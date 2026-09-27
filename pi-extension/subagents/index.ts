@@ -1472,7 +1472,7 @@ async function watchSubagent(
   try {
     const result = await (deps.poll ?? pollForExit)(surface, AbortSignal.any([signal, getModuleAbortSignal()]), {
       // Sidecar exits are checked immediately; screen polling is only the fallback.
-      interval: 2000,
+      interval: 1000,
       sessionFile,
       sentinelFile: running.sentinelFile,
       pidFile: running.pidFile,

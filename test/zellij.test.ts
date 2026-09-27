@@ -6,10 +6,36 @@ import { writeFileSync, existsSync, mkdtempSync, readFileSync, rmSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { syncBuiltinESMExports } from "node:module";
+import { selectPlacement, splitDirection, positiveInteger } from "../pi-extension/subagents/zellij-layout.ts";
 import {
-  isZellijAvailable,
+  isZellijAvailable, __pollForExitTest__,
   sendCommand, readScreen, readScreenAsync, closeSurface, pollForExit, shellEscape, withProcessId,
 } from "../pi-extension/subagents/zellij.ts";
+
+it("splits only while all native candidates have space, otherwise chooses a new tab", () => {
+  const pane = (id: number, rows = 40, columns = 120, extra = {}) => ({
+    id, is_plugin: false, pane_rows: rows, pane_columns: columns, tab_id: 1, ...extra,
+  });
+  assert.equal(splitDirection(pane(0, 5, 11)), "right");
+  assert.equal(splitDirection(pane(0, 11, 5)), "down");
+  assert.equal(splitDirection(pane(0, 5, 10)), null);
+  assert.equal(splitDirection(pane(0, 4, 80)), null);
+  assert.equal(selectPlacement([pane(0), pane(1)], 0), "split");
+  assert.equal(selectPlacement([pane(0, 100, 47), pane(1, 31, 77)], 0), "new-tab");
+  assert.equal(selectPlacement([pane(0, 5, 10), pane(1, 6, 8)], 0), "new-tab");
+  assert.equal(selectPlacement([pane(0, 5, 10)], 0), "new-tab", "do not split below the configured minimum");
+  const mixed = [pane(0, 5, 10), pane(1, 10, 60), pane(2, 10, 80),
+    pane(3, 80, 200, { is_plugin: true }), pane(4, 80, 200, { is_floating: true }),
+    pane(5, 80, 200, { exited: true }), pane(6, 80, 200, { is_selectable: false }),
+    pane(7, 80, 200, { tab_id: 2 })];
+  assert.equal(selectPlacement(mixed, 0), "new-tab");
+  assert.equal(selectPlacement(mixed, 99), null);
+  assert.equal(selectPlacement([pane(0), pane(1)], 0, 100, 30), "new-tab");
+  for (const value of [undefined, "0", "-1", "1.5", "NaN", "Infinity"]) {
+    assert.equal(positiveInteger(value, 50), 50);
+  }
+  assert.equal(positiveInteger("80", 50), 80);
+});
 
 it("routes Zellij commands by id and rejects old CLI versions", () => {
   const originalEnv = { ...process.env };
@@ -75,6 +101,7 @@ switch (args[1]) {
  case 'new-pane': s.creates++; s.marker = args.at(-1); s.parent = process.env.ZELLIJ_PANE_ID; save(); break; // Lost ID reply.
  case 'rename-pane': s.renamed = args.at(-1); s.renamedPane = args[args.indexOf('--pane-id') + 1]; save(); break;
  case 'list-panes':
+   if (args.includes('--geometry')) { console.log('[]'); break; }
    if (process.env.FAKE_MODE === 'slow-list') { setTimeout(() => {}, 30000); break; }
    console.log(JSON.stringify(process.env.FAKE_MODE === 'missing' ? [] : [
    { id: 99, is_plugin: true, title: s.marker },
@@ -142,7 +169,8 @@ switch (args[1]) {
     assert.equal((await pollForExit("terminal_7", AbortSignal.timeout(5000), { interval: 1 })).exitCode, 7);
     assert.equal(JSON.parse(readFileSync(state, "utf8")).reads, 5, "four temporary CLI errors must not terminate a working task");
     process.env.FAKE_MODE = "missing";
-    assert.equal((await pollForExit("terminal_7", AbortSignal.timeout(5000), { interval: 1 })).reason, "interrupted");
+    __pollForExitTest__.clearPaneSample();
+    assert.equal((await pollForExit("terminal_7", AbortSignal.timeout(10000), { interval: 100 })).reason, "interrupted");
     process.env.FAKE_MODE = "fail";
     await assert.rejects(readScreenAsync("terminal_7"));
     assert.equal(existsSync(JSON.parse(readFileSync(state, "utf8")).dump), false);
@@ -194,12 +222,14 @@ else if(args[1] === 'list-panes') console.log(mode === 'invalid' ? '{}' : JSON.s
     child.kill("SIGSTOP");
     await staysRunning(); // Suspended is not exited either.
     child.kill("SIGCONT");
-    assert.ok(readFileSync(cliLog, "utf8").includes('["action","list-panes","--json","--all"]'));
+    assert.ok(!readFileSync(cliLog, "utf8").includes('"list-panes"'), "healthy PID + successful screen reads need no pane queries");
     for (const mode of ["cli-error", "invalid"]) {
       process.env.EXIT_TEST_MODE = mode;
+      __pollForExitTest__.clearPaneSample();
       await staysRunning();
     }
     process.env.EXIT_TEST_MODE = "idle";
+    __pollForExitTest__.clearPaneSample();
     rmSync(pidFile);
     await staysRunning();
     for (const text of ["", "invalid", "-1", "0", "1.5"]) {

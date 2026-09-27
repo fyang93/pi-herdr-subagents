@@ -2,11 +2,11 @@
 
 Async subagents for [pi](https://github.com/badlogic/pi-mono), running in Zellij panes. Spawn a sub-agent, keep working in the main session, and get the result steered back when it finishes. Fully non-blocking.
 
-Requires **Zellij 0.44+**. See [Acknowledgements](#acknowledgements) for the upstream project.
+Requires **Zellij 0.44+** for tiled panes; **0.45+** is required for focus-preserving overflow tabs (recommended). See [Acknowledgements](#acknowledgements) for the upstream project.
 
 ## How it works
 
-`subagent()` returns immediately. The sub-agent runs in its own pane without stealing keyboard focus: a new pane in the parent's Zellij tab. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
+`subagent()` returns immediately. The sub-agent runs in its own pane without stealing keyboard focus: a tiled pane in the parent's Zellij tab, or a background tab when space runs out. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
 
 ```
 ╭─ Subagents ──────────────────────────── 2 running ─╮
@@ -17,13 +17,26 @@ Requires **Zellij 0.44+**. See [Acknowledgements](#acknowledgements) for the ups
 
 Spawn several in parallel — they run concurrently and steer results back independently as each finishes.
 
-Pane placement follows your existing Zellij layout, including horizontal and vertical splits. The extension does not replace layouts or force equal-width columns. Keep `auto_layout true` in your Zellij configuration to let Zellij automatically rearrange panes on creation and removal. Pane operations are implemented in `pi-extension/subagents/zellij.ts`.
+Pane placement prefers tiled subagents within the parent's tab and never requests stacks. It uses Zellij's native directionless splits while each resulting pane can remain at least **50 columns × 10 rows**. Once another split would make panes too small, each new subagent gets a separate background tab instead of being stacked or hidden. The minimum is configurable before starting pi:
 
-Zellij creation uses `--near-current-pane` without `--direction`: placement follows the layout and keyboard focus is preserved, even when another tab is active. All reads, messages and closes target explicit pane IDs. Older Zellij releases are rejected because they lack the required pane-targeted CLI actions.
+```bash
+export PI_SUBAGENT_ZELLIJ_MIN_COLUMNS=50
+export PI_SUBAGENT_ZELLIJ_MIN_ROWS=10
+```
+
+If there is no safe tiled split, the extension creates a new tab with `--no-focus`, preserving the user's current focus. Overflow tabs have an explicit single-terminal layout so custom default layouts cannot launch unrelated commands or create stacks. Each overflowing agent gets its own tab; switch tabs to view its output. Closing that agent's only pane also removes its tab. On Zellij 0.44, overflow fails with an upgrade hint rather than stealing focus.
+
+If layout inspection fails, creation falls back to native pane placement. Existing tabs keep their user-configured layouts (including any user-configured automatic stacks); the extension does not rewrite those layouts or force equal-width columns. Keep `auto_layout true` to let Zellij rearrange panes on creation and removal.
+
+Creation remains asynchronous. Layout inspection and pane creation are serialized within each parent pi process to avoid parallel launches using stale geometry; this does not lock out manual layout changes or other pi processes. Tiled pane creation uses `--near-current-pane` without `--direction`, preserving focus and native placement. All reads, messages and closes target explicit pane IDs. Older Zellij releases are rejected because they lack the required pane-targeted CLI actions. Implementation: `pi-extension/subagents/zellij.ts` and `zellij-layout.ts`.
 
 On parent shutdown or `/reload`, the extension attempts to close its tracked subagent panes. Uncertain pane creation or command delivery is not automatically retried; inspect the reported pane or creation marker before retrying.
 
-Launches record the child process ID before execution. If the process exits or its pane is closed without a completion marker, the watcher confirms this on the next poll, removes the task from the running list, and reports an interruption. A surviving shell is left open. Idle processes, interrupted generation (Esc), and failed CLI queries are not treated as process exits.
+Completion still uses the terminal sentinel. Watchers read the viewport asynchronously, waiting **1 second between checks** (no overlapping reads per agent). Launches record the child PID before execution. Healthy processes with successful screen reads need no pane-list queries. Missing/unverifiable PIDs or repeated screen-read failures trigger a fallback list query, shared across watchers in the parent process and cached for 5 seconds, including failures.
+
+An unmarked process exit needs two OS probes; a missing pane needs two distinct successful list snapshots, not two reads of the same cache. Completion markers take priority. After PID exit, the watcher also checks the scrollback tail in case the sentinel is no longer in the viewport. Confirmed interruptions are removed from the running list; a surviving shell is left open. Idle processes, interrupted generation (Esc), and failed CLI queries are not treated as process exits.
+
+Tiled placement and fewer redundant queries may reduce load, but do not guarantee prevention of Zellij's slow-client disconnects. The 1-second screen interval improves completion latency, not output throttling.
 
 If your shell startup is slow and launch commands get dropped before the prompt is ready, raise the delay:
 
@@ -194,7 +207,7 @@ Status display is configured via `config.json` in the extension directory (copy 
 ## Requirements
 
 - [pi](https://github.com/badlogic/pi-mono)
-- [Zellij](https://zellij.dev/) **0.44+**
+- [Zellij](https://zellij.dev/) **0.45+** recommended; 0.44 supports tiled panes only
 
 ```bash
 zellij
