@@ -99,29 +99,31 @@ async function createSurfaceUnlocked(name: string, fromSurface?: string): Promis
     checkZellijVersion(stdout);
   }
   let placement: Placement = null;
-  // A read-only inspection can fail without risking a duplicate pane. In that
-  // case retain native placement; do not guess based on stale or missing geometry.
+  const minColumns = positiveInteger(process.env.PI_SUBAGENT_ZELLIJ_MIN_COLUMNS, 50);
+  const minRows = positiveInteger(process.env.PI_SUBAGENT_ZELLIJ_MIN_ROWS, 10);
+  // Unknown geometry must not turn into an uncontrolled split of the parent.
   try {
     const { stdout } = await execFileAsync("zellij", ["action", "list-panes", "--json", "--geometry", "--state", "--tab"], {
       ...cliOptions, env: { ...process.env, ZELLIJ_PANE_ID: parent },
     });
     placement = selectPlacement(parsePaneList(stdout), Number(parent),
-      positiveInteger(process.env.PI_SUBAGENT_ZELLIJ_MIN_COLUMNS, 50),
-      positiveInteger(process.env.PI_SUBAGENT_ZELLIJ_MIN_ROWS, 10));
-  } catch {} // Native placement is the fallback when geometry is unavailable.
+      minColumns, minRows,
+      positiveInteger(process.env.PI_SUBAGENT_ZELLIJ_PARENT_MIN_COLUMNS, minColumns),
+      positiveInteger(process.env.PI_SUBAGENT_ZELLIJ_PARENT_MIN_ROWS, minRows));
+  } catch {} // A background tab is safer than guessing at the split target.
   // Once tiled splits would make panes too small, create a background tab rather
   // than stacking and hiding sibling pane contents.
   // A unique temporary title lets us recover a lost CLI reply without spawning twice
   // or selecting somebody else's pane with the same display name.
   const marker = `pi-create-${randomUUID()}`;
-  if (placement === "new-tab") return createSurfaceInNewTab(name, marker);
+  if (placement === null || placement === "new-tab") return createSurfaceInNewTab(name, marker);
   let pane = "";
   let failure: unknown;
   try {
-    const { stdout } = await execFileAsync("zellij", ["action", "new-pane", "--near-current-pane",
-      ...(placement ? ["--direction", placement.direction] : []), "--name", marker], {
+    const { stdout } = await execFileAsync("zellij", ["action", "new-pane", supportsBackgroundTabs ? "--no-focus" : "--near-current-pane",
+      "--direction", placement.direction, "--name", marker], {
       ...cliOptions,
-      env: { ...process.env, ZELLIJ_PANE_ID: placement ? String(placement.paneId) : parent },
+      env: { ...process.env, ZELLIJ_PANE_ID: String(placement.paneId) },
     });
     pane = stdout.trim();
   } catch (error) { failure = error; }

@@ -28,12 +28,14 @@ it(`Zellij: splitting a ${held ? "exited/held" : "live"} sibling preserves the o
     }
     assert.ok(parent);
     process.env.ZELLIJ_PANE_ID = String(parent.id);
+    delete process.env.PI_SUBAGENT_ZELLIJ_PARENT_MIN_COLUMNS;
+    delete process.env.PI_SUBAGENT_ZELLIJ_PARENT_MIN_ROWS;
     // Permit exactly two columns of panes, then require splitting vertically.
-    process.env.PI_SUBAGENT_ZELLIJ_MIN_COLUMNS = String(Math.floor(parent.pane_columns / 2) - 1);
+    process.env.PI_SUBAGENT_ZELLIJ_MIN_COLUMNS = String(Math.floor(parent.pane_columns / 2) - 2);
     process.env.PI_SUBAGENT_ZELLIJ_MIN_ROWS = String(Math.floor(parent.pane_rows / 4));
     // Explicit commands remain held after exit, just like completed automation panes.
     const first = held
-      ? action("new-pane", "--near-current-pane", "--direction", "right", "--name", "placement-held",
+      ? action("new-pane", "--no-focus", "--direction", "right", "--name", "placement-held",
         "--", "sh", "-c", "exit 0").trim()
       : await createSurface("placement-first");
     const find = (id: number) => panes().find((p: any) => !p.is_plugin && p.id === id);
@@ -53,14 +55,25 @@ it(`Zellij: splitting a ${held ? "exited/held" : "live"} sibling preserves the o
     const child = find(Number(second.replace("terminal_", "")));
     assert.deepEqual(geometry(after), geometry(before), "second child must not shrink parent");
     assert.equal(child.tab_id, tabId);
+    for (const p of [after, child, find(siblingId)]) {
+      assert.ok(p.pane_content_columns >= Number(process.env.PI_SUBAGENT_ZELLIJ_MIN_COLUMNS));
+      assert.ok(p.pane_content_rows >= Number(process.env.PI_SUBAGENT_ZELLIJ_MIN_ROWS));
+    }
     assert.equal(child.pane_x, sibling.pane_x, "second child splits the sibling column");
     assert.ok(find(siblingId), "keep the sibling and its output, even after exit");
     assert.deepEqual(activeTabs(), activeBefore, "background creation must preserve active tabs");
+    process.env.PI_SUBAGENT_ZELLIJ_MIN_COLUMNS = "10000";
+    const overflow = await createSurface(`${name}-overflow`);
+    const overflowPane = find(Number(overflow.replace("terminal_", "")));
+    assert.notEqual(overflowPane.tab_id, tabId, "insufficient space uses a separate tab");
+    assert.deepEqual(geometry(find(parent.id)), geometry(before));
+    assert.deepEqual(activeTabs(), activeBefore, "overflow also preserves active tabs");
   } finally {
     process.env = env;
     // Clean up only the uniquely named test tab, never an unrelated ID.
-    const tab = JSON.parse(action("list-tabs", "--json")).find((t: any) => t.name === name);
-    if (tab) action("close-tab-by-id", String(tab.tab_id));
+    const tabs = JSON.parse(action("list-tabs", "--json")).filter((t: any) =>
+      t.name === name || t.name === `${name}-overflow`);
+    for (const tab of tabs) action("close-tab-by-id", String(tab.tab_id));
   }
 });
 }

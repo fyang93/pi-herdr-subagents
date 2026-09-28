@@ -22,6 +22,8 @@ ${script}
     ZELLIJ_SESSION_NAME: dir, TEST_LOG: log, TEST_DIR: dir });
   delete process.env.PI_SUBAGENT_ZELLIJ_MIN_COLUMNS;
   delete process.env.PI_SUBAGENT_ZELLIJ_MIN_ROWS;
+  delete process.env.PI_SUBAGENT_ZELLIJ_PARENT_MIN_COLUMNS;
+  delete process.env.PI_SUBAGENT_ZELLIJ_PARENT_MIN_ROWS;
   hooks.clearPaneSample();
   return { dir, calls: () => readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map(s => JSON.parse(s)),
     close() { process.env = env; hooks.clearPaneSample(); rmSync(dir, { recursive: true, force: true }); } };
@@ -33,7 +35,7 @@ const stateFile = process.env.TEST_DIR + '/state';
 let state = fs.existsSync(stateFile) ? JSON.parse(fs.readFileSync(stateFile)) : {count:0};
 const save = () => fs.writeFileSync(stateFile, JSON.stringify(state));
 if (args[1] === 'list-panes') {
-  if (process.env.BAD_LAYOUT === '1') { console.log('{}'); process.exit(); }
+  if (args.includes('--geometry') && process.env.BAD_LAYOUT === '1') { console.log('{}'); process.exit(); }
   const pane = (id, rows, columns, tab = 9) => ({id, is_plugin:false, tab_id:tab, pane_rows:rows, pane_columns:columns});
   if (args.includes('--geometry')) console.log(JSON.stringify(state.count ? [pane(0,10,70),pane(1,10,60)] : [pane(0,50,140)]));
   else console.log(JSON.stringify([{id:0,is_plugin:false,tab_id:9},{id:20,is_plugin:false,title:state.marker,tab_id:10,tab_name:state.marker}]));
@@ -53,7 +55,7 @@ if (args[1] === 'list-panes') {
     const split = actions.find(c => c.args[1] === "new-pane")!;
     const tab = actions.find(c => c.args[1] === "new-tab")!;
     assert.equal(split.parent, "0");
-    assert.ok(split.args.includes("--near-current-pane") && !split.args.includes("--stacked"));
+    assert.ok(split.args.includes("--no-focus") && !split.args.includes("--stacked"));
     assert.equal(split.args[split.args.indexOf("--direction") + 1], "right");
     assert.ok(tab.args.includes("--no-focus"), "new tab must not steal client focus");
     assert.ok(!tab.args.includes("--stacked"));
@@ -61,9 +63,10 @@ if (args[1] === 'list-panes') {
     assert.ok(ticks > 10, "CLI waits must not block the parent event loop");
     assert.equal(process.env.ZELLIJ_PANE_ID, "0");
     process.env.BAD_LAYOUT = "1";
-    assert.equal(await createSurface("fallback"), "terminal_2");
-    assert.equal(f.calls().filter(c => c.args[1] === "new-pane").length, 2,
-      "unavailable geometry uses native placement without replaying a creation");
+    assert.equal(await createSurface("fallback"), "terminal_20");
+    assert.equal(f.calls().filter(c => c.args[1] === "new-pane").length, 1,
+      "unavailable geometry must never cause an uncontrolled split");
+    assert.equal(f.calls().filter(c => c.args[1] === "new-tab").length, 2);
   } finally { clearInterval(timer); f.close(); }
 });
 
@@ -81,6 +84,53 @@ if (args[1] === 'new-pane') console.log('terminal_8');
     assert.equal(split.parent, "7");
     assert.equal(split.args[split.args.indexOf("--direction") + 1], "right");
     assert.equal(process.env.ZELLIJ_PANE_ID, "0");
+    assert.ok(split.args.includes("--no-focus"));
+    process.env.PI_SUBAGENT_ZELLIJ_PARENT_MIN_COLUMNS = "1000";
+    process.env.PI_SUBAGENT_ZELLIJ_PARENT_MIN_ROWS = "1000";
+    assert.equal(await createSurface("sibling-with-large-parent-minimum"), "terminal_8");
+    assert.equal(f.calls().filter(c => c.args[1] === "new-pane").at(-1)!.parent, "7");
+  } finally { f.close(); }
+});
+
+it("uses background tabs for failed, missing or incomplete layout inspection", async () => {
+  const f = fixture(`
+if (args[1] === 'list-panes') {
+  if (args.includes('--geometry')) {
+    if (process.env.LAYOUT_CASE === 'failed') process.exit(1);
+    if (process.env.LAYOUT_CASE === 'missing') console.log('[]');
+    else console.log(JSON.stringify([
+      {id:0,is_plugin:false,tab_id:9,pane_rows:50,pane_columns:180},
+      {id:7,is_plugin:false,tab_id:9}
+    ]));
+  } else console.log(JSON.stringify([{id:20,is_plugin:false,tab_id:10,tab_name:fs.readFileSync(process.env.TEST_DIR+'/marker','utf8')}]));
+} else if (args[1] === 'new-tab') {
+  fs.writeFileSync(process.env.TEST_DIR+'/marker',args[args.indexOf('--name')+1]); console.log('10');
+}
+`);
+  try {
+    for (const mode of ['failed', 'missing', 'incomplete']) {
+      process.env.LAYOUT_CASE = mode;
+      assert.equal(await createSurface(mode), 'terminal_20');
+    }
+    assert.ok(!f.calls().some(c => c.args[1] === 'new-pane'));
+    assert.equal(f.calls().filter(c => c.args[1] === 'new-tab').length, 3);
+  } finally { f.close(); }
+});
+
+it("applies parent-specific minimums before deciding to split", async () => {
+  const f = fixture(`
+if (args[1] === 'list-panes') {
+  if (args.includes('--geometry')) console.log('[{"id":0,"is_plugin":false,"tab_id":9,"pane_rows":40,"pane_columns":120}]');
+  else console.log(JSON.stringify([{id:20,is_plugin:false,tab_id:10,tab_name:fs.readFileSync(process.env.TEST_DIR+'/marker','utf8')}]));
+} else if (args[1] === 'new-tab') {
+  fs.writeFileSync(process.env.TEST_DIR+'/marker',args[args.indexOf('--name')+1]); console.log('10');
+}
+`);
+  try {
+    process.env.PI_SUBAGENT_ZELLIJ_PARENT_MIN_COLUMNS = '80';
+    process.env.PI_SUBAGENT_ZELLIJ_PARENT_MIN_ROWS = '20';
+    assert.equal(await createSurface('protected'), 'terminal_20');
+    assert.ok(!f.calls().some(c => c.args[1] === 'new-pane'));
   } finally { f.close(); }
 });
 
@@ -121,11 +171,13 @@ if (args[1] === 'new-tab') {
 });
 
 it("rejects overflow on 0.44 before creating a tab instead of stealing focus", async () => {
-  const f = fixture(`if (args[1] === 'list-panes') console.log('[{"id":0,"is_plugin":false,"tab_id":0,"pane_rows":5,"pane_columns":10}]');`);
+  const f = fixture(`if (args[1] === 'list-panes') { if (process.env.FAIL_LAYOUT === '1') process.exit(1); console.log('[{"id":0,"is_plugin":false,"tab_id":0,"pane_rows":5,"pane_columns":10}]'); }`);
   try {
     process.env.TEST_VERSION = "zellij 0.44.3";
     const legacy = await import("../pi-extension/subagents/zellij.ts?legacy-background");
     await assert.rejects(legacy.createSurface("overflow"), /Upgrade to Zellij 0.45/);
+    process.env.FAIL_LAYOUT = "1";
+    await assert.rejects(legacy.createSurface("unknown-layout"), /Upgrade to Zellij 0.45/);
     assert.ok(!f.calls().some(c => c.args[1] === "new-tab" || c.args[1] === "new-pane"));
   } finally { f.close(); }
 });

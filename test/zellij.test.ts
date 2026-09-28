@@ -17,18 +17,20 @@ it("prefers safe siblings before splitting the parent, otherwise chooses a new t
     id, is_plugin: false, pane_rows: rows, pane_columns: columns, tab_id: 1, ...extra,
   });
   assert.equal(splitDirection(pane(0)), "right", "prefer right even when both directions fit");
-  assert.equal(splitDirection(pane(0, 10, 100)), "right");
-  assert.equal(splitDirection(pane(0, 20, 99)), "down");
-  assert.equal(splitDirection(pane(0, 19, 99)), null);
+  assert.equal(splitDirection(pane(0, 12, 104)), "right");
+  assert.equal(splitDirection(pane(0, 24, 103)), "down");
+  assert.equal(splitDirection(pane(0, 23, 103)), null);
+  assert.equal(splitDirection(pane(0, 10, 100)), null, "outer dimensions are not usable content");
   assert.equal(splitDirection(pane(0, 40, 49)), null);
   assert.equal(splitDirection(pane(0, 9, 200)), null);
-  assert.equal(splitDirection(pane(0, 30, 160), 80, 15), "right");
-  assert.equal(splitDirection(pane(0, 30, 159), 80, 15), "down");
-  assert.equal(splitDirection(pane(0, 29, 159), 80, 15), null);
+  assert.equal(splitDirection(pane(0, 34, 164), 80, 15), "right");
+  assert.equal(splitDirection(pane(0, 34, 163), 80, 15), "down");
+  assert.equal(splitDirection(pane(0, 33, 163), 80, 15), null);
+  assert.equal(splitDirection(pane(0, 24, 104, { pane_content_columns: 100, pane_content_rows: 22 })), "down");
   assert.deepEqual(selectPlacement([pane(0)], 0), { paneId: 0, direction: "right" });
   assert.deepEqual(selectPlacement([pane(0), pane(1)], 0), { paneId: 1, direction: "right" });
   assert.deepEqual(selectPlacement([pane(0, 80, 200), pane(1)], 0), { paneId: 1, direction: "right" });
-  assert.deepEqual(selectPlacement([pane(0), pane(1, 20, 60)], 0), { paneId: 1, direction: "down" });
+  assert.deepEqual(selectPlacement([pane(0), pane(1, 24, 60)], 0), { paneId: 1, direction: "down" });
   assert.deepEqual(selectPlacement([pane(0), pane(1, 10, 60)], 0), { paneId: 0, direction: "right" });
   assert.deepEqual(selectPlacement([pane(0, 10, 60), pane(1, 20, 120)], 0), { paneId: 1, direction: "right" });
   assert.deepEqual(selectPlacement([pane(0), pane(1), pane(2, 80, 200)], 0), { paneId: 2, direction: "right" });
@@ -48,6 +50,13 @@ it("prefers safe siblings before splitting the parent, otherwise chooses a new t
     pane(0, 50, 90), pane(128, 50, 89, { exited: true, is_suppressed: true }),
   ], 0), { paneId: 0, direction: "down" }, "suppressed panes are not visible split targets");
   assert.equal(selectPlacement([pane(0), pane(1)], 0, 100, 30), "new-tab");
+  assert.equal(selectPlacement([pane(0), pane(1, 40, 120, { pane_rows: undefined })], 0), null);
+  assert.equal(selectPlacement([pane(0), pane(1, 40, 120, { pane_content_rows: 41 })], 0), null);
+  assert.equal(selectPlacement([pane(0, 40, 120, { is_fullscreen: true }), pane(1)], 0), "new-tab");
+  assert.equal(selectPlacement([pane(0, 40, 120, { is_floating: true }), pane(1)], 0), "new-tab");
+  assert.equal(selectPlacement([pane(0)], 0, 50, 10, 80, 20), "new-tab", "honor higher parent minimums");
+  assert.deepEqual(selectPlacement([pane(0), pane(1)], 0, 50, 10, 80, 20), { paneId: 1, direction: "right" });
+  assert.deepEqual(selectPlacement([pane(0, 50, 179)], 0, 50, 10, 80, 20), { paneId: 0, direction: "right" });
   assert.deepEqual(selectPlacement([pane(0), pane(1)], 0, 80, 15), { paneId: 1, direction: "down" });
   for (const value of [undefined, "0", "-1", "1.5", "NaN", "Infinity"]) {
     assert.equal(positiveInteger(value, 50), 50);
@@ -119,7 +128,7 @@ switch (args[1]) {
  case 'new-pane': s.creates++; s.marker = args.at(-1); s.parent = process.env.ZELLIJ_PANE_ID; save(); break; // Lost ID reply.
  case 'rename-pane': s.renamed = args.at(-1); s.renamedPane = args[args.indexOf('--pane-id') + 1]; save(); break;
  case 'list-panes':
-   if (args.includes('--geometry')) { console.log('[]'); break; }
+   if (args.includes('--geometry')) { console.log(JSON.stringify([0,5].map(id => ({id,is_plugin:false,tab_id:id,pane_rows:50,pane_columns:180})))); break; }
    if (process.env.FAKE_MODE === 'slow-list') { setTimeout(() => {}, 30000); break; }
    console.log(JSON.stringify(process.env.FAKE_MODE === 'missing' ? [] : [
    { id: 99, is_plugin: true, title: s.marker },
