@@ -6,6 +6,7 @@ export interface PaneGeometry {
   id: number;
   is_plugin: boolean;
   is_floating?: boolean;
+  is_suppressed?: boolean;
   is_selectable?: boolean;
   exited?: boolean;
   pane_rows?: number;
@@ -35,8 +36,10 @@ export function selectPlacement(
 ): Placement {
   const parent = panes.find(p => !p.is_plugin && p.id === parentId);
   if (!parent || !Number.isSafeInteger(parent.tab_id)) return null;
+  // Exited/held terminals still occupy visible, splittable space. Excluding
+  // them would shrink the parent while a large completed sibling stays intact.
   const usable = panes.filter(p => p.tab_id === parent.tab_id && !p.is_plugin &&
-    !p.is_floating && p.is_selectable !== false && !p.exited &&
+    !p.is_floating && !p.is_suppressed && p.is_selectable !== false &&
     Number.isSafeInteger(p.pane_rows) && p.pane_rows! > 0 &&
     Number.isSafeInteger(p.pane_columns) && p.pane_columns! > 0);
   const candidates = usable.filter(p => splitDirection(p, minColumns, minRows) !== null);

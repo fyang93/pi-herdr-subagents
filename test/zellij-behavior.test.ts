@@ -67,11 +67,11 @@ if (args[1] === 'list-panes') {
   } finally { clearInterval(timer); f.close(); }
 });
 
-it("targets a safe sibling explicitly instead of shrinking the larger parent", async () => {
+it("targets a visible exited sibling explicitly instead of shrinking the larger parent", async () => {
   const f = fixture(`
 if (args[1] === 'list-panes') console.log(JSON.stringify([
   {id:0,is_plugin:false,tab_id:9,pane_rows:80,pane_columns:200},
-  {id:7,is_plugin:false,tab_id:9,pane_rows:20,pane_columns:120}
+  {id:7,is_plugin:false,tab_id:9,pane_rows:20,pane_columns:120,exited:true,is_held:true}
 ]));
 if (args[1] === 'new-pane') console.log('terminal_8');
 `);

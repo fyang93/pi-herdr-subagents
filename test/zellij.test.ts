@@ -37,10 +37,16 @@ it("prefers safe siblings before splitting the parent, otherwise chooses a new t
   assert.equal(selectPlacement([pane(0, 5, 10)], 0), "new-tab", "do not split below the configured minimum");
   const mixed = [pane(0, 5, 10), pane(1, 10, 60), pane(2, 10, 80),
     pane(3, 80, 200, { is_plugin: true }), pane(4, 80, 200, { is_floating: true }),
-    pane(5, 80, 200, { exited: true }), pane(6, 80, 200, { is_selectable: false }),
+    pane(5, 80, 200, { is_suppressed: true }), pane(6, 80, 200, { is_selectable: false }),
     pane(7, 80, 200, { tab_id: 2 })];
   assert.equal(selectPlacement(mixed, 0), "new-tab");
   assert.equal(selectPlacement(mixed, 99), null);
+  assert.deepEqual(selectPlacement([
+    pane(0, 50, 90), pane(128, 50, 89, { exited: true }),
+  ], 0), { paneId: 128, direction: "down" }, "visible exited sibling must be used before the main session");
+  assert.deepEqual(selectPlacement([
+    pane(0, 50, 90), pane(128, 50, 89, { exited: true, is_suppressed: true }),
+  ], 0), { paneId: 0, direction: "down" }, "suppressed panes are not visible split targets");
   assert.equal(selectPlacement([pane(0), pane(1)], 0, 100, 30), "new-tab");
   assert.deepEqual(selectPlacement([pane(0), pane(1)], 0, 80, 15), { paneId: 1, direction: "down" });
   for (const value of [undefined, "0", "-1", "1.5", "NaN", "Infinity"]) {

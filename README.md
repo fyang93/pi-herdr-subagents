@@ -17,7 +17,7 @@ Requires **Zellij 0.44+** for tiled panes; **0.45+** is required for focus-prese
 
 Spawn several in parallel — they run concurrently and steer results back independently as each finishes.
 
-Pane placement prefers tiled subagents within the parent's tab and never requests stacks. It first splits the largest eligible non-parent pane in the same tab, only splitting the main (parent) session when no other pane has enough space. The target and direction are explicit: prefer a side-by-side split when it fits, otherwise try a top/bottom split. Each resulting pane must remain at least **50 columns × 10 rows**. Once another split would make panes too small, each new subagent gets a separate background tab instead of being stacked or hidden. The minimum is configurable before starting pi:
+Pane placement prefers tiled subagents within the parent's tab and never requests stacks. It first splits the largest eligible non-parent pane in the same tab (including visible held panes whose commands have exited), only splitting the main (parent) session when no other pane has enough space. The target and direction are explicit: prefer a side-by-side split when it fits, otherwise try a top/bottom split. Each resulting pane must remain at least **50 columns × 10 rows**. Once another split would make panes too small, each new subagent gets a separate background tab instead of being stacked or hidden. The minimum is configurable before starting pi:
 
 ```bash
 export PI_SUBAGENT_ZELLIJ_MIN_COLUMNS=50
