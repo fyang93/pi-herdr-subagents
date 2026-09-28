@@ -14,22 +14,15 @@ export interface PaneGeometry {
   tab_name?: string;
 }
 
-export function splitDirection(pane: PaneGeometry): "down" | "right" | null {
+/** Prefer side-by-side panes; try a vertical split only if width is insufficient. */
+export function splitDirection(
+  pane: PaneGeometry, minColumns = 50, minRows = 10,
+): "down" | "right" | null {
   const rows = pane.pane_rows ?? 0;
   const columns = pane.pane_columns ?? 0;
-  if (rows < 5 || columns < 5) return null;
-  if (rows * 4 > columns && rows > 10) return "down";
-  return columns > 10 ? "right" : null;
-}
-
-function canSplit(pane: PaneGeometry, minColumns: number, minRows: number): boolean {
-  const rows = pane.pane_rows ?? 0;
-  const columns = pane.pane_columns ?? 0;
-  switch (splitDirection(pane)) {
-    case "down": return columns >= minColumns && Math.floor(rows / 2) >= minRows;
-    case "right": return rows >= minRows && Math.floor(columns / 2) >= minColumns;
-    default: return false;
-  }
+  if (rows >= minRows && Math.floor(columns / 2) >= minColumns) return "right";
+  if (columns >= minColumns && Math.floor(rows / 2) >= minRows) return "down";
+  return null;
 }
 
 export type Placement = { paneId: number; direction: "down" | "right" } | "new-tab" | null;
@@ -46,11 +39,11 @@ export function selectPlacement(
     !p.is_floating && p.is_selectable !== false && !p.exited &&
     Number.isSafeInteger(p.pane_rows) && p.pane_rows! > 0 &&
     Number.isSafeInteger(p.pane_columns) && p.pane_columns! > 0);
-  const candidates = usable.filter(p => canSplit(p, minColumns, minRows));
+  const candidates = usable.filter(p => splitDirection(p, minColumns, minRows) !== null);
   candidates.sort((a, b) => Number(a.id === parentId) - Number(b.id === parentId) ||
     b.pane_rows! * b.pane_columns! - a.pane_rows! * a.pane_columns! || a.id - b.id);
   const target = candidates[0];
-  return target ? { paneId: target.id, direction: splitDirection(target)! } : "new-tab";
+  return target ? { paneId: target.id, direction: splitDirection(target, minColumns, minRows)! } : "new-tab";
 }
 
 export function positiveInteger(value: string | undefined, fallback: number): number {

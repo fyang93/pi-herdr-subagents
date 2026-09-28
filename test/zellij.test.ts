@@ -16,15 +16,22 @@ it("prefers safe siblings before splitting the parent, otherwise chooses a new t
   const pane = (id: number, rows = 40, columns = 120, extra = {}) => ({
     id, is_plugin: false, pane_rows: rows, pane_columns: columns, tab_id: 1, ...extra,
   });
-  assert.equal(splitDirection(pane(0, 5, 11)), "right");
-  assert.equal(splitDirection(pane(0, 11, 5)), "down");
-  assert.equal(splitDirection(pane(0, 5, 10)), null);
-  assert.equal(splitDirection(pane(0, 4, 80)), null);
-  assert.deepEqual(selectPlacement([pane(0), pane(1)], 0), { paneId: 1, direction: "down" });
-  assert.deepEqual(selectPlacement([pane(0, 80, 200), pane(1)], 0), { paneId: 1, direction: "down" });
-  assert.deepEqual(selectPlacement([pane(0), pane(1, 10, 60)], 0), { paneId: 0, direction: "down" });
+  assert.equal(splitDirection(pane(0)), "right", "prefer right even when both directions fit");
+  assert.equal(splitDirection(pane(0, 10, 100)), "right");
+  assert.equal(splitDirection(pane(0, 20, 99)), "down");
+  assert.equal(splitDirection(pane(0, 19, 99)), null);
+  assert.equal(splitDirection(pane(0, 40, 49)), null);
+  assert.equal(splitDirection(pane(0, 9, 200)), null);
+  assert.equal(splitDirection(pane(0, 30, 160), 80, 15), "right");
+  assert.equal(splitDirection(pane(0, 30, 159), 80, 15), "down");
+  assert.equal(splitDirection(pane(0, 29, 159), 80, 15), null);
+  assert.deepEqual(selectPlacement([pane(0)], 0), { paneId: 0, direction: "right" });
+  assert.deepEqual(selectPlacement([pane(0), pane(1)], 0), { paneId: 1, direction: "right" });
+  assert.deepEqual(selectPlacement([pane(0, 80, 200), pane(1)], 0), { paneId: 1, direction: "right" });
+  assert.deepEqual(selectPlacement([pane(0), pane(1, 20, 60)], 0), { paneId: 1, direction: "down" });
+  assert.deepEqual(selectPlacement([pane(0), pane(1, 10, 60)], 0), { paneId: 0, direction: "right" });
   assert.deepEqual(selectPlacement([pane(0, 10, 60), pane(1, 20, 120)], 0), { paneId: 1, direction: "right" });
-  assert.deepEqual(selectPlacement([pane(0), pane(1), pane(2, 80, 200)], 0), { paneId: 2, direction: "down" });
+  assert.deepEqual(selectPlacement([pane(0), pane(1), pane(2, 80, 200)], 0), { paneId: 2, direction: "right" });
   assert.deepEqual(selectPlacement([pane(0, 100, 47), pane(1, 31, 77)], 0), { paneId: 1, direction: "down" });
   assert.equal(selectPlacement([pane(0, 5, 10), pane(1, 6, 8)], 0), "new-tab");
   assert.equal(selectPlacement([pane(0, 5, 10)], 0), "new-tab", "do not split below the configured minimum");
@@ -35,6 +42,7 @@ it("prefers safe siblings before splitting the parent, otherwise chooses a new t
   assert.equal(selectPlacement(mixed, 0), "new-tab");
   assert.equal(selectPlacement(mixed, 99), null);
   assert.equal(selectPlacement([pane(0), pane(1)], 0, 100, 30), "new-tab");
+  assert.deepEqual(selectPlacement([pane(0), pane(1)], 0, 80, 15), { paneId: 1, direction: "down" });
   for (const value of [undefined, "0", "-1", "1.5", "NaN", "Infinity"]) {
     assert.equal(positiveInteger(value, 50), 50);
   }

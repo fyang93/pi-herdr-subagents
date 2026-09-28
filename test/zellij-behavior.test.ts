@@ -54,7 +54,7 @@ if (args[1] === 'list-panes') {
     const tab = actions.find(c => c.args[1] === "new-tab")!;
     assert.equal(split.parent, "0");
     assert.ok(split.args.includes("--near-current-pane") && !split.args.includes("--stacked"));
-    assert.equal(split.args[split.args.indexOf("--direction") + 1], "down");
+    assert.equal(split.args[split.args.indexOf("--direction") + 1], "right");
     assert.ok(tab.args.includes("--no-focus"), "new tab must not steal client focus");
     assert.ok(!tab.args.includes("--stacked"));
     assert.ok(actions.find(c => c.args[1] === "rename-tab")!.args.includes("10"));
