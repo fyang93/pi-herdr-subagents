@@ -17,7 +17,7 @@ Requires **Zellij 0.44+** for tiled panes; **0.45+** is required for focus-prese
 
 Spawn several in parallel — they run concurrently and steer results back independently as each finishes.
 
-Pane placement prefers tiled subagents within the parent's tab and never requests stacks. It uses Zellij's native directionless splits while each resulting pane can remain at least **50 columns × 10 rows**. Once another split would make panes too small, each new subagent gets a separate background tab instead of being stacked or hidden. The minimum is configurable before starting pi:
+Pane placement prefers tiled subagents within the parent's tab and never requests stacks. It first splits the largest eligible non-parent pane in the same tab, only splitting the main (parent) session when no other pane has enough space. The target and direction are explicit, and each resulting pane must remain at least **50 columns × 10 rows**. Once another split would make panes too small, each new subagent gets a separate background tab instead of being stacked or hidden. The minimum is configurable before starting pi:
 
 ```bash
 export PI_SUBAGENT_ZELLIJ_MIN_COLUMNS=50
@@ -28,7 +28,7 @@ If there is no safe tiled split, the extension creates a new tab with `--no-focu
 
 If layout inspection fails, creation falls back to native pane placement. Existing tabs keep their user-configured layouts (including any user-configured automatic stacks); the extension does not rewrite those layouts or force equal-width columns. Keep `auto_layout true` to let Zellij rearrange panes on creation and removal.
 
-Creation remains asynchronous. Layout inspection and pane creation are serialized within each parent pi process to avoid parallel launches using stale geometry; this does not lock out manual layout changes or other pi processes. Tiled pane creation uses `--near-current-pane` without `--direction`, preserving focus and native placement. All reads, messages and closes target explicit pane IDs. Older Zellij releases are rejected because they lack the required pane-targeted CLI actions. Implementation: `pi-extension/subagents/zellij.ts` and `zellij-layout.ts`.
+Creation remains asynchronous. Layout inspection and pane creation are serialized within each parent pi process to avoid parallel launches using stale geometry; this does not lock out manual layout changes or other pi processes. Tiled pane creation uses `--near-current-pane` with an explicit `--direction` and the selected target's `ZELLIJ_PANE_ID`; when geometry is unavailable it falls back to native directionless placement. All reads, messages and closes target explicit pane IDs. Older Zellij releases are rejected because they lack the required pane-targeted CLI actions. Implementation: `pi-extension/subagents/zellij.ts` and `zellij-layout.ts`.
 
 On parent shutdown or `/reload`, the extension attempts to close its tracked subagent panes. Uncertain pane creation or command delivery is not automatically retried; inspect the reported pane or creation marker before retrying.
 

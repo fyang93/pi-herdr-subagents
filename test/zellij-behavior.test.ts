@@ -53,7 +53,8 @@ if (args[1] === 'list-panes') {
     const split = actions.find(c => c.args[1] === "new-pane")!;
     const tab = actions.find(c => c.args[1] === "new-tab")!;
     assert.equal(split.parent, "0");
-    assert.ok(split.args.includes("--near-current-pane") && !split.args.includes("--stacked") && !split.args.includes("--direction"));
+    assert.ok(split.args.includes("--near-current-pane") && !split.args.includes("--stacked"));
+    assert.equal(split.args[split.args.indexOf("--direction") + 1], "down");
     assert.ok(tab.args.includes("--no-focus"), "new tab must not steal client focus");
     assert.ok(!tab.args.includes("--stacked"));
     assert.ok(actions.find(c => c.args[1] === "rename-tab")!.args.includes("10"));
@@ -64,6 +65,23 @@ if (args[1] === 'list-panes') {
     assert.equal(f.calls().filter(c => c.args[1] === "new-pane").length, 2,
       "unavailable geometry uses native placement without replaying a creation");
   } finally { clearInterval(timer); f.close(); }
+});
+
+it("targets a safe sibling explicitly instead of shrinking the larger parent", async () => {
+  const f = fixture(`
+if (args[1] === 'list-panes') console.log(JSON.stringify([
+  {id:0,is_plugin:false,tab_id:9,pane_rows:80,pane_columns:200},
+  {id:7,is_plugin:false,tab_id:9,pane_rows:20,pane_columns:120}
+]));
+if (args[1] === 'new-pane') console.log('terminal_8');
+`);
+  try {
+    assert.equal(await createSurface("sibling"), "terminal_8");
+    const split = f.calls().find(c => c.args[1] === "new-pane")!;
+    assert.equal(split.parent, "7");
+    assert.equal(split.args[split.args.indexOf("--direction") + 1], "right");
+    assert.equal(process.env.ZELLIJ_PANE_ID, "0");
+  } finally { f.close(); }
 });
 
 it("recovers background tabs by marker, never treating an empty reply as tab zero", async () => {

@@ -10,7 +10,7 @@ import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync, mkdtempSync
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { positiveInteger, selectPlacement, type PaneGeometry } from "./zellij-layout.ts";
+import { positiveInteger, selectPlacement, type PaneGeometry, type Placement } from "./zellij-layout.ts";
 
 const execFileAsync = promisify(execFile);
 // Bound CLI stalls, not agent execution time. Never retry mutating actions.
@@ -98,11 +98,13 @@ async function createSurfaceUnlocked(name: string, fromSurface?: string): Promis
     const { stdout } = await execFileAsync("zellij", ["--version"], cliOptions);
     checkZellijVersion(stdout);
   }
-  let placement: "split" | "new-tab" | null = null;
+  let placement: Placement = null;
   // A read-only inspection can fail without risking a duplicate pane. In that
   // case retain native placement; do not guess based on stale or missing geometry.
   try {
-    const { stdout } = await execFileAsync("zellij", ["action", "list-panes", "--json", "--geometry", "--state", "--tab"], cliOptions);
+    const { stdout } = await execFileAsync("zellij", ["action", "list-panes", "--json", "--geometry", "--state", "--tab"], {
+      ...cliOptions, env: { ...process.env, ZELLIJ_PANE_ID: parent },
+    });
     placement = selectPlacement(parsePaneList(stdout), Number(parent),
       positiveInteger(process.env.PI_SUBAGENT_ZELLIJ_MIN_COLUMNS, 50),
       positiveInteger(process.env.PI_SUBAGENT_ZELLIJ_MIN_ROWS, 10));
@@ -116,9 +118,10 @@ async function createSurfaceUnlocked(name: string, fromSurface?: string): Promis
   let pane = "";
   let failure: unknown;
   try {
-    const { stdout } = await execFileAsync("zellij", ["action", "new-pane", "--near-current-pane", "--name", marker], {
+    const { stdout } = await execFileAsync("zellij", ["action", "new-pane", "--near-current-pane",
+      ...(placement ? ["--direction", placement.direction] : []), "--name", marker], {
       ...cliOptions,
-      env: { ...process.env, ZELLIJ_PANE_ID: parent },
+      env: { ...process.env, ZELLIJ_PANE_ID: placement ? String(placement.paneId) : parent },
     });
     pane = stdout.trim();
   } catch (error) { failure = error; }

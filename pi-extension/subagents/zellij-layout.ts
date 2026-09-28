@@ -32,23 +32,25 @@ function canSplit(pane: PaneGeometry, minColumns: number, minRows: number): bool
   }
 }
 
-/**
- * Return native tiled placement while every pane Zellij might split remains
- * usable. Once a split would make panes too small (or no tiled split is viable),
- * return new-tab. Null means the parent/layout could not be inspected safely.
+export type Placement = { paneId: number; direction: "down" | "right" } | "new-tab" | null;
+
+/** Prefer the largest safe sibling before shrinking the parent. Null means
+ * the parent/layout could not be inspected safely.
  */
 export function selectPlacement(
   panes: PaneGeometry[], parentId: number, minColumns = 50, minRows = 10,
-): "split" | "new-tab" | null {
+): Placement {
   const parent = panes.find(p => !p.is_plugin && p.id === parentId);
   if (!parent || !Number.isSafeInteger(parent.tab_id)) return null;
   const usable = panes.filter(p => p.tab_id === parent.tab_id && !p.is_plugin &&
     !p.is_floating && p.is_selectable !== false && !p.exited &&
     Number.isSafeInteger(p.pane_rows) && p.pane_rows! > 0 &&
     Number.isSafeInteger(p.pane_columns) && p.pane_columns! > 0);
-  const candidates = usable.filter(p => canSplit(p, 5, 5));
-  if (candidates.length && candidates.every(p => canSplit(p, minColumns, minRows))) return "split";
-  return "new-tab";
+  const candidates = usable.filter(p => canSplit(p, minColumns, minRows));
+  candidates.sort((a, b) => Number(a.id === parentId) - Number(b.id === parentId) ||
+    b.pane_rows! * b.pane_columns! - a.pane_rows! * a.pane_columns! || a.id - b.id);
+  const target = candidates[0];
+  return target ? { paneId: target.id, direction: splitDirection(target)! } : "new-tab";
 }
 
 export function positiveInteger(value: string | undefined, fallback: number): number {

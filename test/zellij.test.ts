@@ -12,7 +12,7 @@ import {
   sendCommand, readScreen, readScreenAsync, closeSurface, pollForExit, shellEscape, withProcessId,
 } from "../pi-extension/subagents/zellij.ts";
 
-it("splits only while all native candidates have space, otherwise chooses a new tab", () => {
+it("prefers safe siblings before splitting the parent, otherwise chooses a new tab", () => {
   const pane = (id: number, rows = 40, columns = 120, extra = {}) => ({
     id, is_plugin: false, pane_rows: rows, pane_columns: columns, tab_id: 1, ...extra,
   });
@@ -20,8 +20,12 @@ it("splits only while all native candidates have space, otherwise chooses a new 
   assert.equal(splitDirection(pane(0, 11, 5)), "down");
   assert.equal(splitDirection(pane(0, 5, 10)), null);
   assert.equal(splitDirection(pane(0, 4, 80)), null);
-  assert.equal(selectPlacement([pane(0), pane(1)], 0), "split");
-  assert.equal(selectPlacement([pane(0, 100, 47), pane(1, 31, 77)], 0), "new-tab");
+  assert.deepEqual(selectPlacement([pane(0), pane(1)], 0), { paneId: 1, direction: "down" });
+  assert.deepEqual(selectPlacement([pane(0, 80, 200), pane(1)], 0), { paneId: 1, direction: "down" });
+  assert.deepEqual(selectPlacement([pane(0), pane(1, 10, 60)], 0), { paneId: 0, direction: "down" });
+  assert.deepEqual(selectPlacement([pane(0, 10, 60), pane(1, 20, 120)], 0), { paneId: 1, direction: "right" });
+  assert.deepEqual(selectPlacement([pane(0), pane(1), pane(2, 80, 200)], 0), { paneId: 2, direction: "down" });
+  assert.deepEqual(selectPlacement([pane(0, 100, 47), pane(1, 31, 77)], 0), { paneId: 1, direction: "down" });
   assert.equal(selectPlacement([pane(0, 5, 10), pane(1, 6, 8)], 0), "new-tab");
   assert.equal(selectPlacement([pane(0, 5, 10)], 0), "new-tab", "do not split below the configured minimum");
   const mixed = [pane(0, 5, 10), pane(1, 10, 60), pane(2, 10, 80),
