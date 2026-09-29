@@ -10,7 +10,7 @@ import {
   sendCommand, sendLongCommand, readScreen, readScreenAsync, closeSurface, pollForExit, shellEscape,
 } from "../../pi-extension/subagents/zellij.ts";
 
-it("Zellij: size-bounded tiled placement, overflow rejection, messages and exit detection", {
+it("Zellij: size-bounded tiled placement, background overflow, messages and exit detection", {
   skip: !isZellijAvailable(), timeout: 30_000,
 }, async () => {
   const action = (...args: string[]) => execFileSync("zellij", ["action", ...args], { encoding: "utf8" });
@@ -20,6 +20,7 @@ it("Zellij: size-bounded tiled placement, overflow rejection, messages and exit 
   const oldColumns = process.env.PI_SUBAGENT_ZELLIJ_MIN_COLUMNS;
   const oldRows = process.env.PI_SUBAGENT_ZELLIJ_MIN_ROWS;
   const dir = mkdtempSync(join(tmpdir(), "pi-zellij-test-"));
+  let overflowTab: number | undefined;
   let tabId: number | undefined;
   try {
     action("new-tab", "--name", name, "--layout", "default");
@@ -43,7 +44,9 @@ it("Zellij: size-bounded tiled placement, overflow rejection, messages and exit 
       createSurface("third", `terminal_${parent.id}`)])];
     process.env.PI_SUBAGENT_ZELLIJ_MIN_COLUMNS = "10000";
     process.env.PI_SUBAGENT_ZELLIJ_MIN_ROWS = "10000";
-    await assert.rejects(createSurface("overflow"), /No safe tiled split/);
+    const overflow = await createSurface("overflow");
+    overflowTab = panes().find((p: any) => p.id === Number(overflow.replace("terminal_", "")) && !p.is_plugin)?.tab_id;
+    assert.notEqual(overflowTab, tabId);
     const childPanes = children.map(surface => panes().find((p: any) => !p.is_plugin && p.id === Number(surface.replace("terminal_", ""))));
     assert.ok(childPanes.every((p: any) => p), "each pane should exist");
     const main = panes().find((p: any) => !p.is_plugin && p.id === parent.id);
@@ -87,6 +90,7 @@ it("Zellij: size-bounded tiled placement, overflow rejection, messages and exit 
     else process.env.PI_SUBAGENT_ZELLIJ_MIN_ROWS = oldRows;
     if (oldParent === undefined) delete process.env.ZELLIJ_PANE_ID;
     else process.env.ZELLIJ_PANE_ID = oldParent;
+    if (overflowTab !== undefined) action("close-tab-by-id", String(overflowTab));
     if (tabId !== undefined) action("close-tab-by-id", String(tabId));
     rmSync(dir, { recursive: true, force: true });
   }

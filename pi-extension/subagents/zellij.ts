@@ -1,7 +1,7 @@
 /**
  * Zellij pane operations and exit polling. Pane ids are `terminal_<id>`.
- * Use size-bounded tiled splits in the parent's tab; refuse when space runs out.
- * Never request stacked panes or background tabs.
+ * Use size-bounded tiled splits in the parent's tab; overflow into background tabs.
+ * Never request stacked panes or switch the user's focus.
  */
 import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
@@ -43,7 +43,7 @@ export function zellijSetupHint(): string {
 
 // Zellij 0.44 added pane-targeted CLI actions and returned pane ids.
 let zellijVersionChecked = false;
-let supportsNoFocus = false;
+let supportsBackgroundTabs = false;
 function requireZellij(): void {
   if (!isZellijAvailable()) throw new Error(`Zellij is not available. ${zellijSetupHint()}`);
   if (zellijVersionChecked) return;
@@ -55,7 +55,7 @@ function checkZellijVersion(version: string): void {
   if (!match || (Number(match[1]) === 0 && Number(match[2]) < 44)) {
     throw new Error("Subagents require Zellij 0.44+ for pane-targeted CLI actions.");
   }
-  supportsNoFocus = Number(match[1]) > 0 || Number(match[2]) >= 45;
+  supportsBackgroundTabs = Number(match[1]) > 0 || Number(match[2]) >= 45;
   zellijVersionChecked = true;
 }
 
@@ -110,16 +110,13 @@ async function createSurfaceUnlocked(name: string, fromSurface?: string): Promis
       minColumns, minRows,
       positiveInteger(process.env.PI_SUBAGENT_ZELLIJ_PARENT_MIN_COLUMNS, minColumns),
       positiveInteger(process.env.PI_SUBAGENT_ZELLIJ_PARENT_MIN_ROWS, minRows));
-  } catch {} // Refuse creation rather than guessing at the split target.
-  if (placement === null) {
-    throw new Error("No safe tiled split: subagent panes must not exceed the parent size. Free pane space or enlarge the parent, then retry.");
-  }
-  // Recover a lost CLI reply without spawning twice or selecting another pane.
+  } catch {} // Unknown geometry must not turn into an uncontrolled split.
   const marker = `pi-create-${randomUUID()}`;
+  if (placement === null) return createSurfaceInNewTab(name, marker);
   let pane = "";
   let failure: unknown;
   try {
-    const { stdout } = await execFileAsync("zellij", ["action", "new-pane", supportsNoFocus ? "--no-focus" : "--near-current-pane",
+    const { stdout } = await execFileAsync("zellij", ["action", "new-pane", supportsBackgroundTabs ? "--no-focus" : "--near-current-pane",
       "--direction", placement.direction, "--name", marker], {
       ...cliOptions,
       env: { ...process.env, ZELLIJ_PANE_ID: String(placement.paneId) },
@@ -146,6 +143,54 @@ async function createSurfaceUnlocked(name: string, fromSurface?: string): Promis
   }
   try { await execFileAsync("zellij", ["action", "rename-pane", "--pane-id", pane, "--", name], cliOptions); }
   catch (error) { console.warn(`Pane ${pane} created as ${marker}, but rename failed: ${error}`); }
+  return pane;
+}
+
+/** Create exactly one terminal in a background tab; never replay an ambiguous mutation. */
+async function createSurfaceInNewTab(name: string, marker: string): Promise<string> {
+  if (!supportsBackgroundTabs) {
+    throw new Error("No safe tiled split remains. Upgrade to Zellij 0.45+ for background tabs (--no-focus); no tab was created.");
+  }
+  let tabId: number | undefined;
+  let failure: unknown;
+  try {
+    const { stdout } = await execFileAsync("zellij", ["action", "new-tab", "--no-focus", "--name", marker,
+      "--cwd", process.cwd(), "--layout-string", "layout { pane; }"], cliOptions);
+    const rawId = stdout.trim();
+    if (/^\d+$/.test(rawId) && Number.isSafeInteger(Number(rawId))) tabId = Number(rawId);
+  } catch (error) { failure = error; }
+
+  // A lost CLI reply is ambiguous: find the unique marker tab, but never create
+  // another one. Polling only observes state; it does not replay the mutation.
+  const deadline = performance.now() + 2000;
+  let pane = "";
+  let createdTabId = tabId;
+  while (performance.now() < deadline) {
+    try {
+      const { stdout } = await execFileAsync("zellij", ["action", "list-panes", "--json", "--all"], {
+        ...cliOptions, timeout: Math.max(1, Math.ceil(deadline - performance.now())),
+      });
+      const matches = parsePaneList(stdout).filter(p => !p.is_plugin && p.tab_name === marker &&
+        Number.isSafeInteger(p.tab_id) && p.tab_id! >= 0 &&
+        (tabId === undefined || p.tab_id === tabId));
+      if (matches.length === 1) {
+        pane = `terminal_${matches[0].id}`;
+        createdTabId = matches[0].tab_id;
+        break;
+      }
+    } catch (error) { failure = error; }
+    const remaining = deadline - performance.now();
+    if (remaining > 0) await sleep(Math.min(50, remaining));
+  }
+  if (!/^terminal_\d+$/.test(pane)) {
+    throw new Error(`Could not confirm Zellij tab/pane creation (${marker}); not retried to avoid duplicates. ${failure ?? tabId ?? "no pane found"}`);
+  }
+  if (Number.isSafeInteger(createdTabId)) {
+    try { await execFileAsync("zellij", ["action", "rename-tab", "--tab-id", String(createdTabId), "--", name], cliOptions); }
+    catch (error) { console.warn(`Tab ${createdTabId} created as ${marker}, but rename failed: ${error}`); }
+  }
+  try { await execFileAsync("zellij", ["action", "rename-pane", "--pane-id", pane, "--", name], cliOptions); }
+  catch (error) { console.warn(`Pane ${pane} created in tab ${createdTabId ?? marker}, but rename failed: ${error}`); }
   return pane;
 }
 

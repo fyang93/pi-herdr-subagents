@@ -72,14 +72,15 @@ it(`Zellij: splitting a ${held ? "exited/held" : "live"} sibling preserves the o
       assert.equal(p.pane_rows, balancedParent.pane_rows);
     }
     process.env.PI_SUBAGENT_ZELLIJ_MIN_COLUMNS = "10000";
-    await assert.rejects(createSurface(`${name}-overflow`), /No safe tiled split/);
+    const overflow = await createSurface(`${name}-overflow`);
+    assert.notEqual(find(Number(overflow.replace("terminal_", ""))).tab_id, tabId);
     assert.deepEqual(geometry(find(parent.id)), geometry(balancedParent));
     assert.deepEqual(activeTabs(), activeBefore, "overflow also preserves active tabs");
   } finally {
     process.env = env;
     // Clean up only the uniquely named test tab, never an unrelated ID.
     const tabs = JSON.parse(action("list-tabs", "--json")).filter((t: any) =>
-      t.name === name);
+      t.name === name || t.name === `${name}-overflow`);
     for (const tab of tabs) action("close-tab-by-id", String(tab.tab_id));
   }
 });
