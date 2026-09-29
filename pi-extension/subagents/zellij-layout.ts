@@ -1,7 +1,4 @@
-/** Space-aware placement adapted from HazAT/pi-interactive-subagents (MIT).
- * Tiled splits preserve simultaneous visibility; when they become too small,
- * continue in a new tab instead of stacking and hiding panes.
- */
+/** Size-bounded tiled placement adapted from HazAT/pi-interactive-subagents (MIT). */
 export interface PaneGeometry {
   id: number;
   is_plugin: boolean;
@@ -33,22 +30,27 @@ function measurePane(pane: PaneGeometry) {
   return { rows, columns, rowInset, columnInset };
 }
 
-/** Prefer side-by-side panes; try a top/bottom split if width is insufficient. */
+/** Prefer splitting the longer dimension, using Zellij's column/row counts. */
+function splitDirections(pane: PaneGeometry, minColumns: number, minRows: number): ("down" | "right")[] {
+  const size = measurePane(pane);
+  if (!size) return [];
+  const { rows, columns, rowInset, columnInset } = size;
+  const directions: ("down" | "right")[] = rows > columns ? ["down", "right"] : ["right", "down"];
+  return directions.filter(direction => direction === "right"
+    ? rows - rowInset >= minRows && Math.floor(columns / 2) - columnInset >= minColumns
+    : columns - columnInset >= minColumns && Math.floor(rows / 2) - rowInset >= minRows);
+}
+
 export function splitDirection(
   pane: PaneGeometry, minColumns = 50, minRows = 10,
 ): "down" | "right" | null {
-  const size = measurePane(pane);
-  if (!size) return null;
-  const { rows, columns, rowInset, columnInset } = size;
-  if (rows - rowInset >= minRows && Math.floor(columns / 2) - columnInset >= minColumns) return "right";
-  if (columns - columnInset >= minColumns && Math.floor(rows / 2) - rowInset >= minRows) return "down";
-  return null;
+  return splitDirections(pane, minColumns, minRows)[0] ?? null;
 }
 
-export type Placement = { paneId: number; direction: "down" | "right" } | "new-tab" | null;
+export type Placement = { paneId: number; direction: "down" | "right" } | null;
 
-/** Prefer the largest safe sibling before shrinking the parent. Null means
- * the parent/layout could not be inspected safely.
+/** Split the largest eligible pane, provided no sibling will exceed the parent
+ * in width or height after the split. Null means no safe placement.
  */
 export function selectPlacement(
   panes: PaneGeometry[], parentId: number, minColumns = 50, minRows = 10,
@@ -57,22 +59,30 @@ export function selectPlacement(
   const parent = panes.find(p => !p.is_plugin && p.id === parentId);
   if (!parent || !Number.isSafeInteger(parent.tab_id)) return null;
   if (parent.is_floating || parent.is_suppressed || parent.is_selectable === false ||
-      panes.some(p => p.tab_id === parent.tab_id && p.is_fullscreen)) return "new-tab";
-  // Exited/held terminals still occupy visible, splittable space. Excluding
-  // them would shrink the parent while a large completed sibling stays intact.
+      panes.some(p => p.tab_id === parent.tab_id && p.is_fullscreen)) return null;
+  // Exited/held terminals still occupy space and must participate in size checks.
   const usable = panes.filter(p => p.tab_id === parent.tab_id && !p.is_plugin &&
     !p.is_floating && !p.is_suppressed && p.is_selectable !== false);
   // Missing geometry is not evidence that a sibling lacks space. In particular,
   // never shrink the parent just because a sibling could not be inspected.
   if (usable.some(p => !measurePane(p))) return null;
-  const direction = (p: PaneGeometry) => splitDirection(p,
-    p.id === parentId ? Math.max(minColumns, parentMinColumns) : minColumns,
-    p.id === parentId ? Math.max(minRows, parentMinRows) : minRows);
-  const candidates = usable.filter(p => direction(p) !== null);
-  candidates.sort((a, b) => Number(a.id === parentId) - Number(b.id === parentId) ||
-    b.pane_rows! * b.pane_columns! - a.pane_rows! * a.pane_columns! || a.id - b.id);
-  const target = candidates[0];
-  return target ? { paneId: target.id, direction: direction(target)! } : "new-tab";
+  const siblingsFit = (columns: number, rows: number) => usable.every(p =>
+    p.id === parentId || (p.pane_columns! <= columns && p.pane_rows! <= rows));
+  if (!siblingsFit(parent.pane_columns!, parent.pane_rows!)) return null;
+  let best: Placement = null, bestArea = 0;
+  for (const p of usable) {
+    const area = p.pane_columns! * p.pane_rows!;
+    if (p.id === parentId || area < bestArea || (area === bestArea && p.id > best!.paneId)) continue;
+    const direction = splitDirection(p, minColumns, minRows);
+    if (direction) { best = { paneId: p.id, direction }; bestArea = area; }
+  }
+  if (parent.pane_columns! * parent.pane_rows! <= bestArea) return best;
+  // Only a strictly larger parent can win. Exact halves avoid rounding overshoot.
+  const direction = splitDirections(parent, Math.max(minColumns, parentMinColumns), Math.max(minRows, parentMinRows))
+    .find(d => d === "right"
+      ? parent.pane_columns! % 2 === 0 && siblingsFit(parent.pane_columns! / 2, parent.pane_rows!)
+      : parent.pane_rows! % 2 === 0 && siblingsFit(parent.pane_columns!, parent.pane_rows! / 2));
+  return direction ? { paneId: parentId, direction } : best;
 }
 
 export function positiveInteger(value: string | undefined, fallback: number): number {

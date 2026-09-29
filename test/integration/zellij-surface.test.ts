@@ -10,7 +10,7 @@ import {
   sendCommand, sendLongCommand, readScreen, readScreenAsync, closeSurface, pollForExit, shellEscape,
 } from "../../pi-extension/subagents/zellij.ts";
 
-it("Zellij: tiled placement, focus-safe background tabs, messages and exit detection", {
+it("Zellij: size-bounded tiled placement, overflow rejection, messages and exit detection", {
   skip: !isZellijAvailable(), timeout: 30_000,
 }, async () => {
   const action = (...args: string[]) => execFileSync("zellij", ["action", ...args], { encoding: "utf8" });
@@ -19,7 +19,6 @@ it("Zellij: tiled placement, focus-safe background tabs, messages and exit detec
   const oldParent = process.env.ZELLIJ_PANE_ID;
   const oldColumns = process.env.PI_SUBAGENT_ZELLIJ_MIN_COLUMNS;
   const oldRows = process.env.PI_SUBAGENT_ZELLIJ_MIN_ROWS;
-  const childTabs = new Set<number>();
   const dir = mkdtempSync(join(tmpdir(), "pi-zellij-test-"));
   let tabId: number | undefined;
   try {
@@ -40,24 +39,21 @@ it("Zellij: tiled placement, focus-safe background tabs, messages and exit detec
     process.env.PI_SUBAGENT_ZELLIJ_MIN_COLUMNS = "1";
     process.env.PI_SUBAGENT_ZELLIJ_MIN_ROWS = "1";
     const first = await createSurface("first");
-    process.env.PI_SUBAGENT_ZELLIJ_MIN_COLUMNS = "10000";
-    process.env.PI_SUBAGENT_ZELLIJ_MIN_ROWS = "10000";
     const children = [first, ...await Promise.all([createSurface("second"),
       createSurface("third", `terminal_${parent.id}`)])];
+    process.env.PI_SUBAGENT_ZELLIJ_MIN_COLUMNS = "10000";
+    process.env.PI_SUBAGENT_ZELLIJ_MIN_ROWS = "10000";
+    await assert.rejects(createSurface("overflow"), /No safe tiled split/);
     const childPanes = children.map(surface => panes().find((p: any) => !p.is_plugin && p.id === Number(surface.replace("terminal_", ""))));
     assert.ok(childPanes.every((p: any) => p), "each pane should exist");
-    for (const pane of childPanes) if (pane.tab_id !== tabId) childTabs.add(pane.tab_id);
-    assert.equal(childPanes[0].tab_id, tabId, "available space is used for a tiled split");
-    assert.ok(childPanes.slice(1).every((p: any) => p.tab_id !== tabId), "overflow uses background tabs");
-    assert.equal(childTabs.size, 2, "each overflowing agent gets its own new tab");
+    const main = panes().find((p: any) => !p.is_plugin && p.id === parent.id);
+    assert.ok(childPanes.every((p: any) => p.tab_id === tabId &&
+      p.pane_columns <= main.pane_columns && p.pane_rows <= main.pane_rows));
     assert.deepEqual(activeTabs(), activeBefore, "do not switch the active tab");
-    for (const pane of childPanes.slice(1)) {
-      assert.equal(panes().filter((p: any) => p.tab_id === pane.tab_id).length, 1, "explicit layout creates exactly one pane, no default commands/plugins");
-    }
     assert.ok(childPanes.every((p: any) => !p.is_suppressed), "subagent panes remain visible, never stacked");
     const focused = () => panes().filter((p: any) => p.tab_id === tabId && !p.is_plugin && p.is_focused).map((p: any) => p.id);
-    assert.deepEqual(focused(), [parent.id], "new tabs do not steal client focus");
-    assert.equal(panes().filter((p: any) => p.tab_id === tabId && !p.is_plugin).length, 2);
+    assert.deepEqual(focused(), [parent.id], "new panes do not steal client focus");
+    assert.equal(panes().filter((p: any) => p.tab_id === tabId && !p.is_plugin).length, 4);
     await new Promise(resolve => setTimeout(resolve, Number(process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS ?? 2500)));
 
     const literal = "$HOME 'quoted' " + "X".repeat(500);
@@ -91,9 +87,6 @@ it("Zellij: tiled placement, focus-safe background tabs, messages and exit detec
     else process.env.PI_SUBAGENT_ZELLIJ_MIN_ROWS = oldRows;
     if (oldParent === undefined) delete process.env.ZELLIJ_PANE_ID;
     else process.env.ZELLIJ_PANE_ID = oldParent;
-    for (const childTabId of childTabs) {
-      try { action("close-tab-by-id", String(childTabId)); } catch {}
-    }
     if (tabId !== undefined) action("close-tab-by-id", String(tabId));
     rmSync(dir, { recursive: true, force: true });
   }

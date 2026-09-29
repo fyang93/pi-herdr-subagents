@@ -2,11 +2,11 @@
 
 Async subagents for [pi](https://github.com/badlogic/pi-mono), running in Zellij panes. Spawn a sub-agent, keep working in the main session, and get the result steered back when it finishes. Fully non-blocking.
 
-Requires **Zellij 0.44+** for tiled panes; **0.45+** is required for focus-preserving overflow tabs (recommended). See [Acknowledgements](#acknowledgements) for the upstream project.
+Requires **Zellij 0.44+**; **0.45+** is recommended for focus-preserving pane creation. See [Acknowledgements](#acknowledgements) for the upstream project.
 
 ## How it works
 
-`subagent()` returns immediately. The sub-agent runs in its own pane without stealing keyboard focus: a tiled pane in the parent's Zellij tab, or a background tab when space runs out. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
+`subagent()` returns immediately. The sub-agent runs in its own pane without stealing keyboard focus: a tiled pane in the parent's Zellij tab. If no safe space remains, creation fails rather than opening a larger pane. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
 
 ```
 ╭─ Subagents ──────────────────────────── 2 running ─╮
@@ -17,7 +17,7 @@ Requires **Zellij 0.44+** for tiled panes; **0.45+** is required for focus-prese
 
 Spawn several in parallel — they run concurrently and steer results back independently as each finishes.
 
-Pane placement prefers tiled subagents within the parent's tab and never requests stacks. It first splits the largest eligible non-parent pane in the same tab (including visible held panes whose commands have exited), only splitting the main (parent) session when no other pane has enough space. The target and direction are explicit: prefer a side-by-side split when it fits, otherwise try a top/bottom split. Split eligibility uses a conservative minimum of **50 columns × 10 rows of usable content**, accounting for content geometry and reserving at least two frame cells per dimension on each resulting pane. Once another split would make panes too small, each new subagent gets a separate background tab instead of being stacked or hidden. The minimum is configurable before starting pi:
+Pane placement uses a linear scan, not sorting, to select the largest eligible pane by area (including the parent and visible held panes), preferring non-parent panes on ties. If its row count exceeds its column count, prefer a top/bottom split; otherwise prefer left/right (including ties). Try the other direction if the preferred split cannot meet the constraints. These are terminal cell counts, not pixel dimensions. Before issuing any split command, it calculates the resulting dimensions: every sibling must fit within the resulting parent's width and height. Thus a half-screen parent plus two quarter-screen children can become four equal quarters by splitting the parent. Splits of the parent require an even dimension to avoid a rounding cell making the child larger. Never create overflow tabs or stacks. Split eligibility requires **50 columns × 10 rows of usable content**, reserving at least two frame cells per dimension on each resulting pane. The minimum is configurable before starting pi:
 
 ```bash
 export PI_SUBAGENT_ZELLIJ_MIN_COLUMNS=50
@@ -27,11 +27,9 @@ export PI_SUBAGENT_ZELLIJ_PARENT_MIN_COLUMNS=80
 export PI_SUBAGENT_ZELLIJ_PARENT_MIN_ROWS=20
 ```
 
-Parent-specific minima only constrain splits of the parent and cannot lower the common minimum. These thresholds and sibling-first/right-first preferences are extension policy, not Zellij-prescribed values.
+Parent-specific minima only constrain splits of the parent and cannot lower the common minimum. These thresholds and largest-first/longer-dimension-first preferences are extension policy, not Zellij-prescribed values.
 
-If there is no safe tiled split, the extension creates a new tab with `--no-focus`, preserving the user's current focus. Overflow tabs have an explicit single-terminal layout so custom default layouts cannot launch unrelated commands or create stacks. Each overflowing agent gets its own tab; switch tabs to view its output. Closing that agent's only pane also removes its tab. On Zellij 0.44, overflow fails with an upgrade hint rather than stealing focus.
-
-If layout inspection fails, outer geometry is missing or inconsistent, or the parent's tab is fullscreen, creation uses a background tab instead of guessing or altering fullscreen. Apart from the selected split, existing panes are not closed, resized, replaced or rearranged to make room. The extension does not change `auto_layout` or other user settings.
+If space runs out, layout inspection fails, geometry is incomplete, or the parent's tab is fullscreen, creation fails with a clear error. Free pane space or enlarge the parent before retrying. There is no automatic queue. Existing oversized panes are not repaired, and existing panes are not closed, resized or rearranged to make room. The extension does not change `auto_layout` or other user settings.
 
 Creation remains asynchronous. Layout inspection and pane creation are serialized within each parent pi process to avoid parallel launches using stale geometry; this does not lock out manual layout changes or other pi processes. Tiled pane creation uses `--no-focus` on Zellij 0.45+ (`--near-current-pane` on 0.44), an explicit `--direction`, and the selected target's `ZELLIJ_PANE_ID`; there is no directionless fallback. All reads, messages and closes target explicit pane IDs. Older Zellij releases are rejected because they lack the required pane-targeted CLI actions. Implementation: `pi-extension/subagents/zellij.ts` and `zellij-layout.ts`.
 

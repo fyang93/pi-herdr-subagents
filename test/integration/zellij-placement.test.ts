@@ -58,21 +58,28 @@ it(`Zellij: splitting a ${held ? "exited/held" : "live"} sibling preserves the o
     for (const p of [after, child, find(siblingId)]) {
       assert.ok(p.pane_content_columns >= Number(process.env.PI_SUBAGENT_ZELLIJ_MIN_COLUMNS));
       assert.ok(p.pane_content_rows >= Number(process.env.PI_SUBAGENT_ZELLIJ_MIN_ROWS));
+      assert.ok(p.pane_columns <= after.pane_columns && p.pane_rows <= after.pane_rows);
     }
     assert.equal(child.pane_x, sibling.pane_x, "second child splits the sibling column");
     assert.ok(find(siblingId), "keep the sibling and its output, even after exit");
     assert.deepEqual(activeTabs(), activeBefore, "background creation must preserve active tabs");
+    const third = await createSurface("placement-third");
+    const balancedParent = find(parent.id);
+    assert.equal(balancedParent.pane_rows, before.pane_rows / 2, "split the half-screen parent into quarters");
+    for (const id of [siblingId, Number(second.replace("terminal_", "")), Number(third.replace("terminal_", ""))]) {
+      const p = find(id);
+      assert.equal(p.pane_columns, balancedParent.pane_columns);
+      assert.equal(p.pane_rows, balancedParent.pane_rows);
+    }
     process.env.PI_SUBAGENT_ZELLIJ_MIN_COLUMNS = "10000";
-    const overflow = await createSurface(`${name}-overflow`);
-    const overflowPane = find(Number(overflow.replace("terminal_", "")));
-    assert.notEqual(overflowPane.tab_id, tabId, "insufficient space uses a separate tab");
-    assert.deepEqual(geometry(find(parent.id)), geometry(before));
+    await assert.rejects(createSurface(`${name}-overflow`), /No safe tiled split/);
+    assert.deepEqual(geometry(find(parent.id)), geometry(balancedParent));
     assert.deepEqual(activeTabs(), activeBefore, "overflow also preserves active tabs");
   } finally {
     process.env = env;
     // Clean up only the uniquely named test tab, never an unrelated ID.
     const tabs = JSON.parse(action("list-tabs", "--json")).filter((t: any) =>
-      t.name === name || t.name === `${name}-overflow`);
+      t.name === name);
     for (const tab of tabs) action("close-tab-by-id", String(tab.tab_id));
   }
 });

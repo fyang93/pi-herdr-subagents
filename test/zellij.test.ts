@@ -12,11 +12,15 @@ import {
   sendCommand, readScreen, readScreenAsync, closeSurface, pollForExit, shellEscape, withProcessId,
 } from "../pi-extension/subagents/zellij.ts";
 
-it("prefers safe siblings before splitting the parent, otherwise chooses a new tab", () => {
+it("splits the largest eligible pane while bounding siblings by the resulting parent size", () => {
   const pane = (id: number, rows = 40, columns = 120, extra = {}) => ({
     id, is_plugin: false, pane_rows: rows, pane_columns: columns, tab_id: 1, ...extra,
   });
-  assert.equal(splitDirection(pane(0)), "right", "prefer right even when both directions fit");
+  assert.equal(splitDirection(pane(0)), "right", "wide panes split left/right");
+  assert.equal(splitDirection(pane(0, 140, 120)), "down", "tall panes split top/bottom even when both fit");
+  assert.equal(splitDirection(pane(0, 120, 120)), "right", "ties split left/right");
+  assert.deepEqual(selectPlacement([pane(0, 140, 120)], 0), { paneId: 0, direction: "down" });
+  assert.deepEqual(selectPlacement([pane(0, 140, 120), pane(1, 140, 120)], 0), { paneId: 1, direction: "down" });
   assert.equal(splitDirection(pane(0, 12, 104)), "right");
   assert.equal(splitDirection(pane(0, 24, 103)), "down");
   assert.equal(splitDirection(pane(0, 23, 103)), null);
@@ -29,19 +33,23 @@ it("prefers safe siblings before splitting the parent, otherwise chooses a new t
   assert.equal(splitDirection(pane(0, 24, 104, { pane_content_columns: 100, pane_content_rows: 22 })), "down");
   assert.deepEqual(selectPlacement([pane(0)], 0), { paneId: 0, direction: "right" });
   assert.deepEqual(selectPlacement([pane(0), pane(1)], 0), { paneId: 1, direction: "right" });
-  assert.deepEqual(selectPlacement([pane(0, 80, 200), pane(1)], 0), { paneId: 1, direction: "right" });
-  assert.deepEqual(selectPlacement([pane(0), pane(1, 24, 60)], 0), { paneId: 1, direction: "down" });
+  assert.deepEqual(selectPlacement([pane(3), pane(0), pane(2), pane(1)], 0),
+    { paneId: 1, direction: "right" }, "equal areas keep non-parent preference and deterministic ID tie-break");
+  assert.deepEqual(selectPlacement([pane(1, 24, 100), pane(0), pane(2, 30, 120)], 0),
+    { paneId: 2, direction: "right" }, "linear scan replaces a smaller candidate with a larger one");
+  assert.deepEqual(selectPlacement([pane(0, 80, 200), pane(1)], 0), { paneId: 0, direction: "down" });
+  assert.deepEqual(selectPlacement([pane(0), pane(1, 24, 60)], 0), { paneId: 0, direction: "right" });
   assert.deepEqual(selectPlacement([pane(0), pane(1, 10, 60)], 0), { paneId: 0, direction: "right" });
-  assert.deepEqual(selectPlacement([pane(0, 10, 60), pane(1, 20, 120)], 0), { paneId: 1, direction: "right" });
-  assert.deepEqual(selectPlacement([pane(0), pane(1), pane(2, 80, 200)], 0), { paneId: 2, direction: "right" });
-  assert.deepEqual(selectPlacement([pane(0, 100, 47), pane(1, 31, 77)], 0), { paneId: 1, direction: "down" });
-  assert.equal(selectPlacement([pane(0, 5, 10), pane(1, 6, 8)], 0), "new-tab");
-  assert.equal(selectPlacement([pane(0, 5, 10)], 0), "new-tab", "do not split below the configured minimum");
+  assert.equal(selectPlacement([pane(0, 10, 60), pane(1, 20, 120)], 0), null);
+  assert.equal(selectPlacement([pane(0), pane(1), pane(2, 80, 200)], 0), null, "do not compound an already oversized layout");
+  assert.equal(selectPlacement([pane(0, 100, 47), pane(1, 31, 77)], 0), null, "area alone is not enough");
+  assert.equal(selectPlacement([pane(0, 5, 10), pane(1, 6, 8)], 0), null);
+  assert.equal(selectPlacement([pane(0, 5, 10)], 0), null, "do not split below the configured minimum");
   const mixed = [pane(0, 5, 10), pane(1, 10, 60), pane(2, 10, 80),
     pane(3, 80, 200, { is_plugin: true }), pane(4, 80, 200, { is_floating: true }),
     pane(5, 80, 200, { is_suppressed: true }), pane(6, 80, 200, { is_selectable: false }),
     pane(7, 80, 200, { tab_id: 2 })];
-  assert.equal(selectPlacement(mixed, 0), "new-tab");
+  assert.equal(selectPlacement(mixed, 0), null);
   assert.equal(selectPlacement(mixed, 99), null);
   assert.deepEqual(selectPlacement([
     pane(0, 50, 90), pane(128, 50, 89, { exited: true }),
@@ -49,15 +57,28 @@ it("prefers safe siblings before splitting the parent, otherwise chooses a new t
   assert.deepEqual(selectPlacement([
     pane(0, 50, 90), pane(128, 50, 89, { exited: true, is_suppressed: true }),
   ], 0), { paneId: 0, direction: "down" }, "suppressed panes are not visible split targets");
-  assert.equal(selectPlacement([pane(0), pane(1)], 0, 100, 30), "new-tab");
+  assert.equal(selectPlacement([pane(0), pane(1)], 0, 100, 30), null);
   assert.equal(selectPlacement([pane(0), pane(1, 40, 120, { pane_rows: undefined })], 0), null);
   assert.equal(selectPlacement([pane(0), pane(1, 40, 120, { pane_content_rows: 41 })], 0), null);
-  assert.equal(selectPlacement([pane(0, 40, 120, { is_fullscreen: true }), pane(1)], 0), "new-tab");
-  assert.equal(selectPlacement([pane(0, 40, 120, { is_floating: true }), pane(1)], 0), "new-tab");
-  assert.equal(selectPlacement([pane(0)], 0, 50, 10, 80, 20), "new-tab", "honor higher parent minimums");
+  assert.equal(selectPlacement([pane(0, 40, 120, { is_fullscreen: true }), pane(1)], 0), null);
+  assert.equal(selectPlacement([pane(0, 40, 120, { is_floating: true }), pane(1)], 0), null);
+  assert.equal(selectPlacement([pane(0)], 0, 50, 10, 80, 20), null, "honor higher parent minimums");
   assert.deepEqual(selectPlacement([pane(0), pane(1)], 0, 50, 10, 80, 20), { paneId: 1, direction: "right" });
-  assert.deepEqual(selectPlacement([pane(0, 50, 179)], 0, 50, 10, 80, 20), { paneId: 0, direction: "right" });
+  assert.deepEqual(selectPlacement([pane(0, 50, 179)], 0, 50, 10, 80, 20), { paneId: 0, direction: "down" });
+  assert.equal(selectPlacement([pane(0, 51, 179)], 0), null, "avoid unequal halves from rounding");
   assert.deepEqual(selectPlacement([pane(0), pane(1)], 0, 80, 15), { paneId: 1, direction: "down" });
+  // Largest-first alone is insufficient: halving the 40-row parent would leave
+  // the 30-row sibling larger. Split the sibling instead, even though it is smaller.
+  assert.deepEqual(selectPlacement([pane(0, 40, 100), pane(1, 30, 100)], 0),
+    { paneId: 1, direction: "down" });
+  // Main is 1/2, children are 1/4 each: split main down into four equal quarters.
+  assert.deepEqual(selectPlacement([pane(0, 48, 100), pane(1, 24, 100), pane(2, 24, 100)], 0),
+    { paneId: 0, direction: "down" });
+  // Try down even when right meets the minimum but would leave main narrower than its children.
+  assert.deepEqual(selectPlacement([pane(0, 48, 200), pane(1, 24, 200), pane(2, 24, 200)], 0),
+    { paneId: 0, direction: "down" });
+  assert.deepEqual(selectPlacement([pane(0, 48, 100), pane(1, 48, 100)], 0),
+    { paneId: 1, direction: "down" }, "two equal halves: splitting main would make the child larger");
   for (const value of [undefined, "0", "-1", "1.5", "NaN", "Infinity"]) {
     assert.equal(positiveInteger(value, 50), 50);
   }
