@@ -80,7 +80,7 @@ if (args[1] === 'new-pane') console.log('terminal_8');
     assert.equal(await createSurface("sibling"), "terminal_8");
     const split = f.calls().find(c => c.args[1] === "new-pane")!;
     assert.equal(split.parent, "7");
-    assert.equal(split.args[split.args.indexOf("--direction") + 1], "right");
+    assert.equal(split.args[split.args.indexOf("--direction") + 1], "down");
     assert.equal(process.env.ZELLIJ_PANE_ID, "0");
     assert.ok(split.args.includes("--no-focus"));
     process.env.PI_SUBAGENT_ZELLIJ_PARENT_MIN_COLUMNS = "1000";

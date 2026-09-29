@@ -18,7 +18,8 @@ it("splits the largest eligible pane while bounding siblings by the resulting pa
   });
   assert.equal(splitDirection(pane(0)), "right", "wide panes split left/right");
   assert.equal(splitDirection(pane(0, 140, 120)), "down", "tall panes split top/bottom even when both fit");
-  assert.equal(splitDirection(pane(0, 120, 120)), "right", "ties split left/right");
+  assert.equal(splitDirection(pane(0, 60, 120)), "right", "visual ties split left/right");
+  assert.equal(splitDirection(pane(0, 120, 120)), "down", "square in cells is visually tall");
   assert.deepEqual(selectPlacement([pane(0, 140, 120)], 0), { paneId: 0, direction: "down" });
   assert.deepEqual(selectPlacement([pane(0, 140, 120), pane(1, 140, 120)], 0), { paneId: 1, direction: "down" });
   assert.equal(splitDirection(pane(0, 12, 104)), "right");

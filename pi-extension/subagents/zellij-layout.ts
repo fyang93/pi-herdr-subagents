@@ -30,12 +30,12 @@ function measurePane(pane: PaneGeometry) {
   return { rows, columns, rowInset, columnInset };
 }
 
-/** Prefer splitting the longer dimension, using Zellij's column/row counts. */
+/** Approximate visual aspect ratio: a terminal cell is about twice as tall as wide. */
 function splitDirections(pane: PaneGeometry, minColumns: number, minRows: number): ("down" | "right")[] {
   const size = measurePane(pane);
   if (!size) return [];
   const { rows, columns, rowInset, columnInset } = size;
-  const directions: ("down" | "right")[] = rows > columns ? ["down", "right"] : ["right", "down"];
+  const directions: ("down" | "right")[] = rows * 2 > columns ? ["down", "right"] : ["right", "down"];
   return directions.filter(direction => direction === "right"
     ? rows - rowInset >= minRows && Math.floor(columns / 2) - columnInset >= minColumns
     : columns - columnInset >= minColumns && Math.floor(rows / 2) - rowInset >= minRows);
