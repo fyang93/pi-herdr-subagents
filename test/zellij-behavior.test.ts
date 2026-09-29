@@ -54,7 +54,8 @@ if (args[1] === 'list-panes') {
     assert.deepEqual(actions.map(c => c.args[1]), ["list-panes", "new-pane", "rename-pane", "list-panes", "new-tab", "list-panes", "rename-tab", "rename-pane"]);
     const split = actions.find(c => c.args[1] === "new-pane")!;
     const tab = actions.find(c => c.args[1] === "new-tab")!;
-    assert.ok(tab.args.includes("--no-focus") && tab.args.includes("layout { pane; }"));
+    assert.ok(tab.args.includes("--no-focus"));
+    assert.ok(!tab.args.includes("--layout-string"), "inherit Zellij's default tab layout");
     assert.equal(split.parent, "0");
     assert.ok(split.args.includes("--no-focus") && !split.args.includes("--stacked"));
     assert.equal(split.args[split.args.indexOf("--direction") + 1], "right");

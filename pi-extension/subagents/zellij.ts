@@ -155,7 +155,7 @@ async function createSurfaceInNewTab(name: string, marker: string): Promise<stri
   let failure: unknown;
   try {
     const { stdout } = await execFileAsync("zellij", ["action", "new-tab", "--no-focus", "--name", marker,
-      "--cwd", process.cwd(), "--layout-string", "layout { pane; }"], cliOptions);
+      "--cwd", process.cwd()], cliOptions);
     const rawId = stdout.trim();
     if (/^\d+$/.test(rawId) && Number.isSafeInteger(Number(rawId))) tabId = Number(rawId);
   } catch (error) { failure = error; }

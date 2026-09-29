@@ -49,6 +49,10 @@ it("Zellij: size-bounded tiled placement, background overflow, messages and exit
     assert.notEqual(overflowTab, tabId);
     assert.equal(panes().filter((p: any) => p.tab_id === overflowTab && !p.is_plugin).length, 1,
       "new tab already contains the pane used for the agent command");
+    for (const plugin of ["tab-bar", "status-bar"]) {
+      assert.ok(panes().some((p: any) => p.tab_id === overflowTab && p.plugin_url === plugin),
+        `new tab includes ${plugin}`);
+    }
     const childPanes = children.map(surface => panes().find((p: any) => !p.is_plugin && p.id === Number(surface.replace("terminal_", ""))));
     assert.ok(childPanes.every((p: any) => p), "each pane should exist");
     const main = panes().find((p: any) => !p.is_plugin && p.id === parent.id);
