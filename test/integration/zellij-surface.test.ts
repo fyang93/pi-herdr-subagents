@@ -47,6 +47,8 @@ it("Zellij: size-bounded tiled placement, background overflow, messages and exit
     const overflow = await createSurface("overflow");
     overflowTab = panes().find((p: any) => p.id === Number(overflow.replace("terminal_", "")) && !p.is_plugin)?.tab_id;
     assert.notEqual(overflowTab, tabId);
+    assert.equal(panes().filter((p: any) => p.tab_id === overflowTab && !p.is_plugin).length, 1,
+      "new tab already contains the pane used for the agent command");
     const childPanes = children.map(surface => panes().find((p: any) => !p.is_plugin && p.id === Number(surface.replace("terminal_", ""))));
     assert.ok(childPanes.every((p: any) => p), "each pane should exist");
     const main = panes().find((p: any) => !p.is_plugin && p.id === parent.id);
@@ -58,6 +60,12 @@ it("Zellij: size-bounded tiled placement, background overflow, messages and exit
     assert.deepEqual(focused(), [parent.id], "new panes do not steal client focus");
     assert.equal(panes().filter((p: any) => p.tab_id === tabId && !p.is_plugin).length, 4);
     await new Promise(resolve => setTimeout(resolve, Number(process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS ?? 2500)));
+    sendCommand(overflow, "printf 'OVERFLOW_%s\\n' AGENT_READY");
+    for (let i = 0; i < 100 && !readScreen(overflow).includes("OVERFLOW_AGENT_READY"); i++) {
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    assert.ok(readScreen(overflow).includes("OVERFLOW_AGENT_READY"), "command runs inside the new tab's pane");
+    assert.deepEqual(activeTabs(), activeBefore, "sending to background tab preserves focus");
 
     const literal = "$HOME 'quoted' " + "X".repeat(500);
     sendLongCommand(children[1], `printf '%s\\n' ${shellEscape(literal)}; printf '__SUBAGENT_DONE_%s__\\n' 7`, {
