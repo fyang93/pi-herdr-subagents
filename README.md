@@ -17,17 +17,14 @@ Requires **Zellij 0.44+**; **0.45+** is required for focus-preserving background
 
 Spawn several in parallel — they run concurrently and steer results back independently as each finishes.
 
-Pane placement uses a linear scan, not sorting, to select the largest eligible pane by area (including the parent and visible held panes), preferring non-parent panes on ties. To approximate visual shape, compare columns to twice the rows (terminal cells are roughly twice as tall as wide): taller panes split top/bottom, otherwise left/right. Try the other direction if the preferred split cannot meet the constraints. This fixed factor is only an approximation, not a pixel measurement. Before issuing any split command, it calculates the resulting dimensions: every sibling must fit within the resulting parent's width and height. Thus a half-screen parent plus two quarter-screen children can become four equal quarters by splitting the parent. Splits of the parent require an even dimension to avoid a rounding cell making the child larger. Never create stacks; overflow tabs do not contain the parent, so they are exempt from the same-tab size constraint. Split eligibility requires **50 columns × 10 rows of usable content**, reserving at least two frame cells per dimension on each resulting pane. The minimum is configurable before starting pi:
+Pane placement uses a linear scan, not sorting, to select the largest eligible pane by area (including visible held panes). To approximate visual shape, compare columns to twice the rows (terminal cells are roughly twice as tall as wide): taller panes split top/bottom, otherwise left/right. Try the other direction if the preferred split cannot meet the constraints. This fixed factor is only an approximation, not a pixel measurement. Never create stacks. Split eligibility requires **50 columns × 15 rows of usable content**, reserving at least two frame cells per dimension on each resulting pane. The minimum is configurable before starting pi:
 
 ```bash
 export PI_SUBAGENT_ZELLIJ_MIN_COLUMNS=50
-export PI_SUBAGENT_ZELLIJ_MIN_ROWS=10
-# Optional stronger protection for the main session (defaults to the values above):
-export PI_SUBAGENT_ZELLIJ_PARENT_MIN_COLUMNS=80
-export PI_SUBAGENT_ZELLIJ_PARENT_MIN_ROWS=20
+export PI_SUBAGENT_ZELLIJ_MIN_ROWS=15
 ```
 
-Parent-specific minima only constrain splits of the parent and cannot lower the common minimum. These thresholds and largest-first/longer-dimension-first preferences are extension policy, not Zellij-prescribed values.
+These thresholds and largest-first/longer-dimension-first preferences are extension policy, not Zellij-prescribed values.
 
 If space runs out, layout inspection fails, geometry is incomplete, or the parent's tab is fullscreen, creation uses a background single-pane tab on Zellij 0.45+ (on 0.44 it fails rather than stealing focus). There is no automatic queue. Existing oversized panes are not repaired, and existing panes are not closed, resized or rearranged to make room. The extension does not change `auto_layout` or other user settings.
 

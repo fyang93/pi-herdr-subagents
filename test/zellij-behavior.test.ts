@@ -22,8 +22,6 @@ ${script}
     ZELLIJ_SESSION_NAME: dir, TEST_LOG: log, TEST_DIR: dir });
   delete process.env.PI_SUBAGENT_ZELLIJ_MIN_COLUMNS;
   delete process.env.PI_SUBAGENT_ZELLIJ_MIN_ROWS;
-  delete process.env.PI_SUBAGENT_ZELLIJ_PARENT_MIN_COLUMNS;
-  delete process.env.PI_SUBAGENT_ZELLIJ_PARENT_MIN_ROWS;
   hooks.clearPaneSample();
   return { dir, calls: () => readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map(s => JSON.parse(s)),
     close() { process.env = env; hooks.clearPaneSample(); rmSync(dir, { recursive: true, force: true }); } };
@@ -69,11 +67,11 @@ if (args[1] === 'list-panes') {
   } finally { clearInterval(timer); f.close(); }
 });
 
-it("targets a visible exited sibling explicitly instead of shrinking the larger parent", async () => {
+it("splits the largest pane in the tab regardless of the caller pane size", async () => {
   const f = fixture(`
 if (args[1] === 'list-panes') console.log(JSON.stringify([
-  {id:0,is_plugin:false,tab_id:9,pane_rows:80,pane_columns:200},
-  {id:7,is_plugin:false,tab_id:9,pane_rows:80,pane_columns:120,exited:true,is_held:true}
+  {id:0,is_plugin:false,tab_id:9,pane_rows:40,pane_columns:120},
+  {id:7,is_plugin:false,tab_id:9,pane_rows:80,pane_columns:200,exited:true,is_held:true}
 ]));
 if (args[1] === 'new-pane') console.log('terminal_8');
 `);
@@ -81,13 +79,9 @@ if (args[1] === 'new-pane') console.log('terminal_8');
     assert.equal(await createSurface("sibling"), "terminal_8");
     const split = f.calls().find(c => c.args[1] === "new-pane")!;
     assert.equal(split.parent, "7");
-    assert.equal(split.args[split.args.indexOf("--direction") + 1], "down");
+    assert.equal(split.args[split.args.indexOf("--direction") + 1], "right");
     assert.equal(process.env.ZELLIJ_PANE_ID, "0");
     assert.ok(split.args.includes("--no-focus"));
-    process.env.PI_SUBAGENT_ZELLIJ_PARENT_MIN_COLUMNS = "1000";
-    process.env.PI_SUBAGENT_ZELLIJ_PARENT_MIN_ROWS = "1000";
-    assert.equal(await createSurface("sibling-with-large-parent-minimum"), "terminal_8");
-    assert.equal(f.calls().filter(c => c.args[1] === "new-pane").at(-1)!.parent, "7");
   } finally { f.close(); }
 });
 
@@ -116,20 +110,16 @@ if (args[1] === 'list-panes') {
   } finally { f.close(); }
 });
 
-it("applies parent-specific minimums before deciding to split", async () => {
+it("uses the common minimum without caller-pane-specific limits", async () => {
   const f = fixture(`
 if (args[1] === 'list-panes') {
   if (args.includes('--geometry')) console.log('[{"id":0,"is_plugin":false,"tab_id":9,"pane_rows":40,"pane_columns":120}]');
   else console.log(JSON.stringify([{id:20,is_plugin:false,tab_id:10,tab_name:fs.readFileSync(process.env.TEST_DIR+'/marker','utf8')}]));
-} else if (args[1] === 'new-tab') {
-  fs.writeFileSync(process.env.TEST_DIR+'/marker',args[args.indexOf('--name')+1]); console.log('10');
-}
+} else if (args[1] === 'new-pane') console.log('terminal_21');
 `);
   try {
-    process.env.PI_SUBAGENT_ZELLIJ_PARENT_MIN_COLUMNS = '80';
-    process.env.PI_SUBAGENT_ZELLIJ_PARENT_MIN_ROWS = '20';
-    assert.equal(await createSurface('protected'), 'terminal_20');
-    assert.ok(!f.calls().some(c => c.args[1] === 'new-pane'));
+    assert.equal(await createSurface('common-minimum'), 'terminal_21');
+    assert.ok(f.calls().some(c => c.args[1] === 'new-pane'));
   } finally { f.close(); }
 });
 

@@ -100,16 +100,13 @@ async function createSurfaceUnlocked(name: string, fromSurface?: string): Promis
   }
   let placement: Placement = null;
   const minColumns = positiveInteger(process.env.PI_SUBAGENT_ZELLIJ_MIN_COLUMNS, 50);
-  const minRows = positiveInteger(process.env.PI_SUBAGENT_ZELLIJ_MIN_ROWS, 10);
+  const minRows = positiveInteger(process.env.PI_SUBAGENT_ZELLIJ_MIN_ROWS, 15);
   // Unknown geometry must not turn into an uncontrolled split of the parent.
   try {
     const { stdout } = await execFileAsync("zellij", ["action", "list-panes", "--json", "--geometry", "--state", "--tab"], {
       ...cliOptions, env: { ...process.env, ZELLIJ_PANE_ID: parent },
     });
-    placement = selectPlacement(parsePaneList(stdout), Number(parent),
-      minColumns, minRows,
-      positiveInteger(process.env.PI_SUBAGENT_ZELLIJ_PARENT_MIN_COLUMNS, minColumns),
-      positiveInteger(process.env.PI_SUBAGENT_ZELLIJ_PARENT_MIN_ROWS, minRows));
+    placement = selectPlacement(parsePaneList(stdout), Number(parent), minColumns, minRows);
   } catch {} // Unknown geometry must not turn into an uncontrolled split.
   const marker = `pi-create-${randomUUID()}`;
   if (placement === null) return createSurfaceInNewTab(name, marker);

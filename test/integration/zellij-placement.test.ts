@@ -28,8 +28,6 @@ it(`Zellij: splitting a ${held ? "exited/held" : "live"} sibling preserves the o
     }
     assert.ok(parent);
     process.env.ZELLIJ_PANE_ID = String(parent.id);
-    delete process.env.PI_SUBAGENT_ZELLIJ_PARENT_MIN_COLUMNS;
-    delete process.env.PI_SUBAGENT_ZELLIJ_PARENT_MIN_ROWS;
     // Permit exactly two columns of panes, then require splitting vertically.
     process.env.PI_SUBAGENT_ZELLIJ_MIN_COLUMNS = String(Math.floor(parent.pane_columns / 2) - 2);
     process.env.PI_SUBAGENT_ZELLIJ_MIN_ROWS = String(Math.floor(parent.pane_rows / 4));
@@ -106,8 +104,6 @@ it("Zellij: repeated splits keep every child in the parent's tab no larger than 
     process.env.ZELLIJ_PANE_ID = String(parent.id);
     delete process.env.PI_SUBAGENT_ZELLIJ_MIN_COLUMNS;
     delete process.env.PI_SUBAGENT_ZELLIJ_MIN_ROWS;
-    delete process.env.PI_SUBAGENT_ZELLIJ_PARENT_MIN_COLUMNS;
-    delete process.env.PI_SUBAGENT_ZELLIJ_PARENT_MIN_ROWS;
     let tiled = 0, overflow = 0;
     for (let i = 0; i < 18; i++) {
       const surface = await createSurface(`${name}-${i}`);
