@@ -1,7 +1,7 @@
 {
-  "name": "pi-interactive-subagents",
-  "version": "3.7.2",
-  "description": "Interactive subagents for pi - spawn, orchestrate, and manage sub-agent sessions in Zellij",
+  "name": "pi-herdr-subagents",
+  "version": "4.0.0",
+  "description": "Interactive subagents for pi - spawn, orchestrate, and manage sub-agent sessions as herdr agents",
   "keywords": [
     "pi-package"
   ],
@@ -9,12 +9,11 @@
   "author": "Amos Blomqvist",
   "repository": {
     "type": "git",
-    "url": "https://github.com/fyang93/pi-interactive-subagents"
+    "url": "https://github.com/fyang93/pi-herdr-subagents"
   },
   "type": "module",
   "scripts": {
-    "test": "node --test test/test.ts test/zellij.test.ts test/zellij-behavior.test.ts",
-    "test:integration": "node --test --test-concurrency=1 test/integration/*.test.ts"
+    "test": "node --test test/test.ts test/herdr.test.ts"
   },
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": "*",

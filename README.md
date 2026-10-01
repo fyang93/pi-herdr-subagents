@@ -1,56 +1,24 @@
-# pi-interactive-subagents
+# pi-herdr-subagents
 
-Async subagents for [pi](https://github.com/badlogic/pi-mono), running in Zellij panes. Spawn a sub-agent, keep working in the main session, and get the result steered back when it finishes. Fully non-blocking.
-
-Requires **Zellij 0.44+**; **0.45+** is required for focus-preserving background overflow tabs. See [Acknowledgements](#acknowledgements) for the upstream project.
+Async subagents for [pi](https://github.com/badlogic/pi-mono), running as named agents in [herdr](https://herdr.dev). Spawn a sub-agent, keep working in the main session, and get the result steered back when it finishes. Fully non-blocking.
 
 ## How it works
 
-`subagent()` returns immediately. The sub-agent runs in its own pane without stealing keyboard focus: a tiled pane in the parent's Zellij tab, or a background tab when no safe split remains. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
+`subagent()` returns as soon as the sub-agent is up. Each sub-agent is a herdr agent in its own pane, without stealing keyboard focus: an unfocused split of the largest pane in the parent's tab, or a background tab when no split leaves both halves at least **50 columns × 15 rows** (`PI_SUBAGENT_MIN_COLUMNS`, `PI_SUBAGENT_MIN_ROWS`). Existing panes are never rearranged, and a zoomed tab always gets a background tab.
 
-```
-╭─ Subagents ──────────────────────────── 2 running ─╮
-│ 00:23  scout      active · bash 7m                 │
-│ 00:45  scout-2    waiting 2m                       │
-╰────────────────────────────────────────────────────╯
-```
+- **Start** — `herdr agent start <name> --kind pi` launches pi once the pane's shell is ready, and returns when pi is ready for input; the skills and the task are then submitted with `herdr agent prompt`. The herdr agent name is derived from the display name (`Scout: auth` → `scout-auth`, suffixed when taken).
+- **Status** — herdr's agents sidebar shows every sub-agent as working, idle, blocked or done. The extension installs herdr's pi integration (`herdr integration install pi`) on first start inside herdr, so the state comes from pi itself rather than screen detection.
+- **Blocked** — when herdr sees an autonomous sub-agent stuck at a confirmation or question dialog, the parent is told once, with the pane to look at.
+- **Completion** — on quit, the sub-agent writes `<session>.exit` (`done`, or `error` with the provider's message when its last turn failed). The parent checks that marker and asks herdr whether the agent is still in its pane, once a second. An agent that leaves its pane twice in a row without a marker is reported as interrupted; its pane is left open for inspection. On completion the parent reads the result from the session file, closes the pane and steers the result into the main session.
+- **Shutdown** — on parent shutdown or `/reload`, tracked sub-agent panes are closed.
 
 Spawn several in parallel — they run concurrently and steer results back independently as each finishes.
-
-Pane placement uses a linear scan, not sorting, to select the largest eligible pane by area (including visible held panes). To approximate visual shape, compare columns to twice the rows (terminal cells are roughly twice as tall as wide): taller panes split top/bottom, otherwise left/right. Try the other direction if the preferred split cannot meet the constraints. This fixed factor is only an approximation, not a pixel measurement. Never create stacks. Split eligibility requires **50 columns × 15 rows of usable content**, reserving at least two frame cells per dimension on each resulting pane. The minimum is configurable before starting pi:
-
-```bash
-export PI_SUBAGENT_ZELLIJ_MIN_COLUMNS=50
-export PI_SUBAGENT_ZELLIJ_MIN_ROWS=15
-```
-
-These thresholds and largest-first/longer-dimension-first preferences are extension policy, not Zellij-prescribed values.
-
-If space runs out, layout inspection fails, geometry is incomplete, or the parent's tab is fullscreen, creation uses a background single-pane tab on Zellij 0.45+ (on 0.44 it fails rather than stealing focus). There is no automatic queue. Existing oversized panes are not repaired, and existing panes are not closed, resized or rearranged to make room. The extension does not change `auto_layout` or other user settings.
-
-Creation remains asynchronous. Layout inspection and pane creation are serialized within each parent pi process to avoid parallel launches using stale geometry; this does not lock out manual layout changes or other pi processes. Tiled pane creation uses `--no-focus` on Zellij 0.45+ (`--near-current-pane` on 0.44), an explicit `--direction`, and the selected target's `ZELLIJ_PANE_ID`; there is no directionless fallback. All reads, messages and closes target explicit pane IDs. Older Zellij releases are rejected because they lack the required pane-targeted CLI actions. Implementation: `pi-extension/subagents/zellij.ts` and `zellij-layout.ts`.
-
-Official references: [CLI actions](https://zellij.dev/documentation/cli-actions) document `new-pane`, `new-tab`, `--no-focus` and `list-panes`; [options](https://zellij.dev/documentation/options) describe `auto_layout`. `new-pane --pane-id` targets **in-place replacement**, not a tiled split. Layout inspection and creation are not atomic, so simultaneous external changes can still invalidate a placement decision; no absolute geometry guarantee is claimed.
-
-On parent shutdown or `/reload`, the extension attempts to close its tracked subagent panes. Uncertain pane creation or command delivery is not automatically retried; inspect the reported pane or creation marker before retrying.
-
-Completion still uses the terminal sentinel. Watchers read the viewport asynchronously, waiting **1 second between checks** (no overlapping reads per agent). Launches record the child PID before execution. Healthy processes with successful screen reads need no pane-list queries. Missing/unverifiable PIDs or repeated screen-read failures trigger a fallback list query, shared across watchers in the parent process and cached for 5 seconds, including failures.
-
-An unmarked process exit needs two OS probes; a missing pane needs two distinct successful list snapshots, not two reads of the same cache. Completion markers take priority. After PID exit, the watcher also checks the scrollback tail in case the sentinel is no longer in the viewport. Confirmed interruptions are removed from the running list; a surviving shell is left open. Idle processes, interrupted generation (Esc), and failed CLI queries are not treated as process exits.
-
-Tiled placement and fewer redundant queries may reduce load, but do not guarantee prevention of Zellij's slow-client disconnects. The 1-second screen interval improves completion latency, not output throttling.
-
-If your shell startup is slow and launch commands get dropped before the prompt is ready, raise the delay:
-
-```bash
-export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500   # default: 500
-```
 
 ## Tools
 
 | Tool | Description |
 | --- | --- |
-| `subagent` | Spawn a sub-agent in a dedicated Zellij pane (async) |
+| `subagent` | Spawn a sub-agent as a named herdr agent in its own pane (async) |
 | `subagent_message` | Message a sub-agent by name — steers it if running, resumes its session if finished |
 | `subagents_list` | List available agent definitions |
 | `ask_question` | *(sub-agent sessions only)* Ask the orchestrator a question and wait for the reply |
@@ -68,7 +36,7 @@ subagent({ agent: "worker", name: "dark-mode", task: "Implement the dark mode to
 | --------- | ---- | ------- | ----------- |
 | `agent` | string | required | Which agent to spawn (must be known and permitted) |
 | `task` | string | required | Task prompt |
-| `name` | string | agent name | Display name for the pane and widget. Must be unique — duplicates are auto-suffixed (`scout`, `scout-2`, …) |
+| `name` | string | agent name | Display name for the pane and herdr agent. Must be unique — duplicates are auto-suffixed (`scout`, `scout-2`, …) |
 | `model` | string | agent's model | Override the model for this spawn |
 | `cwd` | string | agent's `cwd` | Working directory (see [Role folders](#role-folders)) |
 
@@ -80,7 +48,7 @@ subagent({ agent: "worker", name: "dark-mode", task: "Implement the dark mode to
 subagent_message({ name: "scout", message: "Also check the auth middleware" });
 ```
 
-- **Running** — the message is typed into the live pane (newlines flattened) and picked up at the next turn boundary. The call returns immediately; the eventual completion still arrives as a steer message.
+- **Running** — the message is submitted as one prompt with `herdr agent prompt` (multi-line kept) and picked up at the next turn boundary; herdr refuses it while the sub-agent waits at a dialog. The call returns immediately; the eventual completion still arrives as a steer message.
 - **Finished** — the session is resumed with the message as the follow-up task, like a fresh spawn: fire-and-forget, always autonomous, result steered back later. The resumed run reclaims its original name.
 
 Every spawn records name → session file in `artifacts/<sessionId>/subagent-registry.json`, so names stay addressable across pi restarts. A nested sub-agent that spawns children gets its own registry keyed by its own session id. Resume is refused with a clear error (listing known names) if the name isn't registered, the session file is gone, or the session predates sandboxed resume.
@@ -135,7 +103,7 @@ You are a specialized agent that does X...
 | `session-mode` | string | `standalone` (default), `lineage-only`, or `fork` — see below |
 | `system-prompt` | string | `append` or `replace`: pass the body as the child's `--append-system-prompt` / `--system-prompt`. Omit and the body is prepended to the task prompt instead |
 | `auto-exit` | boolean | Auto-shutdown when the agent finishes (see below) |
-| `interactive` | boolean | Whether stall/recovery transitions wake the parent (see below) |
+| `interactive` | boolean | Whether a blocked sub-agent wakes the parent (see below) |
 | `cwd` | string | Default working directory |
 | `disable-model-invocation` | boolean | Hide from `subagents_list`; still spawnable by explicit name |
 | `cli` | string | `claude` runs the agent via the Claude Code CLI instead of pi |
@@ -157,7 +125,7 @@ Notes:
 
 ### interactive
 
-Controls whether `stalled`/`recovered` status transitions send a steer message to the parent session. Defaults to the inverse of `auto-exit`: autonomous agents get stall pings; user-driven agents stay quiet (the user is already working in that pane — the widget still updates). Set explicitly to override.
+Controls whether a sub-agent blocked at a dialog sends a steer message to the parent session. Defaults to the inverse of `auto-exit`: autonomous agents report it; user-driven agents stay quiet (the user is already working in that pane). Set explicitly to override.
 
 ## Tool access control
 
@@ -194,32 +162,16 @@ subagent({ agent: "worker", cwd: "agents/sre", task: "Review the deployment pipe
 
 Set a per-agent default with `cwd:` in frontmatter.
 
-## Status widget & configuration
-
-The widget tracks each sub-agent from a runtime activity snapshot written by the child: `starting`, `active` (turn/provider/tool work), `waiting` (open for input or another stage), `stalled` (no valid snapshot for too long), or `running` (fallback). Sub-agent sessions also show their own tools widget — toggle it with `Ctrl+Alt+O`. Completion messages expand with `Ctrl+O`.
-
-Status display is configured via `config.json` in the extension directory (copy `config.json.example`; it's gitignored):
-
-```json
-{
-  "status": { "enabled": true }
-}
-```
-
 ## Requirements
 
 - [pi](https://github.com/badlogic/pi-mono)
-- [Zellij](https://zellij.dev/) **0.45+** recommended; 0.44 supports tiled panes only
+- [herdr](https://herdr.dev) 0.9+; start pi inside a herdr pane
 
-```bash
-zellij
-# Inside Zellij:
-pi
-```
+Sub-agent sessions show their own tools widget — toggle it with `Ctrl+Alt+O`. Completion messages expand with `Ctrl+O`.
 
 ## Acknowledgements
 
-This fork builds on [Amos Blomqvist's tmux-only fork](https://github.com/amosblomqvist/pi-interactive-subagents) of [HazAT/pi-interactive-subagents](https://github.com/HazAT/pi-interactive-subagents). The original project introduced the subagent architecture, multi-multiplexer surface layer, and status widget; its supervision features were inspired by [RepoPrompt](https://repoprompt.com/).
+This fork builds on [Amos Blomqvist's tmux-only fork](https://github.com/amosblomqvist/pi-interactive-subagents) of [HazAT/pi-interactive-subagents](https://github.com/HazAT/pi-interactive-subagents). The original project introduced the subagent architecture; its supervision features were inspired by [RepoPrompt](https://repoprompt.com/). This version runs on herdr only.
 
 ## License
 
