@@ -15,7 +15,7 @@ case "$1 $2" in
   "pane layout") cat ${JSON.stringify(join(dir, "layout"))} ;;
   "pane split") echo '{"result":{"pane":{"pane_id":"w1:p9"}}}' ;;
   "tab create") echo '{"result":{"root_pane":{"pane_id":"w1:p8"},"tab":{}}}' ;;
-  "agent list") echo '{"result":{"agents":[{"name":"scout"}]}}' ;;
+  "agent list") [ -e ${JSON.stringify(join(dir, "list_fail"))} ] && { echo '{"error":{"code":"server_error","message":"down"}}' >&2; exit 1; }; echo '{"result":{"agents":[{"name":"scout"}]}}' ;;
   "agent start") cat ${JSON.stringify(join(dir, "start"))}; [ -s ${JSON.stringify(join(dir, "start"))} ] && grep -q error ${JSON.stringify(join(dir, "start"))} && exit 1; true ;;
   "agent prompt") [ "$3" = blocked ] && { echo '{"error":{"code":"agent_blocked","message":"blocked"}}' >&2; exit 1; }; echo '{"result":{}}' ;;
   "pane get") cat ${JSON.stringify(join(dir, "pane"))}; grep -q error ${JSON.stringify(join(dir, "pane"))} && exit 1; true ;;
@@ -74,6 +74,19 @@ it("picks another name once when a parallel start took it, and keeps the pane's 
   reply("start", { error: { code: "timeout", message: "timed out" } });
   await assert.rejects(herdr.startAgent(launch), /timeout[\s\S]*Last output in the pane:\n\{not json\nlast line/);
   writeFileSync(join(dir, "start"), "");
+});
+
+it("closes the pane when listing agents or submitting the task fails after it was created", async () => {
+  layout([["w1:p1", 200, 50]]);
+  writeFileSync(join(dir, "start"), "");
+  writeFileSync(join(dir, "list_fail"), "");
+  writeFileSync(log, "");
+  await assert.rejects(herdr.startAgent(launch), /server_error/);
+  assert.deepEqual(calls().at(-1), ["pane", "close", "w1:p9"]);
+  rmSync(join(dir, "list_fail"));
+  writeFileSync(log, "");
+  await assert.rejects(herdr.startAgent({ ...launch, name: "blocked" }), /agent_blocked/);  // the fake refuses prompts to "blocked"
+  assert.deepEqual(calls().at(-1), ["pane", "close", "w1:p9"]);
 });
 
 it("derives herdr agent names", () => {

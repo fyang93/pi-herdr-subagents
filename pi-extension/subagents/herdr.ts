@@ -121,28 +121,33 @@ async function startAgentUnlocked(launch: AgentLaunch): Promise<{ surface: strin
     : (await herdrAsync(["tab", "create", "--no-focus", "--label", launch.name, "--cwd", launch.cwd, ...env])).root_pane.pane_id;
   await herdrAsync(["pane", "rename", surface, launch.name]).catch(() => {});
   let agent = "";
-  for (let attempt = 0; ; attempt++) {
-    const taken = new Set<string>(((await herdrAsync(["agent", "list"]))?.agents ?? []).map((a: any) => a.name).filter(Boolean));
-    agent = agentName(launch.name, taken);
-    try {
-      await herdrAsync(["agent", "start", agent, "--kind", launch.kind, "--pane", surface, "--timeout", "60000", "--", ...launch.args], { timeout: 70_000 });
-      break;
-    } catch (error) {
-      // Another parent took the name meanwhile; nothing started, so pick again once.
-      if (error instanceof HerdrError && error.code === "agent_name_taken" && attempt === 0) continue;
-      // Blocked at startup (e.g. a trust prompt): leave the pane for the user to answer.
-      if (error instanceof HerdrError && error.code === "agent_not_ready") {
-        throw new Error(`Agent "${agent}" is blocked at a startup dialog in herdr pane ${surface}; answer it there and resend the task.`);
+  // Every failure after the pane exists closes it: the caller never learns the surface, so
+  // nothing else would. A pane blocked at a startup dialog is the exception, left for the user.
+  try {
+    for (let attempt = 0; ; attempt++) {
+      const taken = new Set<string>(((await herdrAsync(["agent", "list"]))?.agents ?? []).map((a: any) => a.name).filter(Boolean));
+      agent = agentName(launch.name, taken);
+      try {
+        await herdrAsync(["agent", "start", agent, "--kind", launch.kind, "--pane", surface, "--timeout", "60000", "--", ...launch.args], { timeout: 70_000 });
+        break;
+      } catch (error) {
+        // Another parent took the name meanwhile; nothing started, so pick again once.
+        if (error instanceof HerdrError && error.code === "agent_name_taken" && attempt === 0) continue;
+        throw error;
       }
-      // Keep what the pane printed (a bad model, an extension error) before closing it.
-      let output = "";
-      try { output = readScreen(surface, 40).split("\n").filter((line) => line.trim()).slice(-8).join("\n"); } catch {}
-      try { closeSurface(surface); } catch {}
-      throw new Error(`${String((error as any)?.message ?? error)}${output ? `\nLast output in the pane:\n${output}` : ""}`);
     }
+    for (const prompt of launch.prompts) await herdrAsync(["agent", "prompt", agent, prompt]);
+    return { surface, agent };
+  } catch (error) {
+    if (error instanceof HerdrError && error.code === "agent_not_ready") {
+      throw new Error(`Agent "${agent}" is blocked at a startup dialog in herdr pane ${surface}; answer it there and resend the task.`);
+    }
+    // Keep what the pane printed (a bad model, an extension error) before closing it.
+    let output = "";
+    try { output = readScreen(surface, 40).split("\n").filter((line) => line.trim()).slice(-8).join("\n"); } catch {}
+    try { closeSurface(surface); } catch {}
+    throw new Error(`${String((error as any)?.message ?? error)}${output ? `\nLast output in the pane:\n${output}` : ""}`);
   }
-  for (const prompt of launch.prompts) await herdrAsync(["agent", "prompt", agent, prompt]);
-  return { surface, agent };
 }
 
 // ── Talking to running agents ──
