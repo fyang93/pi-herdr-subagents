@@ -251,10 +251,6 @@ function readFirstLine(path: string, maxBytes = 65536): string | null {
  * orchestrator for follow-ups.
  */
 export function getSessionId(sessionFile: string): string | null {
-  return readHeaderId(sessionFile);
-}
-
-function readHeaderId(sessionFile: string): string | null {
   const firstLine = readFirstLine(sessionFile)?.trim();
   if (!firstLine) return null;
   try {
