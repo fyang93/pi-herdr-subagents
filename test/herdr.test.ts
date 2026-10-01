@@ -112,12 +112,13 @@ it("follows the agent by name across pane moves, finishes on the exit marker, an
   reply("agent", { result: { agent: { name: "scout", pane_id: "w1:p9", agent_status: "working" } } });
   writeFileSync(`${session}.exit`, JSON.stringify({ type: "error", errorMessage: "overloaded" }));
   const signal = new AbortController().signal;
-  assert.deepEqual(await herdr.waitForExit("w1:p9", signal, { interval: 1, sessionFile: session }),
+  assert.deepEqual(await herdr.waitForExit("scout", signal, { interval: 1, sessionFile: session }),
     { reason: "error", exitCode: 1, errorMessage: "overloaded" });
   assert.equal(existsSync(`${session}.exit`), false);
 
   const seen: unknown[] = [];
   let ticks = 0;
+  writeFileSync(log, "");
   const done = herdr.waitForExit("scout", signal, { interval: 1, sessionFile: session, onTick(status, pane) {
     seen.push([status, pane]);
     // The user moves the pane to another workspace: same agent name, new pane id.
@@ -126,6 +127,7 @@ it("follows the agent by name across pane moves, finishes on the exit marker, an
   } });
   assert.deepEqual(await done, { reason: "done", exitCode: 0 });
   assert.deepEqual(seen, [["working", "w1:p9"], ["working", "w2:p1"]]);
+  assert.deepEqual([...new Set(calls().map((c) => c.join(" ")))], ["agent get scout"], "status is read by agent name, never a pane id");
 
   reply("agent", { error: { code: "agent_not_found", message: "gone" } }); // pi exited: herdr dropped the name
   const gone = await herdr.waitForExit("scout", signal, { interval: 1, sessionFile: session });
