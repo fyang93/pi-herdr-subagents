@@ -1,4 +1,4 @@
-import { describe, it, before, after, beforeEach } from "node:test";
+import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync, chmodSync } from "node:fs";
@@ -9,7 +9,6 @@ import { visibleWidth } from "@mariozechner/pi-tui";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 
 import {
-  getLeafId,
   getNewEntries,
   countSessionEntryLines,
   getSessionId,
@@ -21,12 +20,7 @@ import {
   writeSubagentLoadout,
   loadoutSidecarPath,
   type SubagentLoadout,
-  resetSessionIndexCache,
-  resolveSessionFileById,
   findLastAssistantMessage,
-  appendBranchSummary,
-  copySessionFile,
-  mergeNewEntries,
   seedSubagentSessionFile,
   summarizeSessionStats,
   currentTool,
@@ -214,19 +208,6 @@ describe("session.ts", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  describe("getLeafId", () => {
-    it("returns last entry id", () => {
-      const file = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG, ASSISTANT_MSG]);
-      assert.equal(getLeafId(file), "asst-001");
-    });
-
-    it("returns null for empty file", () => {
-      const file = join(dir, "empty.jsonl");
-      writeFileSync(file, "");
-      assert.equal(getLeafId(file), null);
-    });
-  });
-
   describe("getNewEntries", () => {
     it("returns entries after a given line", () => {
       const file = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG, ASSISTANT_MSG]);
@@ -256,19 +237,7 @@ describe("session.ts", () => {
     });
   });
 
-  describe("getSessionId / resolveSessionFileById", () => {
-    function writeSession(d: string, fname: string, id: string): string {
-      const p = join(d, fname);
-      writeFileSync(p, JSON.stringify({ type: "session", id, version: 3 }) + "\n");
-      return p;
-    }
-
-    // The resolver caches an id→file index per root; reset it so each test
-    // builds a fresh index from the current on-disk state.
-    beforeEach(() => {
-      resetSessionIndexCache();
-    });
-
+  describe("getSessionId", () => {
     it("reads the header id from a session file", () => {
       const file = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG]);
       assert.equal(getSessionId(file), "sess-001");
@@ -277,32 +246,6 @@ describe("session.ts", () => {
     it("returns null for a file without a session header", () => {
       const file = createSessionFile(dir, [USER_MSG]);
       assert.equal(getSessionId(file), null);
-    });
-
-    it("resolves a session file by exact id under the root", () => {
-      const a = writeSession(dir, "a.jsonl", "019f-aaaa");
-      writeSession(dir, "b.jsonl", "019f-bbbb");
-      assert.equal(resolveSessionFileById("019f-aaaa", dir), a);
-    });
-
-    it("resolves a session file by id prefix", () => {
-      const a = writeSession(dir, "p.jsonl", "019f-prefix-match");
-      assert.equal(resolveSessionFileById("019f-prefix", dir), a);
-    });
-
-    it("returns null when no session matches", () => {
-      writeSession(dir, "c.jsonl", "abc");
-      assert.equal(resolveSessionFileById("zzz", dir), null);
-    });
-
-    it("picks up newly added sessions on repeat calls without a reset", () => {
-      // Prime the index (first call builds it).
-      writeSession(dir, "first.jsonl", "id-first");
-      assert.equal(resolveSessionFileById("id-first", dir) !== null, true);
-      // Add a new session AFTER the index was built — no reset. The resolver's
-      // cheap refresh should index it.
-      const b = writeSession(dir, "second.jsonl", "id-second");
-      assert.equal(resolveSessionFileById("id-second", dir), b);
     });
   });
 
@@ -477,50 +420,6 @@ describe("session.ts", () => {
     });
   });
 
-  describe("appendBranchSummary", () => {
-    it("appends valid branch_summary entry", () => {
-      const file = createSessionFile(dir, [SESSION_HEADER, USER_MSG, ASSISTANT_MSG]);
-      const id = appendBranchSummary(file, "user-001", "asst-001", "The plan was created.");
-
-      assert.ok(id, "should return an id");
-      assert.equal(typeof id, "string");
-
-      // Read back and verify
-      const lines = readFileSync(file, "utf8").trim().split("\n");
-      assert.equal(lines.length, 4); // 3 original + 1 summary
-
-      const summary = JSON.parse(lines[3]);
-      assert.equal(summary.type, "branch_summary");
-      assert.equal(summary.id, id);
-      assert.equal(summary.parentId, "user-001");
-      assert.equal(summary.fromId, "asst-001");
-      assert.equal(summary.summary, "The plan was created.");
-      assert.ok(summary.timestamp);
-    });
-
-    it("uses branchPointId as fromId fallback", () => {
-      const file = createSessionFile(dir, [SESSION_HEADER]);
-      appendBranchSummary(file, "branch-pt", null, "summary");
-
-      const lines = readFileSync(file, "utf8").trim().split("\n");
-      const summary = JSON.parse(lines[1]);
-      assert.equal(summary.fromId, "branch-pt");
-    });
-  });
-
-  describe("copySessionFile", () => {
-    it("creates a copy with different path", () => {
-      const file = createSessionFile(dir, [SESSION_HEADER, USER_MSG]);
-      const copyDir = join(dir, "copies");
-      mkdirSync(copyDir, { recursive: true });
-      const copy = copySessionFile(file, copyDir);
-
-      assert.notEqual(copy, file);
-      assert.ok(copy.endsWith(".jsonl"));
-      assert.equal(readFileSync(copy, "utf8"), readFileSync(file, "utf8"));
-    });
-  });
-
   describe("seedSubagentSessionFile", () => {
     it("creates a lineage-only child session with parent linkage and no copied turns", () => {
       const parentFile = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG, ASSISTANT_MSG]);
@@ -564,31 +463,6 @@ describe("session.ts", () => {
       assert.equal(entries[1].type, "model_change");
       assert.equal(entries.some((entry) => entry.type === "session" && entry.parentSession !== parentFile), false);
       assert.equal(entries.some((entry) => entry.type === "message"), false);
-    });
-  });
-
-  describe("mergeNewEntries", () => {
-    it("appends new entries from source to target", () => {
-      // Source starts with same base (2 entries), then has 1 new entry
-      const sourceFile = join(dir, "merge-source.jsonl");
-      const targetFile = join(dir, "merge-target.jsonl");
-      writeFileSync(
-        sourceFile,
-        [SESSION_HEADER, USER_MSG, ASSISTANT_MSG].map((e) => JSON.stringify(e)).join("\n") + "\n",
-      );
-      writeFileSync(
-        targetFile,
-        [SESSION_HEADER, USER_MSG].map((e) => JSON.stringify(e)).join("\n") + "\n",
-      );
-
-      // Merge entries after line 2 (the shared base)
-      const merged = mergeNewEntries(sourceFile, targetFile, 2);
-      assert.equal(merged.length, 1);
-      assert.equal(merged[0].id, "asst-001");
-
-      // Target should now have 3 entries
-      const targetLines = readFileSync(targetFile, "utf8").trim().split("\n");
-      assert.equal(targetLines.length, 3);
     });
   });
 

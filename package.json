@@ -13,7 +13,7 @@
   },
   "type": "module",
   "scripts": {
-    "test": "node --test test/test.ts test/herdr.test.ts"
+    "test": "node --test test/test.ts test/*.test.ts"
   },
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": "*",
