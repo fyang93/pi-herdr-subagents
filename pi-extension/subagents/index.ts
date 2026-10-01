@@ -459,8 +459,10 @@ interface RunningSubagent {
   name: string;
   task: string;
   agent?: string;
-  /** herdr pane id hosting the agent. */
+  /** herdr pane hosting the agent, as last seen; it changes if the pane moves. */
   surface: string;
+  /** herdr agent name: the stable handle for status, prompts and finding the pane. */
+  herdrName?: string;
   startTime: number;
   sessionFile: string;
   abortController?: AbortController;
@@ -716,7 +718,7 @@ function steerSubagent(
   send: (surface: string, message: string) => void = steer,
 ): { ok: true } | { error: string } {
   try {
-    send(running.surface, message.trim());
+    send(running.herdrName ?? running.surface, message.trim());
     return { ok: true };
   } catch (error: any) {
     return {
@@ -883,7 +885,7 @@ async function launchSubagent(
     if (effectiveModel) args.push("--model", effectiveModel);
     if (agentDefs.body) args.push("--append-system-prompt", agentDefs.body);
 
-    const { surface } = await startTracked({
+    const { surface, agent: herdrName } = await startTracked({
       name: params.name, kind: "claude", args, prompts: [params.task], env: { PI_CLAUDE_SENTINEL: sentinelFile }, cwd: targetCwdForSession,
     });
     const running: RunningSubagent = {
@@ -892,6 +894,7 @@ async function launchSubagent(
       task: params.task,
       agent: params.agent,
       surface,
+      herdrName,
       startTime,
       sessionFile: subagentSessionFile,
       cli: "claude",
@@ -935,7 +938,7 @@ async function launchSubagent(
   // the shared helper (same code path resume uses — they can't drift).
   applySandboxToArgs(args, loadout, { artifactDir, name: params.name });
 
-  const { surface } = await startTracked({
+  const { surface, agent: herdrName } = await startTracked({
     name: params.name,
     kind: "pi",
     args,
@@ -950,6 +953,7 @@ async function launchSubagent(
     task: params.task,
     agent: params.agent,
     surface,
+    herdrName,
     startTime,
     sessionFile: subagentSessionFile,
     interactive: effectiveInteractive,
@@ -960,7 +964,7 @@ async function launchSubagent(
 }
 
 /** Start an agent; if this session shut down meanwhile, close it again rather than leave it untracked. */
-async function startTracked(launch: AgentLaunch): Promise<{ surface: string }> {
+async function startTracked(launch: AgentLaunch): Promise<{ surface: string; agent: string }> {
   const lifecycleSignal = getModuleAbortSignal();
   lifecycleSignal.throwIfAborted();
   const started = await launchDeps.startAgent(launch);
@@ -1107,15 +1111,16 @@ async function watchSubagent(
   signal: AbortSignal,
   deps: { wait?: typeof waitForExit; close?: typeof closeSurface } = {},
 ): Promise<SubagentResult> {
-  const { name, task, surface, startTime, sessionFile } = running;
+  const { name, task, startTime, sessionFile } = running;
 
   try {
-    const result = await (deps.wait ?? waitForExit)(surface, AbortSignal.any([signal, getModuleAbortSignal()]), {
+    const result = await (deps.wait ?? waitForExit)(running.herdrName ?? running.surface, AbortSignal.any([signal, getModuleAbortSignal()]), {
       interval: 1000,
       sessionFile,
       sentinelFile: running.sentinelFile,
       exitIsDone: running.cli === "claude",
-      onTick(status) {
+      onTick(status, pane) {
+        if (pane) running.surface = pane;  // the pane may have moved
         deliverPendingQuestion(running);
         reportPaused(running);
         reportBlocked(running, status);
@@ -1142,7 +1147,7 @@ async function watchSubagent(
       }
 
       if (!summary) {
-        try { summary = readScreen(surface, 200); } catch {}
+        try { summary = readScreen(running.surface, 200); } catch {}
       }
 
       if (!summary) {
@@ -1160,9 +1165,9 @@ async function watchSubagent(
       }
 
       try {
-        (deps.close ?? closeSurface)(surface);
+        (deps.close ?? closeSurface)(running.surface);
       } catch (error) {
-        console.warn(`Could not close completed subagent surface ${surface}: ${error}`);
+        console.warn(`Could not close completed subagent pane ${running.surface}: ${error}`);
       }
       runningSubagents.delete(running.id);
 
@@ -1192,9 +1197,9 @@ async function watchSubagent(
     const subagentSessionId = existsSync(sessionFile) ? getSessionId(sessionFile) : null;
 
     try {
-      (deps.close ?? closeSurface)(surface);
+      (deps.close ?? closeSurface)(running.surface);
     } catch (error) {
-      console.warn(`Could not close completed subagent surface ${surface}: ${error}`);
+      console.warn(`Could not close completed subagent pane ${running.surface}: ${error}`);
     }
     runningSubagents.delete(running.id);
 
@@ -1212,7 +1217,7 @@ async function watchSubagent(
     };
   } catch (err: any) {
     try {
-      (deps.close ?? closeSurface)(surface);
+      (deps.close ?? closeSurface)(running.surface);
     } catch {}
     runningSubagents.delete(running.id);
 
@@ -1757,9 +1762,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         applySandboxToArgs(args, loadout, { artifactDir, name });
         // Resume in the subagent's original cwd so its tools (safe_bash, edits)
         // operate where they did before, with the same config dir and spawn allowlist.
-        let surface: string;
+        let surface: string, herdrName: string;
         try {
-          ({ surface } = await startTracked({
+          ({ surface, agent: herdrName } = await startTracked({
             name,
             kind: "pi",
             args,
@@ -1776,6 +1781,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           name,
           task: message,
           surface,
+          herdrName,
           startTime,
           sessionFile: sessionPath,
           interactive,

@@ -168,13 +168,17 @@ export function closeSurface(surface: string): void {
 
 export type AgentStatus = "idle" | "working" | "blocked" | "done" | "unknown";
 
-/** The pane's agent status; "exited" when no agent runs in it (or the pane is gone); null when herdr could not answer. */
-export async function agentStatus(surface: string, signal?: AbortSignal): Promise<AgentStatus | "exited" | null> {
+/**
+ * A live agent's state and current pane, by herdr agent name: the name follows the
+ * agent when its pane moves, a pane id does not. "exited" once herdr no longer
+ * lists it; null when herdr could not answer.
+ */
+export async function agentStatus(agent: string, signal?: AbortSignal): Promise<{ status: AgentStatus; pane: string } | "exited" | null> {
   try {
-    const { pane } = await herdrAsync(["pane", "get", surface], { signal });
-    return pane.agent ? (pane.agent_status ?? "unknown") : "exited";
+    const result = (await herdrAsync(["agent", "get", agent], { signal })).agent;
+    return { status: result.agent_status ?? "unknown", pane: result.pane_id };
   } catch (error) {
-    return error instanceof HerdrError && error.code === "pane_not_found" ? "exited" : null;
+    return error instanceof HerdrError && error.code === "agent_not_found" ? "exited" : null;
   }
 }
 
@@ -215,14 +219,14 @@ function readExitSidecar(sessionFile?: string): ExitResult | undefined {
 
 /**
  * Wait until the agent finishes: its `.exit` marker (pi), its sentinel file
- * (Claude's Stop hook), or the agent leaving its pane. Leaving without a
+ * (Claude's Stop hook), or herdr no longer listing the agent. Leaving without a
  * marker on two consecutive checks is an interruption; when `exitIsDone`,
  * leaving is the normal end (Claude has no exit marker).
  */
 export async function waitForExit(
-  surface: string,
+  agent: string,
   signal: AbortSignal,
-  options: { interval: number; sessionFile?: string; sentinelFile?: string; exitIsDone?: boolean; onTick?: (status: AgentStatus | null) => void },
+  options: { interval: number; sessionFile?: string; sentinelFile?: string; exitIsDone?: boolean; onTick?: (status: AgentStatus | null, pane?: string) => void },
 ): Promise<ExitResult> {
   const aborted = () => new Error("Aborted while waiting for subagent to finish");
   let exitedBefore = false;
@@ -231,18 +235,18 @@ export async function waitForExit(
     const marker = readExitSidecar(options.sessionFile);
     if (marker) return marker;
     if (options.sentinelFile && existsSync(options.sentinelFile)) return { reason: "sentinel", exitCode: 0 };
-    const status = await agentStatus(surface, signal).catch(() => null);
+    const found = await agentStatus(agent, signal).catch(() => null);
     if (signal.aborted) throw aborted();
-    if (status === "exited") {
+    if (found === "exited") {
       // pi writes its marker just before exiting; look once more before calling it an interruption.
       const late = readExitSidecar(options.sessionFile);
       if (late) return late;
       if (options.exitIsDone) return { reason: "done", exitCode: 0 };
-      if (exitedBefore) return { reason: "interrupted", exitCode: 1, errorMessage: `The agent in pane ${surface} exited without a completion marker.` };
+      if (exitedBefore) return { reason: "interrupted", exitCode: 1, errorMessage: `Agent ${agent} exited without a completion marker.` };
       exitedBefore = true;
     } else {
       exitedBefore = false;
-      options.onTick?.(status);
+      options.onTick?.(found?.status ?? null, found?.pane);
     }
     await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => { signal.removeEventListener("abort", onAbort); resolve(); }, options.interval);

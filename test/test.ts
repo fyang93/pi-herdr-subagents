@@ -2106,6 +2106,25 @@ describe("watchSubagent", () => {
     assert.deepEqual(closed, ["w1:p9", "w1:p9"]);
   });
 
+  it("follows its agent by herdr name: waits on the name and closes the pane the agent moved to", async () => {
+    const closed: string[] = [];
+    let waitedOn = "";
+    const moved = { ...running, id: "moved-test", herdrName: "watch-test" };
+    await testApi.watchSubagent(moved, new AbortController().signal, {
+      wait: async (target: string, _signal: AbortSignal, options: any) => {
+        waitedOn = target;
+        options.onTick("working", "w2:p1");
+        return { reason: "done", exitCode: 0 };
+      },
+      close: (surface: string) => { closed.push(surface); },
+    });
+    assert.equal(waitedOn, "watch-test");
+    assert.deepEqual(closed, ["w2:p1"]);
+    let target = "";
+    testApi.steerSubagent(moved, "hi", (t: string) => { target = t; });
+    assert.equal(target, "watch-test");
+  });
+
   it("wakes the parent once when a non-interactive subagent becomes blocked", async () => {
     const { api } = createMockExtensionApi();
     const sent: any[] = [];

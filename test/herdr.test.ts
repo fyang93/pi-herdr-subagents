@@ -18,7 +18,7 @@ case "$1 $2" in
   "agent list") [ -e ${JSON.stringify(join(dir, "list_fail"))} ] && { echo '{"error":{"code":"server_error","message":"down"}}' >&2; exit 1; }; echo '{"result":{"agents":[{"name":"scout"}]}}' ;;
   "agent start") cat ${JSON.stringify(join(dir, "start"))}; [ -s ${JSON.stringify(join(dir, "start"))} ] && grep -q error ${JSON.stringify(join(dir, "start"))} && exit 1; true ;;
   "agent prompt") [ "$3" = blocked ] && { echo '{"error":{"code":"agent_blocked","message":"blocked"}}' >&2; exit 1; }; echo '{"result":{}}' ;;
-  "pane get") cat ${JSON.stringify(join(dir, "pane"))}; grep -q error ${JSON.stringify(join(dir, "pane"))} && exit 1; true ;;
+  "agent get") cat ${JSON.stringify(join(dir, "agent"))}; grep -q error ${JSON.stringify(join(dir, "agent"))} && exit 1; true ;;
   "pane read") printf '{not json\\nlast line\\n' ;;
   "integration status") cat ${JSON.stringify(join(dir, "status"))} ;;
   *) echo '{"result":{}}' ;;
@@ -107,9 +107,9 @@ it("decodes a quit marker as an early end", () => {
   assert.deepEqual(herdr.interpretExitSidecar({ type: "quit" }), { reason: "quit", exitCode: 1 });
 });
 
-it("finishes on the exit marker, and calls an agent that left its pane twice without one interrupted", async () => {
+it("follows the agent by name across pane moves, finishes on the exit marker, and calls an agent gone twice without one interrupted", async () => {
   const session = join(dir, "child.jsonl");
-  reply("pane", { result: { pane: { pane_id: "w1:p9", agent: "pi", agent_status: "working" } } });
+  reply("agent", { result: { agent: { name: "scout", pane_id: "w1:p9", agent_status: "working" } } });
   writeFileSync(`${session}.exit`, JSON.stringify({ type: "error", errorMessage: "overloaded" }));
   const signal = new AbortController().signal;
   assert.deepEqual(await herdr.waitForExit("w1:p9", signal, { interval: 1, sessionFile: session }),
@@ -118,18 +118,19 @@ it("finishes on the exit marker, and calls an agent that left its pane twice wit
 
   const seen: unknown[] = [];
   let ticks = 0;
-  const done = herdr.waitForExit("w1:p9", signal, { interval: 1, sessionFile: session, onTick(status) {
-    seen.push(status);
-    if (++ticks === 2) writeFileSync(`${session}.exit`, JSON.stringify({ type: "done" }));
+  const done = herdr.waitForExit("scout", signal, { interval: 1, sessionFile: session, onTick(status, pane) {
+    seen.push([status, pane]);
+    // The user moves the pane to another workspace: same agent name, new pane id.
+    if (++ticks === 1) reply("agent", { result: { agent: { name: "scout", pane_id: "w2:p1", agent_status: "working" } } });
+    if (ticks === 2) writeFileSync(`${session}.exit`, JSON.stringify({ type: "done" }));
   } });
   assert.deepEqual(await done, { reason: "done", exitCode: 0 });
-  assert.deepEqual(seen, ["working", "working"]);
+  assert.deepEqual(seen, [["working", "w1:p9"], ["working", "w2:p1"]]);
 
-  reply("pane", { result: { pane: { pane_id: "w1:p9" } } }); // the shell is back: pi exited
-  const gone = await herdr.waitForExit("w1:p9", signal, { interval: 1, sessionFile: session });
+  reply("agent", { error: { code: "agent_not_found", message: "gone" } }); // pi exited: herdr dropped the name
+  const gone = await herdr.waitForExit("scout", signal, { interval: 1, sessionFile: session });
   assert.equal(gone.reason, "interrupted");
-  reply("pane", { error: { code: "pane_not_found", message: "gone" } });
-  assert.deepEqual(await herdr.waitForExit("w1:p9", signal, { interval: 1, exitIsDone: true }), { reason: "done", exitCode: 0 });
+  assert.deepEqual(await herdr.waitForExit("scout", signal, { interval: 1, exitIsDone: true }), { reason: "done", exitCode: 0 });
 });
 
 it("installs the pi integration only when it is not current", async () => {
