@@ -120,17 +120,26 @@ async function startAgentUnlocked(launch: AgentLaunch): Promise<{ surface: strin
     ? (await herdrAsync(["pane", "split", best.pane, "--direction", best.direction, "--no-focus", "--cwd", launch.cwd, ...env])).pane.pane_id
     : (await herdrAsync(["tab", "create", "--no-focus", "--label", launch.name, "--cwd", launch.cwd, ...env])).root_pane.pane_id;
   await herdrAsync(["pane", "rename", surface, launch.name]).catch(() => {});
-  const taken = new Set<string>(((await herdrAsync(["agent", "list"]))?.agents ?? []).map((a: any) => a.name).filter(Boolean));
-  const agent = agentName(launch.name, taken);
-  try {
-    await herdrAsync(["agent", "start", agent, "--kind", launch.kind, "--pane", surface, "--timeout", "60000", "--", ...launch.args], { timeout: 70_000 });
-  } catch (error) {
-    // Blocked at startup (e.g. a trust prompt): leave the pane for the user to answer.
-    if (error instanceof HerdrError && error.code === "agent_not_ready") {
-      throw new Error(`Agent "${agent}" is blocked at a startup dialog in herdr pane ${surface}; answer it there and resend the task.`);
+  let agent = "";
+  for (let attempt = 0; ; attempt++) {
+    const taken = new Set<string>(((await herdrAsync(["agent", "list"]))?.agents ?? []).map((a: any) => a.name).filter(Boolean));
+    agent = agentName(launch.name, taken);
+    try {
+      await herdrAsync(["agent", "start", agent, "--kind", launch.kind, "--pane", surface, "--timeout", "60000", "--", ...launch.args], { timeout: 70_000 });
+      break;
+    } catch (error) {
+      // Another parent took the name meanwhile; nothing started, so pick again once.
+      if (error instanceof HerdrError && error.code === "agent_name_taken" && attempt === 0) continue;
+      // Blocked at startup (e.g. a trust prompt): leave the pane for the user to answer.
+      if (error instanceof HerdrError && error.code === "agent_not_ready") {
+        throw new Error(`Agent "${agent}" is blocked at a startup dialog in herdr pane ${surface}; answer it there and resend the task.`);
+      }
+      // Keep what the pane printed (a bad model, an extension error) before closing it.
+      let output = "";
+      try { output = readScreen(surface, 40).split("\n").filter((line) => line.trim()).slice(-8).join("\n"); } catch {}
+      try { closeSurface(surface); } catch {}
+      throw new Error(`${(error as Error).message}${output ? `\nLast output in the pane:\n${output}` : ""}`);
     }
-    try { closeSurface(surface); } catch {}
-    throw error;
   }
   for (const prompt of launch.prompts) await herdrAsync(["agent", "prompt", agent, prompt]);
   return { surface, agent };
@@ -167,15 +176,15 @@ export async function agentStatus(surface: string, signal?: AbortSignal): Promis
 // ── Completion ──
 
 export interface ExitResult {
-  reason: "done" | "error" | "sentinel" | "interrupted";
+  reason: "done" | "quit" | "error" | "sentinel" | "interrupted";
   exitCode: number;
   /** Provider error, or why the agent ended without a completion marker. */
   errorMessage?: string;
 }
 
 /**
- * Decode the `.exit` marker subagent-done.ts writes when pi quits: `done`, or
- * `error` when the last turn failed. ask_question keeps the session open and
+ * Decode the `.exit` marker subagent-done.ts writes when pi quits: `done`,
+ * `error` when the last turn failed, or `quit` when someone ended it early. ask_question keeps the session open and
  * signals through a separate `.ask` file instead.
  */
 export function interpretExitSidecar(data: any): ExitResult {
@@ -185,6 +194,7 @@ export function interpretExitSidecar(data: any): ExitResult {
       : "Subagent exited with stopReason=error (no errorMessage in sidecar).";
     return { reason: "error", exitCode: 1, errorMessage };
   }
+  if (data?.type === "quit") return { reason: "quit", exitCode: 1 };
   return { reason: "done", exitCode: 0 };
 }
 

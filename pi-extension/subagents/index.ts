@@ -397,7 +397,7 @@ function getArtifactDir(sessionDir: string, sessionId: string): string {
 function resolveResultPresentation(
   result: Pick<
     SubagentResult,
-    "exitCode" | "elapsed" | "summary" | "sessionFile" | "sessionId" | "errorMessage"
+    "exitCode" | "elapsed" | "summary" | "sessionFile" | "sessionId" | "errorMessage" | "endedEarly"
   >,
   name: string,
 ): string {
@@ -417,6 +417,11 @@ function resolveResultPresentation(
       `The subagent did not produce a result. You can retry by spawning a new ` +
       `subagent or resume the session with subagent_message.${sessionRef}`
     );
+  }
+
+  if (result.endedEarly) {
+    return `Sub-agent "${name}" was ended in its pane before it finished (${formatElapsed(result.elapsed)}); ` +
+      `its last message may be partial.\n\n${result.summary}${sessionRef}`;
   }
 
   return result.exitCode !== 0
@@ -440,6 +445,8 @@ interface SubagentResult {
   error?: string;
   /** Provider/agent error message when auto-retry exhausted (overload, rate limit, etc.). */
   errorMessage?: string;
+  /** Someone ended an autonomous subagent in its pane before it finished. */
+  endedEarly?: boolean;
   /** Aggregate usage/model/tool stats parsed from the completed session file. */
   stats?: SessionStats;
 }
@@ -1050,6 +1057,23 @@ function deliverPendingQuestion(running: RunningSubagent): void {
   );
 }
 
+/** Wake the parent once when someone interrupts an autonomous subagent's turn in its pane. */
+function reportPaused(running: RunningSubagent): void {
+  const pausedFile = `${running.sessionFile}.paused`;
+  if (!existsSync(pausedFile)) return;
+  try { unlinkSync(pausedFile); } catch {}
+  latestPi?.sendMessage(
+    {
+      customType: "subagent_status",
+      content: `Sub-agent "${running.name}" had its turn interrupted in herdr pane ${running.surface} and is waiting for input. ` +
+        `subagent_message({ name: "${running.name}", message: "…" }) continues it.`,
+      display: true,
+      details: { lines: [`${running.name}: interrupted, waiting in pane ${running.surface}`], overflow: 0 },
+    },
+    { triggerTurn: true, deliverAs: "steer" },
+  );
+}
+
 /**
  * Wake the parent once when herdr sees a subagent stuck at an approval or
  * question dialog, which only someone at its pane can answer. Interactive
@@ -1085,6 +1109,7 @@ async function watchSubagent(
       exitIsDone: running.cli === "claude",
       onTick(status) {
         deliverPendingQuestion(running);
+        reportPaused(running);
         reportBlocked(running, status);
       },
     });
@@ -1174,6 +1199,7 @@ async function watchSubagent(
       exitCode: result.exitCode,
       elapsed,
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+      ...(result.reason === "quit" ? { endedEarly: true } : {}),
       ...(stats ? { stats } : {}),
     };
   } catch (err: any) {
@@ -1406,6 +1432,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   sessionFile: result.sessionFile,
                   ...(result.sessionId ? { sessionId: result.sessionId } : {}),
                   ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+                  ...(result.endedEarly ? { endedEarly: true } : {}),
                   ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
                   ...(result.stats ? { stats: result.stats } : {}),
                 },
@@ -1780,6 +1807,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   sessionFile: sessionPath,
                   sessionId: resumedSessionId,
                   ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+                  ...(result.endedEarly ? { endedEarly: true } : {}),
                 },
               },
               { triggerTurn: true, deliverAs: "steer" },
@@ -1868,7 +1896,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // like the in-process extension. Failure: surface the failure reason.
         let header: string;
         if (failed) {
-          const reason = errorMessage ? "failed (provider/agent error)" : `failed (exit ${exitCode})`;
+          const reason = errorMessage ? "failed (provider/agent error)" : details.endedEarly ? "ended early" : `failed (exit ${exitCode})`;
           header = `${titleSegment}${theme.fg("error", reason)} ${theme.fg("dim", `· ${elapsed}`)}`;
         } else {
           const toolPart = stats ? `${stats.toolCount} tools · ${elapsed}` : elapsed;

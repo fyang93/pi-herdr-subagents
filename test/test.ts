@@ -1177,6 +1177,44 @@ describe("subagent-done.ts", () => {
       return { emit, ask, restore };
     }
 
+    it("marks the exit done after its final turn, and quit when someone ends it earlier", () => {
+      for (const finishFirst of [true, false]) {
+        const dir = createTestDir();
+        const sessionFile = join(dir, "s.jsonl");
+        const { emit, restore } = setupCapturingExtension(sessionFile);
+        try {
+          emit("agent_start");
+          if (finishFirst) emit("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] }, { shutdown() {} });
+          emit("session_shutdown", { reason: "quit" });
+          assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")), { type: finishFirst ? "done" : "quit" });
+        } finally {
+          restore();
+          rmSync(dir, { recursive: true, force: true });
+        }
+      }
+    });
+
+    it("signals the parent and stays open when its turn is interrupted", () => {
+      const dir = createTestDir();
+      const sessionFile = join(dir, "s.jsonl");
+      const { emit, restore } = setupCapturingExtension(sessionFile);
+      try {
+        // Escape mid-reply is "aborted"; Escape during a tool is an error carrying the abort (pi 0.99).
+        for (const interrupted of [{ stopReason: "aborted" }, { stopReason: "error", errorMessage: "This operation was aborted" }]) {
+          let shutdown = false;
+          emit("agent_start");
+          emit("agent_end", { messages: [{ role: "assistant", ...interrupted }] }, { shutdown() { shutdown = true; } });
+          assert.equal(shutdown, false);
+          assert.equal(existsSync(`${sessionFile}.paused`), true);
+          rmSync(`${sessionFile}.paused`);
+          assert.equal(existsSync(`${sessionFile}.exit`), false, "an interruption is not an error exit");
+        }
+      } finally {
+        restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
     it("exits (does not park) when the reply arrives mid-run via input", async () => {
       const dir = createTestDir();
       const { emit, ask, restore } = setupCapturingExtension(join(dir, "s.jsonl"));
@@ -1739,6 +1777,29 @@ describe("subagent interruption", () => {
       assert.match(result.content[0].text, /`message` is required/);
     } finally {
       runningMap.clear();
+    }
+  });
+
+  it("reports a subagent ended early by hand, and wakes the parent once when its turn is interrupted", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const text = testApi.resolveResultPresentation({ exitCode: 1, elapsed: 30, summary: "half done", endedEarly: true }, "Worker");
+    assert.match(text, /ended in its pane before it finished.*\n\nhalf done/s);
+    const dir = createTestDir();
+    const sessionFile = join(dir, "s.jsonl");
+    const { api } = createMockExtensionApi();
+    const sent: any[] = [];
+    api.sendMessage = (message: any) => { sent.push(message); };
+    (subagentsModule as any).default(api);
+    try {
+      writeFileSync(`${sessionFile}.paused`, "{}");
+      await testApi.watchSubagent(makeRunning({ sessionFile }), new AbortController().signal, {
+        wait: async (_surface: string, _signal: AbortSignal, options: any) => { options.onTick("idle"); options.onTick("idle"); return { reason: "done", exitCode: 0 }; },
+        close: () => {},
+      });
+      assert.equal(sent.filter((m) => /interrupted in herdr pane pane-1/.test(m.content)).length, 1);
+      assert.equal(existsSync(`${sessionFile}.paused`), false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 

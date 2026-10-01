@@ -65,6 +65,17 @@ it("leaves a pane blocked at startup for the user and closes it on other start f
   writeFileSync(join(dir, "start"), "");
 });
 
+it("picks another name once when a parallel start took it, and keeps the pane's output when pi fails to start", async () => {
+  layout([["w1:p1", 200, 50]]);
+  reply("start", { error: { code: "agent_name_taken", message: "taken" } });
+  writeFileSync(log, "");
+  await assert.rejects(herdr.startAgent(launch), (error: any) => /agent_name_taken/.test(error.message) && /last line/.test(error.message));
+  assert.equal(calls().filter((c) => c[0] === "agent" && c[1] === "start").length, 2, "one retry, not more");
+  reply("start", { error: { code: "timeout", message: "timed out" } });
+  await assert.rejects(herdr.startAgent(launch), /timeout[\s\S]*Last output in the pane:\n\{not json\nlast line/);
+  writeFileSync(join(dir, "start"), "");
+});
+
 it("derives herdr agent names", () => {
   assert.equal(herdr.agentName("Scout: auth middleware", new Set()), "scout-auth-middleware");
   assert.equal(herdr.agentName("42", new Set()), "subagent");
@@ -77,6 +88,10 @@ it("steers as one multi-line prompt, reads raw text, and reports herdr errors by
   assert.deepEqual(calls()[0], ["agent", "prompt", "w1:p9", "a\nb"]);
   assert.throws(() => herdr.steer("blocked", "hi"), (error: any) => error.code === "agent_blocked");
   assert.equal(herdr.readScreen("w1:p9", 5), "{not json\nlast line");
+});
+
+it("decodes a quit marker as an early end", () => {
+  assert.deepEqual(herdr.interpretExitSidecar({ type: "quit" }), { reason: "quit", exitCode: 1 });
 });
 
 it("finishes on the exit marker, and calls an agent that left its pane twice without one interrupted", async () => {

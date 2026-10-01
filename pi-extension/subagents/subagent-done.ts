@@ -47,6 +47,15 @@ export function runningChildrenCount(): number {
   }
 }
 
+/**
+ * Escape ends a turn as `aborted`, or, when it interrupts a running tool, as
+ * `error` with an abort message.
+ */
+export function wasAborted(message: any): boolean {
+  return message?.stopReason === "aborted" ||
+    (message?.stopReason === "error" && /operation was aborted|AbortError/i.test(String(message.errorMessage ?? "")));
+}
+
 export function shouldAutoExitOnAgentEnd(
   _userTookOver: boolean,
   messages: any[] | undefined,
@@ -63,7 +72,7 @@ export function shouldAutoExitOnAgentEnd(
     for (let i = messages.length - 1; i >= 0; i--) {
       const msg = messages[i];
       if (msg?.role === "assistant") {
-        return msg.stopReason !== "aborted";
+        return !wasAborted(msg);
       }
     }
   }
@@ -92,7 +101,7 @@ export function findLatestAssistantError(
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i];
     if (msg?.role !== "assistant") continue;
-    if (msg.stopReason !== "error") return null;
+    if (msg.stopReason !== "error" || wasAborted(msg)) return null;
     const raw = typeof msg.errorMessage === "string" ? msg.errorMessage.trim() : "";
     return {
       errorMessage: raw || "Subagent agent loop ended with stopReason=error (no errorMessage field).",
@@ -178,6 +187,8 @@ export default function (pi: ExtensionAPI) {
   // lands — on `input` (covers a reply steered into the current run) and on
   // `agent_start` (covers a reply that starts a fresh turn after parking).
   let awaitingAnswer = false;
+  // Set when this extension ends the session after a completed final turn.
+  let finished = false;
 
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
@@ -250,8 +261,16 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
+      finished = true;
       ctx.shutdown();
       return;
+    }
+
+    // Escape stopped an autonomous subagent mid-turn: it waits for input, so tell the parent.
+    const sessionFile = process.env.PI_SUBAGENT_SESSION;
+    const last = [...(messages ?? [])].reverse().find((m) => m?.role === "assistant");
+    if (autoExit && sessionFile && wasAborted(last)) {
+      try { writeFileSync(`${sessionFile}.paused`, "{}"); } catch {}
     }
 
     if (autoExit) {
@@ -262,12 +281,14 @@ export default function (pi: ExtensionAPI) {
   });
 
   // The parent learns how this session ended from `${sessionFile}.exit`: an
-  // error marker written above, or `done` for any other quit (auto-exit or a
-  // human leaving the pane). A crash leaves no marker.
+  // error marker written above, `done` when the work finished (an autonomous
+  // agent's final turn, or a human leaving an interactive pane), or `quit` when
+  // someone ended an autonomous agent early. A crash leaves no marker.
   pi.on("session_shutdown", (event) => {
     const sessionFile = process.env.PI_SUBAGENT_SESSION;
     if ((event as any).reason !== "quit" || !sessionFile || existsSync(`${sessionFile}.exit`)) return;
-    try { writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done" })); } catch {}
+    const type = finished || !autoExit ? "done" : "quit";
+    try { writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type })); } catch {}
   });
 
   // Toggle expand/collapse with Ctrl+Alt+O
