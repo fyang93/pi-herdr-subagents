@@ -156,13 +156,13 @@ The old `registerToolExtension(name, path)` hook has been removed; enable the ex
 
 ## Role folders
 
-`cwd` starts a sub-agent in a directory with its own config, so role-specific setups (CLAUDE.md, skills, extensions) apply:
+`cwd` starts a sub-agent in a directory with its own config, so role-specific setups (AGENTS.md, skills, extensions) apply:
 
 ```
 project/
 └── agents/
-    ├── game-designer/   ← CLAUDE.md, .pi/…
-    └── sre/             ← CLAUDE.md, .pi/…
+    ├── game-designer/   ← AGENTS.md, .pi/…
+    └── sre/             ← AGENTS.md, .pi/…
 ```
 
 ```typescript
