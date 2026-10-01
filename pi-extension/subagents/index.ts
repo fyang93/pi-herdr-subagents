@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { keyHint } from "@mariozechner/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
-import { Box, Text, truncateToWidth } from "@mariozechner/pi-tui";
+import { Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -28,6 +28,7 @@ import {
 
 import {
   countSessionEntryLines,
+  currentTool,
   findLastAssistantMessage,
   getNewEntries,
   getSessionId,
@@ -45,12 +46,14 @@ import {
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
 const launchDeps = { startAgent, watchSubagent };
 
-// Survive /reload: abort watchers from the previous module load.
+// Survive /reload: stop the widget timer and abort watchers from the previous module load.
 // /reload re-imports this file, giving fresh module-level state, but closures from
 // the old module keep running. See https://github.com/HazAT/pi-interactive-subagents/issues/5
 const POLL_ABORT_KEY = Symbol.for("pi-subagents/poll-abort-controller");
+const WIDGET_INTERVAL_KEY = Symbol.for("pi-subagents/widget-interval");
 
 {
+  clearInterval((globalThis as any)[WIDGET_INTERVAL_KEY]);
   const prevAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
   if (prevAbort) prevAbort.abort();
   (globalThis as any)[POLL_ABORT_KEY] = new AbortController();
@@ -482,6 +485,67 @@ const RUNNING_CHILDREN_COUNT_KEY = Symbol.for("pi-subagents/running-children-cou
 
 /** Latest ExtensionAPI, used to deliver watcher notifications to the parent. */
 let latestPi: ExtensionAPI | null = null;
+/** Latest UI context, for the running-subagents widget. */
+let latestCtx: ExtensionContext | null = null;
+
+// ── Running-subagents widget ──
+
+const ACCENT = "\x1b[38;2;77;163;255m";
+const YELLOW = "\x1b[38;2;214;181;94m";
+const RED = "\x1b[38;2;224;108;117m";
+const DIM = "\x1b[38;2;128;128;128m";
+const RST = "\x1b[0m";
+
+function formatClock(ms: number): string {
+  const seconds = Math.max(0, Math.floor(ms / 1000));
+  return `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
+}
+
+/** Right-hand label: herdr's state, plus the tool a working pi subagent is in. */
+function widgetStatus(running: RunningSubagent): string {
+  const status = running.status ?? "starting";
+  if (status === "blocked") return `${RED}blocked${RST}`;
+  if (status !== "working") return `${DIM}${status}${RST}`;
+  const tool = running.cli === "claude" ? undefined : currentTool(running.sessionFile);
+  return `${YELLOW}working${RST}${tool ? ` · ${tool}` : ""}`;
+}
+
+/** One bordered line per running subagent: elapsed, name (agent), state. */
+function renderSubagentWidgetLines(agents: RunningSubagent[], width: number, now = Date.now()): string[] {
+  if (width < 4) return [];
+  const inner = width - 2;
+  const title = `─ Subagents `;
+  const info = ` ${agents.length} running ─`;
+  const top = title.length + info.length <= inner
+    ? `${title}${"─".repeat(inner - title.length - info.length)}${info}`
+    : "─".repeat(inner);
+  const lines = [`${ACCENT}╭${top}╮${RST}`];
+  for (const agent of agents) {
+    const right = ` ${widgetStatus(agent)} `;
+    const left = truncateToWidth(` ${formatClock(now - agent.startTime)}  ${agent.name}${agent.agent ? ` (${agent.agent})` : ""}`,
+      Math.max(0, inner - visibleWidth(right)));
+    const row = truncateToWidth(left + " ".repeat(Math.max(0, inner - visibleWidth(left) - visibleWidth(right))) + right, inner);
+    lines.push(`${ACCENT}│${RST}${row}${" ".repeat(Math.max(0, inner - visibleWidth(row)))}${ACCENT}│${RST}`);
+  }
+  lines.push(`${ACCENT}╰${"─".repeat(inner)}╯${RST}`);
+  return lines;
+}
+
+/** Show the widget while subagents run (redrawn every second), remove it when none are left. */
+function refreshWidget(): void {
+  const ui = latestCtx?.hasUI ? latestCtx.ui : null;
+  if (!ui || runningSubagents.size === 0) {
+    clearInterval((globalThis as any)[WIDGET_INTERVAL_KEY]);
+    (globalThis as any)[WIDGET_INTERVAL_KEY] = null;
+    ui?.setWidget("subagent-status", undefined);
+    return;
+  }
+  ui.setWidget("subagent-status", () => ({
+    invalidate() {},
+    render: (width: number) => renderSubagentWidgetLines([...runningSubagents.values()], width),
+  }), { placement: "aboveEditor" });
+  (globalThis as any)[WIDGET_INTERVAL_KEY] ??= setInterval(refreshWidget, 1000);
+}
 
 /**
  * Build the positional prompt args for a Pi CLI subagent launch.
@@ -727,6 +791,7 @@ export const __test__ = {
   formatContextUsage,
   contextWindowFor,
   formatUsageSegments,
+  renderSubagentWidgetLines,
 };
 
 /**
@@ -1142,6 +1207,7 @@ async function watchSubagent(
 export default function subagentsExtension(pi: ExtensionAPI) {
   latestPi = pi;
   pi.on("session_start", (_event, ctx) => {
+    latestCtx = ctx;
     // Subagents are new pi processes, so they load herdr's state integration once installed.
     if (isHerdrAvailable()) {
       ensurePiIntegration().then(
@@ -1161,6 +1227,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
   // Clean up on session shutdown
   pi.on("session_shutdown", (_event, _ctx) => {
+    clearInterval((globalThis as any)[WIDGET_INTERVAL_KEY]);
+    (globalThis as any)[WIDGET_INTERVAL_KEY] = null;
     const moduleAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
     if (moduleAbort) moduleAbort.abort();
     for (const [_id, agent] of runningSubagents) {
@@ -1316,8 +1384,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const watcherAbort = new AbortController();
         running.abortController = watcherAbort;
 
+        refreshWidget();
+
         // Fire-and-forget: start watching in background
         launchDeps.watchSubagent(running, watcherAbort.signal)
+          .finally(refreshWidget)
           .then((result) => {
             const presentation = resolveResultPresentation(result, running.name);
 
@@ -1680,7 +1751,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const watcherAbort = new AbortController();
         running.abortController = watcherAbort;
 
+        refreshWidget();
         launchDeps.watchSubagent(running, watcherAbort.signal)
+          .finally(refreshWidget)
           .then((result) => {
             const allEntries = getNewEntries(sessionPath, entryCountBefore);
             const summary = findLastAssistantMessage(allEntries) ??

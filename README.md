@@ -7,7 +7,16 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono), running as named 
 `subagent()` returns as soon as the sub-agent is up. Each sub-agent is a herdr agent in its own pane, without stealing keyboard focus: an unfocused split of the largest pane in the parent's tab, or a background tab when no split leaves both halves at least **50 columns × 15 rows** (`PI_SUBAGENT_MIN_COLUMNS`, `PI_SUBAGENT_MIN_ROWS`). Existing panes are never rearranged, and a zoomed tab always gets a background tab.
 
 - **Start** — `herdr agent start <name> --kind pi` launches pi once the pane's shell is ready, and returns when pi is ready for input; the skills and the task are then submitted with `herdr agent prompt`. The herdr agent name is derived from the display name (`Scout: auth` → `scout-auth`, suffixed when taken).
-- **Status** — herdr's agents sidebar shows every sub-agent as working, idle, blocked or done. The extension installs herdr's pi integration (`herdr integration install pi`) on first start inside herdr, so the state comes from pi itself rather than screen detection.
+- **Status** — while sub-agents run, a widget above the input shows each one's elapsed time and state, with the tool a working pi sub-agent is in (read from its session file):
+
+  ```
+  ╭─ Subagents ──────────────────────── 2 running ─╮
+  │ 01:10  Sleeper (worker)          working · bash │
+  │ 00:18  Scout (scout)                    blocked │
+  ╰─────────────────────────────────────────────────╯
+  ```
+
+  herdr's agents sidebar shows the same sub-agents as working, idle, blocked or done. The extension installs herdr's pi integration (`herdr integration install pi`) on first start inside herdr, so the state comes from pi itself rather than screen detection.
 - **Blocked** — when herdr sees an autonomous sub-agent stuck at a confirmation or question dialog, the parent is told once, with the pane to look at.
 - **Completion** — on quit, the sub-agent writes `<session>.exit` (`done`, or `error` with the provider's message when its last turn failed). The parent checks that marker and asks herdr whether the agent is still in its pane, once a second. An agent that leaves its pane twice in a row without a marker is reported as interrupted; its pane is left open for inspection. On completion the parent reads the result from the session file, closes the pane and steers the result into the main session.
 - **Shutdown** — on parent shutdown or `/reload`, tracked sub-agent panes are closed.

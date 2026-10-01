@@ -3,6 +3,7 @@ import {
   closeSync,
   copyFileSync,
   existsSync,
+  fstatSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -620,4 +621,30 @@ export function summarizeSessionStats(sessionFile: string): SessionStats | null 
   }
 
   return stats;
+}
+
+/**
+ * The tool a running session is executing: the last message is an assistant
+ * tool call with no result after it. Reads only the file's tail.
+ */
+export function currentTool(sessionFile: string, tailBytes = 64 * 1024): string | undefined {
+  let fd: number | undefined;
+  try {
+    fd = openSync(sessionFile, "r");
+    const size = fstatSync(fd).size;
+    const buffer = Buffer.alloc(Math.min(size, tailBytes));
+    readSync(fd, buffer, 0, buffer.length, size - buffer.length);
+    const lines = buffer.toString("utf8").split("\n");
+    for (let i = lines.length - 1; i >= 0; i--) {
+      let entry: any;
+      try { entry = JSON.parse(lines[i]); } catch { continue; } // blank, or cut by the tail
+      if (entry?.type !== "message") continue;
+      const message = entry.message;
+      if (message?.role !== "assistant" || !Array.isArray(message.content)) return undefined;
+      const calls = message.content.filter((part: any) => part?.type === "toolCall" && typeof part.name === "string");
+      return calls.at(-1)?.name;
+    }
+  } catch {} // missing or unreadable: no tool to show
+  finally { if (fd !== undefined) closeSync(fd); }
+  return undefined;
 }

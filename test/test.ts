@@ -29,6 +29,7 @@ import {
   mergeNewEntries,
   seedSubagentSessionFile,
   summarizeSessionStats,
+  currentTool,
 } from "../pi-extension/subagents/session.ts";
 
 import {
@@ -1944,6 +1945,46 @@ describe("subagent status renderer", () => {
         );
       }
     }
+  });
+});
+
+describe("running-subagents widget", () => {
+  const testApi = (subagentsModule as any).__test__;
+  const strip = (line: string) => line.replace(/\x1b\[[0-9;]*m/g, "");
+
+  it("shows elapsed time, name, agent and herdr state, with the current tool while working", () => {
+    withTempDir((d) => {
+      const sessionFile = join(d, "child.jsonl");
+      const call = (name: string) => JSON.stringify({ type: "message", message: { role: "assistant", content: [{ type: "text", text: "x" }, { type: "toolCall", id: "1", name }] } });
+      writeFileSync(sessionFile, [JSON.stringify({ type: "session", id: "s" }), call("read"),
+        JSON.stringify({ type: "message", message: { role: "toolResult", toolName: "read" } }), call("bash")].join("\n") + "\n");
+      assert.equal(currentTool(sessionFile), "bash");
+      const agents = [
+        { name: "Sleeper", agent: "worker", startTime: 0, status: "working", sessionFile },
+        { name: "Scout", startTime: 52_000, status: "blocked", sessionFile: join(d, "missing.jsonl") },
+        { name: "Fresh", startTime: 59_000, sessionFile },
+      ];
+      const lines = testApi.renderSubagentWidgetLines(agents, 60, 70_000).map(strip);
+      assert.match(lines[0], /Subagents .* 3 running/);
+      assert.match(lines[1], /01:10 {2}Sleeper \(worker\) +working · bash │$/);
+      assert.match(lines[2], /00:18 {2}Scout +blocked │$/);
+      assert.match(lines[3], /starting │$/);
+      for (const width of [60, 30, 12, 4]) {
+        for (const line of testApi.renderSubagentWidgetLines(agents, width, 70_000)) assert.equal(visibleWidth(line), width);
+      }
+    });
+  });
+
+  it("reports no tool once the call has a result or the session is gone", () => {
+    withTempDir((d) => {
+      const sessionFile = join(d, "child.jsonl");
+      writeFileSync(sessionFile, [
+        JSON.stringify({ type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: "1", name: "bash" }] } }),
+        JSON.stringify({ type: "message", message: { role: "toolResult", toolName: "bash" } }),
+      ].join("\n"));
+      assert.equal(currentTool(sessionFile), undefined);
+      assert.equal(currentTool(join(d, "missing.jsonl")), undefined);
+    });
   });
 });
 
