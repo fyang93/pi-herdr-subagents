@@ -1326,6 +1326,51 @@ describe("tool registration", () => {
     assert.match(result.content[0].text, /specify which agent/i);
   });
 
+  it("routes an agent's identity by system-prompt mode: replace, append, or the task prompt", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const deps = testApi.launchDeps;
+    const oldStart = deps.startAgent, oldWatch = deps.watchSubagent;
+    const oldEnv = { HERDR_ENV: process.env.HERDR_ENV, HERDR_PANE_ID: process.env.HERDR_PANE_ID };
+    try {
+      await withIsolatedAgentEnv(async ({ projectDir, projectAgentsDir }) => {
+        Object.assign(process.env, { HERDR_ENV: "1", HERDR_PANE_ID: "w1:p1" });
+        for (const [name, mode] of [["spm-replace", "replace"], ["spm-append", "append"], ["spm-none", undefined], ["spm-bogus", "foobar"]]) {
+          writeAgentFile(projectAgentsDir, name, `name: ${name}${mode ? `\nsystem-prompt: ${mode}` : ""}`, `You are ${name}.`);
+        }
+        const launches: any[] = [];
+        deps.startAgent = async (launch: any) => { launches.push(launch); return { surface: `w1:p${launches.length + 1}`, agent: launch.name }; };
+        deps.watchSubagent = () => new Promise(() => {});
+        const { api, registeredTools } = createMockExtensionApi();
+        (subagentsModule as any).default(api);
+        const tool = registeredTools.find((item) => item.name === "subagent");
+        const ctx = { cwd: projectDir, sessionManager: {
+          getSessionFile: () => join(projectDir, "parent.jsonl"), getSessionDir: () => projectDir, getSessionId: () => "parent-id" } };
+        const spawn = async (agent: string) => {
+          await tool.execute("call", { agent, task: "do the task" }, undefined, undefined, ctx);
+          const launch = launches.at(-1);
+          const flag = ["--system-prompt", "--append-system-prompt"].find((f) => launch.args.includes(f));
+          return { flag, file: flag && readFileSync(launch.args[launch.args.indexOf(flag) + 1], "utf8"), task: launch.prompts.at(-1) };
+        };
+        const replace = await spawn("spm-replace");
+        assert.equal(replace.flag, "--system-prompt");
+        assert.equal(replace.file, "You are spm-replace.");
+        assert.doesNotMatch(replace.task, /You are spm-replace/);
+        const append = await spawn("spm-append");
+        assert.equal(append.flag, "--append-system-prompt");
+        assert.equal(append.file, "You are spm-append.");
+        for (const agent of ["spm-none", "spm-bogus"]) {  // no or unknown mode: identity rides in the task prompt
+          const plain = await spawn(agent);
+          assert.equal(plain.flag, undefined);
+          assert.match(plain.task, new RegExp(`You are ${agent}\\.[\\s\\S]*do the task`));
+        }
+      });
+    } finally {
+      deps.startAgent = oldStart; deps.watchSubagent = oldWatch;
+      testApi.runningSubagents.clear(); testApi.reservedNames.clear();
+      for (const [key, value] of Object.entries(oldEnv)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
+    }
+  });
+
   it("rejects a top-level spawn naming an unknown agent", async () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);

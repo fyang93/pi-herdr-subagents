@@ -9,7 +9,7 @@ import {
   renameSync,
   writeFileSync,
 } from "node:fs";
-import { randomBytes, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 
 export interface SessionEntry {
@@ -217,18 +217,8 @@ function readEntries(sessionFile: string): SessionEntry[] {
 }
 
 /**
- * Read the canonical session id from a session file's header.
- *
- * pi's `--session <id>` flag resolves against this header `id` (exact match,
- * then prefix), NOT the filename — so this is the value to hand back to the
- * orchestrator for follow-ups.
- */
-/**
- * Read only the first line of a file without loading the whole thing into
- * memory. Session files grow to many MB, but the header we need is always the
- * first JSON line, so reading a small prefix keeps header lookups cheap — this
- * is what makes scanning a large session tree fast enough to avoid blocking the
- * event loop. Returns the first line (sans trailing newline), or null.
+ * Read only the first line of a file: session files grow to many MB, but the
+ * header is always the first JSON line. Returns it (sans newline), or null.
  */
 function readFirstLine(path: string, maxBytes = 65536): string | null {
   let fd: number | undefined;
@@ -253,6 +243,13 @@ function readFirstLine(path: string, maxBytes = 65536): string | null {
   }
 }
 
+/**
+ * Read the canonical session id from a session file's header.
+ *
+ * pi's `--session <id>` flag resolves against this header `id` (exact match,
+ * then prefix), NOT the filename — so this is the value to hand back to the
+ * orchestrator for follow-ups.
+ */
 export function getSessionId(sessionFile: string): string | null {
   return readHeaderId(sessionFile);
 }
