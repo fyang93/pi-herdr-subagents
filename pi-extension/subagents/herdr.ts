@@ -1,6 +1,6 @@
 /**
  * herdr operations. Each subagent is a named herdr agent in its own pane: an
- * unfocused split in the parent's tab (a background tab when no split fits),
+ * unfocused split of the parent's pane (a background tab when that is too small),
  * started with `herdr agent start` so it shows in herdr's agents sidebar, with
  * state reported by herdr's pi integration. Pane ids look like `w1:p2`.
  */
@@ -108,16 +108,13 @@ async function startAgentUnlocked(launch: AgentLaunch): Promise<{ surface: strin
   const minColumns = positiveInteger(process.env.PI_SUBAGENT_MIN_COLUMNS, 50);
   const minRows = positiveInteger(process.env.PI_SUBAGENT_MIN_ROWS, 15);
   const { layout } = await herdrAsync(["pane", "layout", "--pane", parent]);
-  // Split the largest pane in the parent's tab; never unzoom or rearrange the user's layout.
-  let best: { pane: string; direction: "right" | "down"; area: number } | undefined;
-  for (const { pane_id, rect } of layout.zoomed ? [] : layout.panes) {
-    const direction = splitDirection(rect.width, rect.height, minColumns, minRows);
-    const area = rect.width * rect.height;
-    if (direction && (!best || area > best.area)) best = { pane: pane_id, direction, area };
-  }
+  // Split only the parent's own pane, never another pane the user may be working in;
+  // a background tab when it is too small or zoomed. Never unzoom or rearrange the layout.
+  const own = layout.zoomed ? undefined : layout.panes.find((pane: any) => pane.pane_id === parent);
+  const direction = own && splitDirection(own.rect.width, own.rect.height, minColumns, minRows);
   const env = Object.entries(launch.env).flatMap(([key, value]) => ["--env", `${key}=${value}`]);
-  const surface: string = best
-    ? (await herdrAsync(["pane", "split", best.pane, "--direction", best.direction, "--no-focus", "--cwd", launch.cwd, ...env])).pane.pane_id
+  const surface: string = direction
+    ? (await herdrAsync(["pane", "split", parent, "--direction", direction, "--no-focus", "--cwd", launch.cwd, ...env])).pane.pane_id
     : (await herdrAsync(["tab", "create", "--no-focus", "--label", launch.name, "--cwd", launch.cwd, ...env])).root_pane.pane_id;
   await herdrAsync(["pane", "rename", surface, launch.name]).catch(() => {});
   let agent = "";

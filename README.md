@@ -4,7 +4,7 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono), running as named 
 
 ## How it works
 
-`subagent()` returns as soon as the sub-agent is up. Each sub-agent is a herdr agent in its own pane, without stealing keyboard focus: an unfocused split of the largest pane in the parent's tab, or a background tab when no split leaves both halves at least **50 columns × 15 rows** (`PI_SUBAGENT_MIN_COLUMNS`, `PI_SUBAGENT_MIN_ROWS`). Existing panes are never rearranged, and a zoomed tab always gets a background tab.
+`subagent()` returns as soon as the sub-agent is up. Each sub-agent is a herdr agent in its own pane, without stealing keyboard focus: an unfocused split of the parent's own pane, or a background tab when splitting it would leave either half under **50 columns × 15 rows** (`PI_SUBAGENT_MIN_COLUMNS`, `PI_SUBAGENT_MIN_ROWS`). Other panes are never split or rearranged, and a zoomed tab always gets a background tab.
 
 - **Start** — `herdr agent start <name> --kind pi` launches pi once the pane's shell is ready, and returns when pi is ready for input; the skills and the task are then submitted with `herdr agent prompt`. The herdr agent name is derived from the display name (`Scout: auth` → `scout-auth`, suffixed when taken).
 - **Status** — while sub-agents run, a widget above the input shows each one's elapsed time and state, with the tool a working pi sub-agent is in (read from its session file):

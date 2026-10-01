@@ -33,23 +33,25 @@ const layout = (panes: [string, number, number][], zoomed = false) => reply("lay
 });
 const launch = { name: "Scout", kind: "pi" as const, args: ["--session", "/s s.jsonl"], prompts: ["/skill:review", "line 1\nline 2"], env: { PI_SUBAGENT_NAME: "Scout" }, cwd: "/repo" };
 
-it("starts a named agent in an unfocused split of the largest usable pane, else a background tab", async () => {
+it("starts a named agent in an unfocused split of the parent's own pane, else a background tab", async () => {
   writeFileSync(log, "");
   writeFileSync(join(dir, "start"), "");
-  layout([["w1:p1", 90, 50], ["w1:p2", 200, 50]]);
+  layout([["w1:p1", 90, 50], ["w1:p2", 200, 50]]);  // a bigger pane beside the parent is never split
   assert.deepEqual(await herdr.startAgent(launch), { surface: "w1:p9", agent: "scout-2" });
   const made = calls();
-  assert.deepEqual(made[1], ["pane", "split", "w1:p2", "--direction", "right", "--no-focus", "--cwd", "/repo", "--env", "PI_SUBAGENT_NAME=Scout"]);
+  assert.deepEqual(made[1], ["pane", "split", "w1:p1", "--direction", "down", "--no-focus", "--cwd", "/repo", "--env", "PI_SUBAGENT_NAME=Scout"]);
   assert.deepEqual(made.slice(-3), [
     ["agent", "start", "scout-2", "--kind", "pi", "--pane", "w1:p9", "--timeout", "60000", "--", "--session", "/s s.jsonl"],
     ["agent", "prompt", "scout-2", "/skill:review"],
     ["agent", "prompt", "scout-2", "line 1\nline 2"],
   ]);
 
-  writeFileSync(log, "");
-  layout([["w1:p1", 200, 50]], true);
-  assert.equal((await herdr.startAgent(launch)).surface, "w1:p8");
-  assert.deepEqual(calls()[1].slice(0, 5), ["tab", "create", "--no-focus", "--label", "Scout"]);
+  for (const [panes, zoomed] of [[[["w1:p1", 60, 20], ["w1:p2", 200, 50]], false], [[["w1:p1", 200, 50]], true]] as const) {
+    writeFileSync(log, "");
+    layout(panes as any, zoomed);  // the parent is too small, or the tab is zoomed
+    assert.equal((await herdr.startAgent(launch)).surface, "w1:p8");
+    assert.deepEqual(calls()[1].slice(0, 5), ["tab", "create", "--no-focus", "--label", "Scout"]);
+  }
 });
 
 it("leaves a pane blocked at startup for the user and closes it on other start failures", async () => {
