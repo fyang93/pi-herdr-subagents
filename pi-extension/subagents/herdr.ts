@@ -138,7 +138,7 @@ async function startAgentUnlocked(launch: AgentLaunch): Promise<{ surface: strin
       let output = "";
       try { output = readScreen(surface, 40).split("\n").filter((line) => line.trim()).slice(-8).join("\n"); } catch {}
       try { closeSurface(surface); } catch {}
-      throw new Error(`${(error as Error).message}${output ? `\nLast output in the pane:\n${output}` : ""}`);
+      throw new Error(`${String((error as any)?.message ?? error)}${output ? `\nLast output in the pane:\n${output}` : ""}`);
     }
   }
   for (const prompt of launch.prompts) await herdrAsync(["agent", "prompt", agent, prompt]);

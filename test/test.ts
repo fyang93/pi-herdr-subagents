@@ -1803,6 +1803,38 @@ describe("subagent interruption", () => {
     }
   });
 
+  it("keeps an interruption signal until its notice is delivered", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const dir = createTestDir();
+    const sessionFile = join(dir, "s.jsonl");
+    const { api } = createMockExtensionApi();
+    let attempts = 0;
+    const delivered: any[] = [];
+    api.sendMessage = async (message: any) => {
+      if (++attempts === 1) throw new Error("parent busy");
+      delivered.push(message);
+    };
+    (subagentsModule as any).default(api);
+    const settle = () => new Promise((resolve) => setTimeout(resolve, 10));
+    try {
+      writeFileSync(`${sessionFile}.paused`, "{}");
+      await testApi.watchSubagent(makeRunning({ sessionFile }), new AbortController().signal, {
+        wait: async (_surface: string, _signal: AbortSignal, options: any) => {
+          options.onTick("idle"); await settle();
+          assert.equal(existsSync(`${sessionFile}.paused`), true, "a failed send keeps the signal");
+          options.onTick("idle"); await settle();
+          options.onTick("idle"); await settle();
+          return { reason: "done", exitCode: 0 };
+        },
+        close: () => {},
+      });
+      assert.equal(delivered.filter((m) => m.customType === "subagent_status").length, 1);
+      assert.equal(existsSync(`${sessionFile}.paused`), false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("formats exit code 130 as an ordinary failure", () => {
     const testApi = (subagentsModule as any).__test__;
     const presentation = testApi.resolveResultPresentation(

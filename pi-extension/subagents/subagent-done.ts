@@ -49,7 +49,8 @@ export function runningChildrenCount(): number {
 
 /**
  * Escape ends a turn as `aborted`, or, when it interrupts a running tool, as
- * `error` with an abort message.
+ * `error` with an abort message. pi 0.99 has no structured abort field for the
+ * latter, so its message is matched; prefer such a field if pi adds one.
  */
 export function wasAborted(message: any): boolean {
   return message?.stopReason === "aborted" ||

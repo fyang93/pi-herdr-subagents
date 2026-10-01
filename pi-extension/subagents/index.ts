@@ -1025,53 +1025,61 @@ function copyClaudeSession(sentinelFile: string): string | null {
 function deliverPendingQuestion(running: RunningSubagent): void {
   const askFile = `${running.sessionFile}.ask`;
   let payload: any = null;
+  if (delivering.has(askFile) || !existsSync(askFile)) return;
   try {
-    if (!existsSync(askFile)) return;
     payload = JSON.parse(readFileSync(askFile, "utf-8"));
-  } catch {
-    // Malformed/partway-written file — drop it and move on.
+  } catch {} // Malformed/partway-written file — dropped below.
+  if (!payload?.question) {
+    try { unlinkSync(askFile); } catch {}
+    return;
   }
-  try {
-    unlinkSync(askFile);
-  } catch {}
-  if (!payload?.question) return;
 
   const name = running.name; // unique per session (deduped at spawn) — targets the reply
   const sessionId = existsSync(running.sessionFile) ? getSessionId(running.sessionFile) : null;
   const elapsed = Math.floor((Date.now() - running.startTime) / 1000);
   const replyHint = `\n\nReply with subagent_message({ name: "${name}", message: "…" }) — the same name works whether it is still running or has since exited. It stays open until you reply.`;
 
-  latestPi?.sendMessage(
-    {
-      customType: "subagent_question",
-      content: `Sub-agent "${name}" asks (${formatElapsed(elapsed)}):\n\n${payload.question}${replyHint}`,
-      display: true,
-      details: {
-        name,
-        agent: running.agent,
-        question: payload.question,
-        ...(sessionId ? { sessionId } : {}),
-      },
+  deliverOnce(askFile, {
+    customType: "subagent_question",
+    content: `Sub-agent "${name}" asks (${formatElapsed(elapsed)}):\n\n${payload.question}${replyHint}`,
+    display: true,
+    details: {
+      name,
+      agent: running.agent,
+      question: payload.question,
+      ...(sessionId ? { sessionId } : {}),
     },
-    { triggerTurn: true, deliverAs: "steer" },
-  );
+  });
+}
+
+/** Signal files whose notice is being sent, so a slow send is not repeated on the next tick. */
+const delivering = new Set<string>();
+
+/**
+ * Steer a notice for a signal file into the parent, deleting the file only once
+ * the notice is delivered; a failed send keeps it for the next tick.
+ */
+function deliverOnce(file: string, message: Parameters<ExtensionAPI["sendMessage"]>[0]): void {
+  if (!latestPi || delivering.has(file)) return;
+  delivering.add(file);
+  Promise.resolve()
+    .then(() => latestPi!.sendMessage(message, { triggerTurn: true, deliverAs: "steer" }))
+    .then(() => { try { unlinkSync(file); } catch {} })
+    .catch(() => {})
+    .finally(() => delivering.delete(file));
 }
 
 /** Wake the parent once when someone interrupts an autonomous subagent's turn in its pane. */
 function reportPaused(running: RunningSubagent): void {
   const pausedFile = `${running.sessionFile}.paused`;
   if (!existsSync(pausedFile)) return;
-  try { unlinkSync(pausedFile); } catch {}
-  latestPi?.sendMessage(
-    {
-      customType: "subagent_status",
-      content: `Sub-agent "${running.name}" had its turn interrupted in herdr pane ${running.surface} and is waiting for input. ` +
-        `subagent_message({ name: "${running.name}", message: "…" }) continues it.`,
-      display: true,
-      details: { lines: [`${running.name}: interrupted, waiting in pane ${running.surface}`], overflow: 0 },
-    },
-    { triggerTurn: true, deliverAs: "steer" },
-  );
+  deliverOnce(pausedFile, {
+    customType: "subagent_status",
+    content: `Sub-agent "${running.name}" had its turn interrupted in herdr pane ${running.surface} and is waiting for input. ` +
+      `subagent_message({ name: "${running.name}", message: "…" }) continues it.`,
+    display: true,
+    details: { lines: [`${running.name}: interrupted, waiting in pane ${running.surface}`], overflow: 0 },
+  });
 }
 
 /**
@@ -1083,7 +1091,7 @@ function reportBlocked(running: RunningSubagent, status: string | null): void {
   if (!status || status === running.status) return;
   running.status = status;
   if (status !== "blocked" || running.interactive) return;
-  latestPi?.sendMessage(
+  void latestPi?.sendMessage(
     {
       customType: "subagent_status",
       content: `Sub-agent "${running.name}" is blocked at a confirmation or question dialog in herdr pane ${running.surface}. Tell the user, or read it with \`herdr pane read ${running.surface}\`.`,
@@ -1091,7 +1099,7 @@ function reportBlocked(running: RunningSubagent, status: string | null): void {
       details: { lines: [`${running.name}: blocked at a dialog in pane ${running.surface}`], overflow: 0 },
     },
     { triggerTurn: true, deliverAs: "steer" },
-  );
+  )?.catch(() => {}); // a missed blocked notice is not retried; the widget still shows it
 }
 
 async function watchSubagent(
