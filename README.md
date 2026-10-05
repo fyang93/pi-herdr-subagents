@@ -1,7 +1,5 @@
 # pi-herdr-subagents
 
-> **Archived.** This project is no longer maintained. Use **[pi-herdr-swarm](https://github.com/fyang93/pi-herdr-swarm)** instead: it covers everything here (async named sub-agents in herdr panes, results steered back when they finish, presets) and adds peer messaging, a shared project board, detach and resume.
-
 Async subagents for [pi](https://github.com/badlogic/pi-mono), running as named agents in [herdr](https://herdr.dev). Spawn a sub-agent, keep working in the main session, and get the result steered back when it finishes. Fully non-blocking.
 
 ## How it works
