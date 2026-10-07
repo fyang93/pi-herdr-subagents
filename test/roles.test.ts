@@ -71,11 +71,11 @@ const agent = (dir: string, file: string, fields: string, body = "Role instructi
   writeFileSync(join(dir, file + ".md"), `---\n${fields}\n---\n${body}\n`);
 const finished = { messages: [{ role: "assistant", stopReason: "stop" }] };
 
-it("loads a non-spawnable top-level role by declared name with project priority, model, thinking, tools and delegation", async () => {
+it("loads a top-level role by declared name with project priority, model, thinking, tools and delegation", async () => {
   await isolated(async (project, global) => {
     agent(join(global, "agents"), "host", "name: host\nmodel: invalid/global");
     const dir = join(project, ".pi/agents");
-    agent(dir, "host-profile", "name: host\nspawnable: false\nmodel: test/model\nthinking: high\ntools: read, safe_bash\nsubagent_agents: scout, missing\nsystem-prompt: append");
+    agent(dir, "host-profile", "name: host\nmodel: test/model\nthinking: high\ntools: read, safe_bash\nsubagent_agents: scout, missing\nsystem-prompt: append");
     const h = harness({ "subagent-agent": "host" }); extension(h.api);
     await h.emit("session_start");
     assert.deepEqual(h.model, { provider: "test", id: "model" });
@@ -121,27 +121,29 @@ it("denies delegation without subagent_agents even if tools explicitly name spaw
   });
 });
 
-it("spawnable:false project stubs disable bundled/global roles at every depth, but remain loadable for top-level use", async () => {
-  await isolated(async (project, global) => {
-    for (const name of ["scout", "researcher", "worker"]) {
-      agent(join(global, "agents"), name, `name: ${name}\nmodel: test/model`);
-      agent(join(project, ".pi/agents"), name, "spawnable: false", "");
-    }
-    const h = harness(); extension(h.api); await h.emit("session_start");
-    assert.deepEqual(__test__.discoverAgentDefinitions(), []);
-    assert.equal(__test__.loadAgentDefaults("scout")?.spawnable, false);
-    const spawn = h.tools.find(t => t.name === "subagent");
-    for (const name of ["scout", "researcher", "worker"]) {
-      assert.equal((await spawn.execute("c", { agent: name, task: "task" })).details.error, "unknown agent");
-    }
+it("applies a host-started role's own delegation allowlist just like a child, denying direct dispatch when omitted", async () => {
+  await isolated(async (project) => {
     const moduleUrl = new URL("../pi-extension/subagents/index.ts", import.meta.url).href;
-    const output = execFileSync(process.execPath, ["--input-type=module", "-e", `
-      import extension, { __test__ } from ${JSON.stringify(moduleUrl)};
-      const tools = []; extension({ on() {}, registerFlag() {}, registerTool(t) { tools.push(t); }, registerShortcut() {}, registerCommand() {}, registerMessageRenderer() {} });
-      const result = await tools.find(t => t.name === 'subagent').execute('c', { agent: 'scout', task: 'task' });
-      console.log(JSON.stringify([__test__.discoverAgentDefinitions(), result.details.error]));
-    `], { env: { ...process.env, PI_SUBAGENT_AGENT: "host", PI_SUBAGENT_ALLOWED: "scout,worker,missing" }, encoding: "utf8" });
-    assert.deepEqual(JSON.parse(output), [[], "agent not in allowlist"]);
+    for (const allowed of [undefined, "scout"]) {
+      agent(join(project, ".pi/agents"), "host", allowed ? `subagent_agents: ${allowed}` : "tools: subagent");
+      const h = harness({ "subagent-agent": "host" }); extension(h.api); await h.emit("session_start");
+      const inspect = async (tools: any[]) => ({
+        listed: (await tools.find(t => t.name === "subagents_list").execute()).details.agents.map((a: any) => a.name),
+        errors: await Promise.all(["scout", "worker"].map(async name =>
+          (await tools.find(t => t.name === "subagent").execute("c", { agent: name, task: "task" })).details.error)),
+      });
+      const result = await inspect(h.tools);
+      assert.deepEqual(result, {
+        listed: allowed ? ["scout"] : [],
+        errors: [allowed ? "herdr not available" : "agent not in allowlist", "agent not in allowlist"],
+      });
+      const output = execFileSync(process.execPath, ["--input-type=module", "-e", `
+        import extension from ${JSON.stringify(moduleUrl)};
+        const tools = []; extension({ on() {}, registerFlag() {}, registerTool(t) { tools.push(t); }, registerShortcut() {}, registerCommand() {}, registerMessageRenderer() {} });
+        console.log(JSON.stringify(await (${inspect.toString()})(tools)));
+      `], { env: { ...process.env, PI_SUBAGENT_AGENT: "host", PI_SUBAGENT_ALLOWED: allowed ?? "" }, encoding: "utf8" });
+      assert.deepEqual(result, JSON.parse(output));
+    }
   });
 });
 
@@ -161,20 +163,13 @@ it("fails closed for unknown roles, unavailable models, invalid thinking, non-pi
   });
 });
 
-it("resume cannot bypass project exclusions or a top-level role's delegation permissions", async () => {
+it("resume cannot bypass a top-level role's delegation permissions", async () => {
   await isolated(async (project) => {
     const file = join(project, "child.jsonl");
     writeFileSync(file, '{"type":"session","id":"child"}\n');
     registerName(join(project, "artifacts/session"), "saved", { sessionFile: file, sessionId: "child" });
     writeSubagentLoadout(file, { agent: "scout", toolAllowlist: "read", model: null, thinking: null, identity: null, systemPromptMode: null, spawnable: null, autoExit: true, cwd: null, agentDir: null });
-    agent(join(project, ".pi/agents"), "scout", "spawnable: false");
-    process.env.HERDR_ENV = "1"; process.env.HERDR_PANE_ID = "test:pane";
-    const h = harness(); extension(h.api);
-    // No session_start is needed to test dispatch; keep herdr startup integration out of this test.
-    const result = await h.tools.find(t => t.name === "subagent_message").execute("c", { name: "saved", message: "continue" }, undefined, undefined, h.ctx);
-    assert.match(result.details.error, /spawning is not permitted/);
-    delete process.env.HERDR_ENV;
-    agent(join(project, ".pi/agents"), "scout", "spawnable: true");
+    process.env.HERDR_PANE_ID = "test:pane";
     agent(join(project, ".pi/agents"), "watcher", "tools: read");
     const restricted = harness({ "subagent-agent": "watcher" }); extension(restricted.api); await restricted.emit("session_start");
     process.env.HERDR_ENV = "1";

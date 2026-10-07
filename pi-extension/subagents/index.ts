@@ -110,7 +110,6 @@ interface AgentDefaults {
   cli?: string;
   body?: string;
   disableModelInvocation?: boolean;
-  spawnable?: boolean;
 }
 
 type AgentSource = "package" | "global" | "project";
@@ -203,7 +202,6 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
     thinking: getFrontmatterValue(frontmatter, "thinking"),
     subagentAgents: parseCommaList(getFrontmatterValue(frontmatter, "subagent_agents")),
     autoExit: parseOptionalBoolean(getFrontmatterValue(frontmatter, "auto-exit")),
-    spawnable: parseOptionalBoolean(getFrontmatterValue(frontmatter, "spawnable")),
     interactive: parseOptionalBoolean(getFrontmatterValue(frontmatter, "interactive")),
     sessionMode: parseSessionMode(getFrontmatterValue(frontmatter, "session-mode")),
     cwd: getFrontmatterValue(frontmatter, "cwd"),
@@ -239,7 +237,7 @@ function discoverAllAgentDefinitions(cwd = process.cwd()): ListedAgentDefinition
 
 function discoverAgentDefinitions(): ListedAgentDefinition[] {
   return discoverAllAgentDefinitions().filter(a =>
-    a.spawnable !== false && (!SUBAGENT_ALLOWLIST || SUBAGENT_ALLOWLIST.has(a.name)));
+    !SUBAGENT_ALLOWLIST || SUBAGENT_ALLOWLIST.has(a.name));
 }
 
 function resolveSubagentPaths(
@@ -1384,9 +1382,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
-        // Intersect the caller's permissions with current definitions at every
-        // depth: a pinned allowlist must not bypass spawnable:false overrides.
-        // Hidden-but-spawnable roles remain callable by explicit name.
+        // Require a known agent within the caller's allowlist at every depth.
+        // Hidden roles remain callable by explicit name.
         const permittedAgents = discoverAgentDefinitions().map((a) => a.name);
         const permittedSet = new Set(permittedAgents);
         const permittedList = permittedAgents.join(", ") || "(none)";
@@ -1806,8 +1803,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
 
-        const definition = loadout.agent ? loadAgentDefaults(loadout.agent) : null;
-        if (definition?.spawnable === false || (SUBAGENT_ALLOWLIST && (!loadout.agent || !SUBAGENT_ALLOWLIST.has(loadout.agent)))) {
+        if (SUBAGENT_ALLOWLIST && (!loadout.agent || !SUBAGENT_ALLOWLIST.has(loadout.agent))) {
           const err = `You may not resume the "${loadout.agent ?? requestedName}" agent — spawning is not permitted.`;
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
