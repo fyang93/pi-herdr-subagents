@@ -151,9 +151,14 @@ it("fails closed for unknown roles, unavailable models, invalid thinking, non-pi
   await isolated(async (project) => {
     const dir = join(project, ".pi/agents");
     for (const [name, fields] of [["bad-model", "model: unknown"], ["bad-thinking", "thinking: turbo"], ["claude", "cli: claude"]]) agent(dir, name, fields);
+    const pollKey = Symbol.for("pi-subagents/poll-abort-controller");
     for (const flags of [{ "subagent-exit": true }, ...["missing", "bad-model", "bad-thinking", "claude"].map(name => ({ "subagent-agent": name }))]) {
-      const h = harness(flags); extension(h.api); await h.emit("session_start");
+      const h = harness(flags); extension(h.api);
+      const controller = (globalThis as any)[pollKey] as AbortController;
+      controller.abort(); // A previous session has already stopped polling.
+      await h.emit("session_start");
       assert.equal(h.shutdowns, 1);
+      assert.equal((globalThis as any)[pollKey], controller, "failed startup must not restart polling");
       await h.emit("before_agent_start", { systemPrompt: "Base" });
       assert.equal(h.stopped, true);
       assert.equal(h.entries.length, 0);
@@ -216,11 +221,11 @@ it("top-level auto-exit waits for idle, pending messages, child results and draf
       children = 0;
       await h.emit("session_shutdown", { reason: "quit" });
     }
-    const compacted = await start();
-    await compacted.emit("agent_end", finished); await compacted.emit("session_before_compact");
-    await delay(25); assert.equal(compacted.shutdowns, 0, "old pi must not exit during compaction");
-    await compacted.emit("session_compact"); await delay(25); assert.equal(compacted.shutdowns, 1);
-    await compacted.emit("session_shutdown", { reason: "quit" });
+    const settled = await start();
+    await settled.emit("agent_end", finished);
+    assert.equal(settled.shutdowns, 0, "waits for Pi's final settlement boundary");
+    await settled.emit("agent_settled"); assert.equal(settled.shutdowns, 1);
+    await settled.emit("session_shutdown", { reason: "quit" });
     const resumed = await start();
     children = 1; await resumed.emit("agent_end", finished); await resumed.emit("agent_settled");
     assert.equal(resumed.shutdowns, 0);
@@ -235,7 +240,7 @@ it("top-level auto-exit waits for idle, pending messages, child results and draf
     const h2 = await start();
     await h2.emit("agent_end", finished);
     await h2.emit("session_shutdown", { reason: "reload" });
-    await delay(25); assert.equal(h2.shutdowns, 0, "reload cancels the old timer");
+    assert.equal(h2.shutdowns, 0, "reload before settlement does not request shutdown");
   } finally {
     (globalThis as any)[childKey] = previous;
     if (herdrEnv === undefined) delete process.env.HERDR_ENV; else process.env.HERDR_ENV = herdrEnv;

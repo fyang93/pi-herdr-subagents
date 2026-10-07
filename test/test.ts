@@ -5,7 +5,7 @@ import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { visibleWidth } from "@mariozechner/pi-tui";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import { setTimeout as delay } from "node:timers/promises";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 
@@ -1200,8 +1200,8 @@ describe("subagent-done.ts", () => {
         try {
           emit("agent_start");
           if (finishFirst) {
-            emit("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] }, { shutdown() {} });
-            await delay(25);
+            emit("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] });
+            emit("agent_settled", {}, { shutdown() {} });
           }
           emit("session_shutdown", { reason: "quit" });
           assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")), { type: finishFirst ? "done" : "quit" });
@@ -1242,9 +1242,9 @@ describe("subagent-done.ts", () => {
         // Reply arrives MID-RUN as a steer: input fires, no new agent_start.
         emit("input");
         let shutdown = false;
-        emit("agent_end", { messages: [] }, { shutdown() { shutdown = true; } });
-        await delay(25);
-        assert.equal(shutdown, true, "reply consumed mid-run → agent_end should exit, not park");
+        emit("agent_end", { messages: [] });
+        emit("agent_settled", {}, { shutdown() { shutdown = true; } });
+        assert.equal(shutdown, true, "reply consumed mid-run → settled session should exit, not park");
       } finally {
         restore();
         rmSync(dir, { recursive: true, force: true });
@@ -1280,9 +1280,9 @@ describe("subagent-done.ts", () => {
         emit("input");
         emit("agent_start");
         let shutdown2 = false;
-        emit("agent_end", { messages: [] }, { shutdown() { shutdown2 = true; } });
-        await delay(25);
-        assert.equal(shutdown2, true, "after the reply turn, agent_end should exit");
+        emit("agent_end", { messages: [] });
+        emit("agent_settled", {}, { shutdown() { shutdown2 = true; } });
+        assert.equal(shutdown2, true, "after the reply turn, settlement should exit");
       } finally {
         restore();
         rmSync(dir, { recursive: true, force: true });

@@ -1,9 +1,9 @@
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { keyHint } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { keyHint } from "@earendil-works/pi-coding-agent";
 import subagentDoneExtension from "./subagent-done.ts";
 import safeBashExtension from "./tools/safe-bash.ts";
-import { Type, type Static } from "@sinclair/typebox";
-import { Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
+import { Type, type Static } from "typebox";
+import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -1250,10 +1250,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     firstRoleInput = true;
     SUBAGENT_ALLOWLIST = readSpawnAllowlist();
     const name = pi.getFlag("subagent-agent");
-    if (typeof name === "string" && name) {
+    if ((typeof name === "string" && name) || pi.getFlag("subagent-exit") === true) {
       // Fail closed: a bad role must not run the task with the default loadout.
       SUBAGENT_ALLOWLIST = new Set();
       try {
+        if (typeof name !== "string" || !name) throw new Error("--subagent-exit requires --subagent-agent <name>.");
         const selected = loadAgentDefaults(name, ctx.cwd);
         if (!selected) throw new Error(`Unknown agent role: ${name}`);
         if (selected.cli && selected.cli !== "pi") throw new Error("Top-level roles only support pi agents.");
@@ -1284,14 +1285,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         ctx.ui.notify(roleError, "error");
         if (!ctx.hasUI) console.error(roleError);
         ctx.shutdown();
+        return;
       }
-    } else if (pi.getFlag("subagent-exit") === true) {
-      roleError = "--subagent-exit requires --subagent-agent <name>.";
-      SUBAGENT_ALLOWLIST = new Set();
-      pi.setActiveTools([]);
-      ctx.ui.notify(roleError, "error");
-      if (!ctx.hasUI) console.error(roleError);
-      ctx.shutdown();
     }
     latestCtx = ctx;
     // Subagents are new pi processes, so they load herdr's state integration once installed.
@@ -1594,7 +1589,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // "Started" result — tool returned immediately
         if (details?.status === "started") {
           return new Text(
-            theme.fg("accent", "⟳") +
+            theme.fg("accent", "●") +
               " " +
               theme.fg("toolTitle", theme.bold(name)) +
               theme.fg("dim", " — started"),
@@ -1717,7 +1712,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         if (details?.status === "started") {
           return new Text(
-            theme.fg("accent", "⟳") +
+            theme.fg("accent", "●") +
               " " +
               theme.fg("toolTitle", theme.bold(details.name ?? "Resume")) +
               theme.fg("dim", " — resumed"),
@@ -1935,8 +1930,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       const agentName = spaceIdx === -1 ? trimmed : trimmed.slice(0, spaceIdx);
       const task = spaceIdx === -1 ? "" : trimmed.slice(spaceIdx + 1).trim();
 
-      const defs = loadAgentDefaults(agentName);
-      if (!defs || !discoverAgentDefinitions().some(a => a.name === agentName)) {
+      if (!discoverAgentDefinitions().some(a => a.name === agentName)) {
         ctx.ui.notify(
           `Agent "${agentName}" not found in ~/.pi/agent/agents/ or .pi/agents/`,
           "error",

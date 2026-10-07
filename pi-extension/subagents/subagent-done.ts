@@ -12,10 +12,10 @@
  * (auto-exit is suppressed for that turn via `awaitingAnswer`), and the parent
  * replies with subagent_message — which lands as the subagent's next turn.
  */
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { Box, Text, matchesKey } from "@mariozechner/pi-tui";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Box, Text, matchesKey } from "@earendil-works/pi-tui";
 import { closeOwnPaneOnExit } from "./herdr.ts";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import { existsSync, writeFileSync } from "node:fs";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
@@ -196,20 +196,13 @@ export default function (pi: ExtensionAPI, options: {
   // Set when this extension ends the session after a completed final turn.
   let finished = false;
   let stopWatchingKeys: (() => void) | undefined;
-  let exitTick: ReturnType<typeof setTimeout> | undefined;
   let sessionKey: string | undefined;
   let completionMessages: any[] | undefined;
   let completionCandidate = false;
-  let compacting = false;
   const TAKEOVER_KEY = Symbol.for("pi-subagents/top-level-takeover");
 
-  function cancelExit() {
-    clearTimeout(exitTick);
-    exitTick = undefined;
-  }
-
   function finishIfReady(ctx: any) {
-    if (!completionCandidate || finished || compacting || !autoExit() || awaitingAnswer || runningChildrenCount() ||
+    if (!completionCandidate || finished || !autoExit() || awaitingAnswer || runningChildrenCount() ||
         (options.topLevel && userTookOver) || ctx.ui?.getEditorText?.() ||
         ctx.hasPendingMessages?.() || (ctx.isIdle && !ctx.isIdle())) return;
     const errorInfo = findLatestAssistantError(completionMessages);
@@ -222,38 +215,15 @@ export default function (pi: ExtensionAPI, options: {
     ctx.shutdown();
   }
 
-  // ponytail: delayed idle/compaction checks on old pi; upgrade for agent_settled.
-  // New pi cancels this
-  // fallback before settlement and requests shutdown synchronously there, so
-  // RPC and TUI both observe it at their final lifecycle boundary.
-  function scheduleExit(ctx: any) {
-    cancelExit();
-    exitTick = setTimeout(() => {
-      exitTick = undefined;
-      if (completionCandidate && ctx.isIdle && !ctx.isIdle()) { scheduleExit(ctx); return; }
-      finishIfReady(ctx);
-    }, 10);
-  }
-  pi.on("session_before_compact", () => { compacting = true; cancelExit(); });
-  pi.on("session_compact", (_event, ctx) => {
-    compacting = false;
-    if (completionCandidate) scheduleExit(ctx);
-  });
-  (pi.on as any)("agent_before_settle", (event: any) => {
-    cancelExit();
+  pi.on("agent_before_settle", (event) => {
     if (event.outcome === "aborted" || (options.topLevel && event.outcome === "error")) completionCandidate = false;
   });
-  (pi.on as any)("agent_settled", (_event: any, ctx: any) => {
-    cancelExit();
-    finishIfReady(ctx);
-  });
+  pi.on("agent_settled", (_event, ctx) => finishIfReady(ctx));
 
   pi.on("session_start", (_event, ctx) => {
-    cancelExit();
     stopWatchingKeys?.();
     finished = false;
     completionCandidate = false;
-    compacting = false;
     awaitingAnswer = false;
     agentStarted = false;
     sessionKey = ctx.sessionManager?.getSessionFile() ?? ctx.sessionManager?.getSessionId();
@@ -265,7 +235,6 @@ export default function (pi: ExtensionAPI, options: {
         if (matchesKey(data, "escape") || (agentStarted && /[^\x00-\x1f\x7f]/.test(text))) {
           userTookOver = true;
           (globalThis as any)[TAKEOVER_KEY] = sessionKey;
-          cancelExit();
         }
         return undefined;
       });
@@ -283,7 +252,6 @@ export default function (pi: ExtensionAPI, options: {
   });
 
   pi.on("input", (event) => {
-    cancelExit();
     completionCandidate = false;
     // A submitted message is the orchestrator's (or a human's) reply — the
     // pending ask_question has been answered, however it was delivered. Clear
@@ -304,16 +272,14 @@ export default function (pi: ExtensionAPI, options: {
   });
 
   pi.on("agent_start", () => {
-    cancelExit();
     completionCandidate = false;
-    compacting = false;
     agentStarted = true;
     // A new turn is starting — any pending ask_question has now been answered
     // (or superseded), so let auto-exit resume normally when this turn ends.
     awaitingAnswer = false;
   });
 
-  pi.on("agent_end", (event, ctx) => {
+  pi.on("agent_end", (event) => {
     const messages = (event as any).messages as any[] | undefined;
     // Never shut down while this session still has work in flight:
     //  - awaitingAnswer: an ask_question is pending the orchestrator's reply.
@@ -332,10 +298,7 @@ export default function (pi: ExtensionAPI, options: {
 
     completionCandidate = shouldExit;
     completionMessages = messages;
-    if (shouldExit) {
-      scheduleExit(ctx);
-      return;
-    }
+    if (shouldExit) return;
 
     // Escape stopped an autonomous subagent mid-turn: it waits for input, so tell the parent.
     const sessionFile = process.env.PI_SUBAGENT_SESSION;
@@ -360,7 +323,6 @@ export default function (pi: ExtensionAPI, options: {
   // agent's final turn, or a human leaving an interactive pane), or `quit` when
   // someone ended an autonomous agent early. A crash leaves no marker.
   pi.on("session_shutdown", (event) => {
-    cancelExit();
     stopWatchingKeys?.();
     stopWatchingKeys = undefined;
     if (options.topLevel) {
