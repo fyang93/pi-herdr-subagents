@@ -184,7 +184,7 @@ it("resume cannot bypass a top-level role's delegation permissions", async () =>
   });
 });
 
-it("top-level auto-exit waits for idle, pending messages, child results and drafts; typing/Escape/abort/error retain the pane", async () => {
+it("top-level auto-exit waits for idle, pending messages, child results and drafts; Escape/abort/error retain the pane", async () => {
   const herdrEnv = process.env.HERDR_ENV;
   delete process.env.HERDR_ENV; // This test must never close the runner's real pane.
   const childKey = Symbol.for("pi-subagents/running-children-count");
@@ -205,22 +205,27 @@ it("top-level auto-exit waits for idle, pending messages, child results and draf
     h.busy(false); await h.emit("agent_before_settle", { outcome: "completed" });
     await h.emit("agent_settled"); assert.equal(h.shutdowns, 1, "settlement requests shutdown synchronously (including RPC)");
     await h.emit("session_shutdown", { reason: "quit" });
-    for (const mode of ["pending", "children", "draft", "typing", "escape", "abort", "error"]) {
+    for (const mode of ["pending", "children", "draft", "escape", "abort", "error"]) {
       const h = await start();
       if (mode === "pending") h.pending(true);
       if (mode === "children") children = 1;
       if (mode === "draft") h.draft("unfinished text");
-      if (mode === "typing") h.key("\x1b[200~draft\x1b[201~");
       if (mode === "escape") h.key("\x1b");
       const event = mode === "abort" || mode === "error" ? { messages: [{ role: "assistant", stopReason: mode === "abort" ? "aborted" : "error", errorMessage: "provider unavailable" }] } : finished;
       await h.emit("agent_end", event); await delay(25); assert.equal(h.shutdowns, 0, mode);
-      if (["typing", "escape", "abort"].includes(mode)) {
+      if (["escape", "abort"].includes(mode)) {
         await h.emit("input", { source: "extension" }); await h.emit("agent_start");
         await h.emit("agent_end", finished); await delay(25); assert.equal(h.shutdowns, 0, `${mode} stays taken over`);
       }
       children = 0;
       await h.emit("session_shutdown", { reason: "quit" });
     }
+    const pushedTask = await start();
+    await pushedTask.emit("input", { source: "interactive", text: "follow-up task" });
+    await pushedTask.emit("agent_start");
+    await pushedTask.emit("agent_end", finished); await pushedTask.emit("agent_settled");
+    assert.equal(pushedTask.shutdowns, 1, "submitted follow-up work still exits when settled");
+    await pushedTask.emit("session_shutdown", { reason: "quit" });
     const settled = await start();
     await settled.emit("agent_end", finished);
     assert.equal(settled.shutdowns, 0, "waits for Pi's final settlement boundary");
@@ -232,10 +237,14 @@ it("top-level auto-exit waits for idle, pending messages, child results and draf
     children = 0; await resumed.emit("agent_start"); await resumed.emit("agent_end", finished);
     await resumed.emit("agent_settled"); assert.equal(resumed.shutdowns, 1, "exit after processing the last child result");
     await resumed.emit("session_shutdown", { reason: "quit" });
-    const takenOver = await start(); takenOver.key("draft");
-    await takenOver.emit("session_shutdown", { reason: "reload" });
+    const takenOver = await start(); takenOver.draft("draft");
+    await takenOver.emit("agent_end", finished); await takenOver.emit("agent_settled");
+    assert.equal(takenOver.shutdowns, 0, "an editor draft keeps the pane open");
+    await takenOver.emit("session_shutdown", { reason: "quit" });
+    const escaped = await start(); escaped.key("\x1b");
+    await escaped.emit("session_shutdown", { reason: "reload" });
     const reloaded = await start(); await reloaded.emit("agent_end", finished); await reloaded.emit("agent_settled");
-    assert.equal(reloaded.shutdowns, 0, "human takeover survives reload");
+    assert.equal(reloaded.shutdowns, 0, "Escape takeover survives reload");
     await reloaded.emit("session_shutdown", { reason: "quit" });
     const h2 = await start();
     await h2.emit("agent_end", finished);
