@@ -1,35 +1,35 @@
-# pi-interactive-subagents
+# pi-herdr-subagents
 
-Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux panes. Spawn a sub-agent, keep working in the main session, and get the result steered back when it finishes. Fully non-blocking.
-
-**tmux-only fork.** See [Acknowledgements](#acknowledgements) for the upstream project, which also supports cmux, zellij, and WezTerm.
+Async subagents for [pi](https://github.com/badlogic/pi-mono), running as named agents in [herdr](https://herdr.dev). Spawn a sub-agent, keep working in the main session, and get the result steered back when it finishes. Fully non-blocking.
 
 ## How it works
 
-`subagent()` returns immediately. The sub-agent runs in its own tmux pane — a right split off the parent pi pane, so pane creation never steals keyboard focus. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
+`subagent()` returns as soon as the sub-agent is up. Each sub-agent is a herdr agent in its own pane, without stealing keyboard focus: an unfocused split of the parent's own pane, or a background tab when splitting it would leave either half under **50 columns × 15 rows** (`PI_SUBAGENT_MIN_COLUMNS`, `PI_SUBAGENT_MIN_ROWS`). Other panes are never split or rearranged, and a zoomed tab always gets a background tab.
 
-```
-╭─ Subagents ──────────────────────────── 2 running ─╮
-│ 00:23  scout      active · bash 7m                 │
-│ 00:45  scout-2    waiting 2m                       │
-╰────────────────────────────────────────────────────╯
-```
+- **Start** — `herdr agent start <name> --kind pi` launches pi once the pane's shell is ready, and returns when pi is ready for input; the skills and the task are then submitted with `herdr agent prompt`. The herdr agent name is derived from the display name (`Scout: auth` → `scout-auth`, suffixed when taken).
+- **Status** — while sub-agents run, a widget above the input shows each one's elapsed time and state, with the tool a working pi sub-agent is in (read from its session file):
+
+  ```
+  ╭─ Subagents ──────────────────────── 2 running ─╮
+  │ 01:10  Sleeper (worker)          working · bash │
+  │ 00:18  Scout (scout)                    blocked │
+  ╰─────────────────────────────────────────────────╯
+  ```
+
+  herdr's agents sidebar shows the same sub-agents as working, idle, blocked or done. The extension installs herdr's pi integration (`herdr integration install pi`) on first start inside herdr, so the state comes from pi itself rather than screen detection.
+- **Blocked** — when herdr sees an autonomous sub-agent stuck at a confirmation or question dialog, the parent is told once, with the pane to look at.
+- **Interrupted** — when someone presses Escape in an autonomous sub-agent's pane, it stays open waiting for input and the parent is told once; `subagent_message` continues it.
+- **Completion** — a sub-agent ends when its final turn ends; there is no done tool. On quit it writes `<session>.exit`: `done` after its final turn (or when a human leaves an interactive pane), `quit` when someone ended an autonomous one early (reported as ended early, with its last message), or `error` with the provider's message when its last turn failed. The parent checks that marker and asks herdr whether the agent is still in its pane, once a second. An agent that leaves its pane twice in a row without a marker is reported as interrupted; its pane is left open for inspection. On completion the parent reads the result from the session file, closes the pane and steers the result into the main session.
+- **Start failures** — if pi does not come up, the error includes the pane's last lines before the pane is closed. A name another parent took at the same moment is picked again once.
+- **Shutdown** — on parent shutdown or `/reload`, tracked sub-agent panes are closed.
 
 Spawn several in parallel — they run concurrently and steer results back independently as each finishes.
-
-Panes are kept evenly sized: the extension re-applies an `even-horizontal` layout after every spawn and exit (debounced). The layout is a single constant, `SUBAGENT_TMUX_LAYOUT` in `pi-extension/subagents/tmux.ts` — change it to any named tmux layout (`main-vertical`, `tiled`, …).
-
-If your shell startup is slow and launch commands get dropped before the prompt is ready, raise the delay:
-
-```bash
-export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500   # default: 500
-```
 
 ## Tools
 
 | Tool | Description |
 | --- | --- |
-| `subagent` | Spawn a sub-agent in a dedicated tmux pane (async) |
+| `subagent` | Spawn a sub-agent as a named herdr agent in its own pane (async) |
 | `subagent_message` | Message a sub-agent by name — steers it if running, resumes its session if finished |
 | `subagents_list` | List available agent definitions |
 | `ask_question` | *(sub-agent sessions only)* Ask the orchestrator a question and wait for the reply |
@@ -47,7 +47,7 @@ subagent({ agent: "worker", name: "dark-mode", task: "Implement the dark mode to
 | --------- | ---- | ------- | ----------- |
 | `agent` | string | required | Which agent to spawn (must be known and permitted) |
 | `task` | string | required | Task prompt |
-| `name` | string | agent name | Display name for the pane and widget. Must be unique — duplicates are auto-suffixed (`scout`, `scout-2`, …) |
+| `name` | string | agent name | Display name for the pane and herdr agent. Must be unique — duplicates are auto-suffixed (`scout`, `scout-2`, …) |
 | `model` | string | agent's model | Override the model for this spawn |
 | `cwd` | string | agent's `cwd` | Working directory (see [Role folders](#role-folders)) |
 
@@ -59,12 +59,12 @@ subagent({ agent: "worker", name: "dark-mode", task: "Implement the dark mode to
 subagent_message({ name: "scout", message: "Also check the auth middleware" });
 ```
 
-- **Running** — the message is typed into the live pane (newlines flattened) and picked up at the next turn boundary. The call returns immediately; the eventual completion still arrives as a steer message.
+- **Running** — the message is submitted as one prompt with `herdr agent prompt` (multi-line kept) and picked up at the next turn boundary; herdr refuses it while the sub-agent waits at a dialog. The call returns immediately; the eventual completion still arrives as a steer message.
 - **Finished** — the session is resumed with the message as the follow-up task, like a fresh spawn: fire-and-forget, always autonomous, result steered back later. The resumed run reclaims its original name.
 
 Every spawn records name → session file in `artifacts/<sessionId>/subagent-registry.json`, so names stay addressable across pi restarts. A nested sub-agent that spawns children gets its own registry keyed by its own session id. Resume is refused with a clear error (listing known names) if the name isn't registered, the session file is gone, or the session predates sandboxed resume.
 
-**Resume replays the original sandbox.** At spawn time the fully-resolved loadout — tool allowlist, backing extensions, model, thinking level, system prompt, spawn whitelist, cwd — is snapshotted to `<session>.loadout.json`. Resume rebuilds the exact same restricted process from that snapshot rather than relaunching unrestricted.
+**Resume replays the saved loadout.** The optional tool allowlist, model, thinking level, system prompt, spawn whitelist, cwd, and config directory are snapshotted to `<session>.loadout.json`. Resume restores those settings; extensions are discovered from the current configuration, not frozen at spawn time.
 
 ### ask_question
 
@@ -76,9 +76,9 @@ If the reply arrives while the sub-agent is still mid-turn, it is absorbed into 
 
 | Agent | Model | Tools | Role |
 | ----- | ----- | ----- | ---- |
-| **scout** | `openrouter/z-ai/glm-5.3` | `read`, `grep`, `find`, `ls` | Fast read-only codebase recon |
-| **researcher** | `openrouter/z-ai/glm-5.3` | `web_search`, `web_fetch`, `safe_bash` | Web research, synthesized into a sourced brief |
-| **worker** | `openrouter/z-ai/glm-5.3` | `read`, `write`, `edit`, `bash`, `web_search`, `web_fetch` + spawning | General implementer; may spawn `scout` and `researcher` |
+| **scout** | `openai-codex/gpt-5.6-luna` | `read`, `grep`, `find`, `ls`, `mcp` | Fast read-only codebase recon |
+| **researcher** | `openai-codex/gpt-5.6-luna` | `web_search`, `source_check`, `fetch_content`, `get_search_content`, `safe_bash` | Web research, synthesized into a sourced brief |
+| **worker** | pi default | `read`, `write`, `edit`, `bash`, `web_search`, `source_check`, `fetch_content`, `get_search_content` + spawning | General implementer; may spawn `scout` and `researcher` |
 
 All three are autonomous (`auto-exit: true`) and carry their identity in the system prompt (`system-prompt: append`).
 
@@ -108,13 +108,13 @@ You are a specialized agent that does X...
 | `description` | string | Shown in `subagents_list` |
 | `model` | string | Default model |
 | `thinking` | string | `minimal`, `low`, `medium`, or `high` |
-| `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Extension-backed: `web_search`, `web_fetch`, `safe_bash`, `video_extract`, `youtube_search`, `google_image_search`. Only the extensions backing the listed tools are loaded into the child |
+| `tools` | string | Optional comma-separated tool allowlist, passed as `--tools`. Omit or leave empty for the default full toolset. Extensions load normally in both cases; no tool-to-extension path mapping is needed. `ask_question` is added automatically, as are spawning tools when `subagent_agents` grants delegation |
 | `subagent_agents` | string | Comma-separated agent names this agent may spawn. **Presence of this field grants the spawning toolset** (`subagent`, `subagent_message`, `subagents_list`) and restricts spawn targets to the list. Omit it and the agent cannot spawn at all |
 | `skills` | string | Comma-separated skill names to auto-load |
 | `session-mode` | string | `standalone` (default), `lineage-only`, or `fork` — see below |
 | `system-prompt` | string | `append` or `replace`: pass the body as the child's `--append-system-prompt` / `--system-prompt`. Omit and the body is prepended to the task prompt instead |
 | `auto-exit` | boolean | Auto-shutdown when the agent finishes (see below) |
-| `interactive` | boolean | Whether stall/recovery transitions wake the parent (see below) |
+| `interactive` | boolean | Whether a blocked sub-agent wakes the parent (see below) |
 | `cwd` | string | Default working directory |
 | `disable-model-invocation` | boolean | Hide from `subagents_list`; still spawnable by explicit name |
 | `cli` | string | `claude` runs the agent via the Claude Code CLI instead of pi |
@@ -136,25 +136,35 @@ Notes:
 
 ### interactive
 
-Controls whether `stalled`/`recovered` status transitions send a steer message to the parent session. Defaults to the inverse of `auto-exit`: autonomous agents get stall pings; user-driven agents stay quiet (the user is already working in that pane — the widget still updates). Set explicitly to override.
+Controls whether a sub-agent blocked at a dialog sends a steer message to the parent session. Defaults to the inverse of `auto-exit`: autonomous agents report it; user-driven agents stay quiet (the user is already working in that pane). Set explicitly to override.
 
 ## Tool access control
 
-Access is **whitelist-only**. Every sub-agent process is launched with `--no-extensions` (extension discovery disabled) and `--tools <allowlist>`; only the extensions backing the listed tools are loaded back in explicitly. There is no default toolset and no deny-list — an agent gets exactly what its frontmatter lists. The restriction survives resume via the loadout snapshot.
+Tool restrictions are **optional**:
+
+- With `tools`: pass `--tools <allowlist>` (including child control tools).
+- Without `tools` (or with an empty value): omit `--tools` and use Pi's default full toolset, even when `subagent_agents` is configured.
+- In both cases, extensions are discovered normally from the child's configuration; no `--no-extensions` or third-party tool-path mapping is used. Package-local helpers (`ask_question`, `safe_bash`, and delegation support) are still explicitly loaded as needed.
+
+The saved tool allowlist survives resume. It limits model-callable tools, not extension initialization, event hooks, or background tasks; this is not a security sandbox. Only enable extensions that are suitable for running in child processes.
 
 Spawns must name a known agent at **every** depth. A top-level session may spawn anything discoverable; a sub-agent may only spawn the agents in its `subagent_agents` list (enforced via `PI_SUBAGENT_ALLOWED`). There is no agentless spawn route, so a child can never escalate to a full-toolset profile by omitting its agent.
 
-Extensions can register additional tools for sub-agents at runtime via `registerToolExtension(name, path)` on the `__pi_interactive_subagents` process global.
+Install and enable tool-providing packages normally, for example `pi install npm:pi-web-access` or `pi install npm:pi-mcp-adapter`. Their tools can then be named in `tools`, without registering extension paths. Older sessions with a saved `web_fetch` allowlist should be replaced by new sessions using `fetch_content`.
+
+Scout allows `mcp` for discovery and single calls; add `mcpScript` if batching is needed. Without the adapter, scout falls back to local file tools. Configure CodeGraph or other servers through the adapter in the child's config/cwd; connections are not inherited from the parent. `mcp:server-name` frontmatter syntax is not supported by this extension. The gateway can access all configured servers: scout's read-only instructions are not an enforced MCP permission boundary. Restrict server operations separately when required.
+
+The old `registerToolExtension(name, path)` hook has been removed; enable the extension in Pi settings instead.
 
 ## Role folders
 
-`cwd` starts a sub-agent in a directory with its own config, so role-specific setups (CLAUDE.md, skills, extensions) apply:
+`cwd` starts a sub-agent in a directory with its own config, so role-specific setups (AGENTS.md, skills, extensions) apply:
 
 ```
 project/
 └── agents/
-    ├── game-designer/   ← CLAUDE.md, .pi/…
-    └── sre/             ← CLAUDE.md, .pi/…
+    ├── game-designer/   ← AGENTS.md, .pi/…
+    └── sre/             ← AGENTS.md, .pi/…
 ```
 
 ```typescript
@@ -163,30 +173,16 @@ subagent({ agent: "worker", cwd: "agents/sre", task: "Review the deployment pipe
 
 Set a per-agent default with `cwd:` in frontmatter.
 
-## Status widget & configuration
-
-The widget tracks each sub-agent from a runtime activity snapshot written by the child: `starting`, `active` (turn/provider/tool work), `waiting` (open for input or another stage), `stalled` (no valid snapshot for too long), or `running` (fallback). Sub-agent sessions also show their own tools widget — toggle it with `Ctrl+Alt+O`. Completion messages expand with `Ctrl+O`.
-
-Status display is configured via `config.json` in the extension directory (copy `config.json.example`; it's gitignored):
-
-```json
-{
-  "status": { "enabled": true }
-}
-```
-
 ## Requirements
 
 - [pi](https://github.com/badlogic/pi-mono)
-- [tmux](https://github.com/tmux/tmux)
+- [herdr](https://herdr.dev) 0.9+; start pi inside a herdr pane
 
-```bash
-tmux new -A -s pi 'pi'
-```
+Sub-agent sessions show their own tools widget — toggle it with `Ctrl+Alt+O`. Completion messages expand with `Ctrl+O`.
 
 ## Acknowledgements
 
-Forked from [HazAT/pi-interactive-subagents](https://github.com/HazAT/pi-interactive-subagents), which originated the subagent architecture, the multi-multiplexer surface layer, and the status widget; its supervision features were inspired by [RepoPrompt](https://repoprompt.com/).
+This fork builds on [Amos Blomqvist's tmux-only fork](https://github.com/amosblomqvist/pi-interactive-subagents) of [HazAT/pi-interactive-subagents](https://github.com/HazAT/pi-interactive-subagents). The original project introduced the subagent architecture; its supervision features were inspired by [RepoPrompt](https://repoprompt.com/). This version runs on herdr only.
 
 ## License
 

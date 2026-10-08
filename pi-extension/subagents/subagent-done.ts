@@ -12,11 +12,10 @@
  * (auto-exit is suppressed for that turn via `awaitingAnswer`), and the parent
  * replies with subagent_message — which lands as the subagent's next turn.
  */
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { Box, Text } from "@mariozechner/pi-tui";
-import { Type } from "@sinclair/typebox";
-import { writeFileSync } from "node:fs";
-import { createSubagentActivityRecorder } from "./activity.ts";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Box, Text } from "@earendil-works/pi-tui";
+import { Type } from "typebox";
+import { existsSync, writeFileSync } from "node:fs";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
@@ -48,6 +47,16 @@ export function runningChildrenCount(): number {
   }
 }
 
+/**
+ * Escape ends a turn as `aborted`, or, when it interrupts a running tool, as
+ * `error` with an abort message. pi 0.99 has no structured abort field for the
+ * latter, so its message is matched; prefer such a field if pi adds one.
+ */
+export function wasAborted(message: any): boolean {
+  return message?.stopReason === "aborted" ||
+    (message?.stopReason === "error" && /operation was aborted|AbortError/i.test(String(message.errorMessage ?? "")));
+}
+
 export function shouldAutoExitOnAgentEnd(
   _userTookOver: boolean,
   messages: any[] | undefined,
@@ -64,7 +73,7 @@ export function shouldAutoExitOnAgentEnd(
     for (let i = messages.length - 1; i >= 0; i--) {
       const msg = messages[i];
       if (msg?.role === "assistant") {
-        return msg.stopReason !== "aborted";
+        return !wasAborted(msg);
       }
     }
   }
@@ -93,7 +102,7 @@ export function findLatestAssistantError(
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i];
     if (msg?.role !== "assistant") continue;
-    if (msg.stopReason !== "error") return null;
+    if (msg.stopReason !== "error" || wasAborted(msg)) return null;
     const raw = typeof msg.errorMessage === "string" ? msg.errorMessage.trim() : "";
     return {
       errorMessage: raw || "Subagent agent loop ended with stopReason=error (no errorMessage field).",
@@ -120,10 +129,6 @@ export default function (pi: ExtensionAPI) {
   const subagentAgent = process.env.PI_SUBAGENT_AGENT ?? "";
   const deniedToolsValue = process.env.PI_DENY_TOOLS;
   const autoExit = process.env.PI_SUBAGENT_AUTO_EXIT === "1";
-  const recorder = createSubagentActivityRecorder({
-    runningChildId: process.env.PI_SUBAGENT_ID,
-    activityFile: process.env.PI_SUBAGENT_ACTIVITY_FILE,
-  });
 
   function renderWidget(ctx: { ui: { setWidget: Function } }, _theme: any) {
     ctx.ui.setWidget(
@@ -183,10 +188,11 @@ export default function (pi: ExtensionAPI) {
   // lands — on `input` (covers a reply steered into the current run) and on
   // `agent_start` (covers a reply that starts a fresh turn after parking).
   let awaitingAnswer = false;
+  // Set when this extension ends the session after a completed final turn.
+  let finished = false;
 
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
-    recorder.sessionStart();
     const tools = pi.getAllTools();
     toolNames = tools.map((t) => t.name).sort();
     denied = parseDeniedTools(deniedToolsValue);
@@ -195,7 +201,6 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("input", () => {
-    recorder.input();
     // A submitted message is the orchestrator's (or a human's) reply — the
     // pending ask_question has been answered, however it was delivered. Clear
     // here, not only on agent_start, because a reply steered in *mid-run* is
@@ -211,16 +216,11 @@ export default function (pi: ExtensionAPI) {
     userTookOver = true;
   });
 
-  pi.on("before_agent_start", () => {
-    recorder.beforeAgentStart();
-  });
-
   pi.on("agent_start", () => {
     agentStarted = true;
     // A new turn is starting — any pending ask_question has now been answered
     // (or superseded), so let auto-exit resume normally when this turn ends.
     awaitingAnswer = false;
-    recorder.agentStart();
   });
 
   pi.on("agent_end", (event, ctx) => {
@@ -258,17 +258,22 @@ export default function (pi: ExtensionAPI) {
             }),
           );
         } catch {
-          // Best effort — even without the sidecar, watcher's session-file
-          // fallback can still recover the errorMessage.
+          // Best effort: without the marker the parent reports an interruption.
         }
       }
 
-      recorder.agentEndDone();
+      finished = true;
       ctx.shutdown();
       return;
     }
 
-    recorder.agentEndWaiting();
+    // Escape stopped an autonomous subagent mid-turn: it waits for input, so tell the parent.
+    const sessionFile = process.env.PI_SUBAGENT_SESSION;
+    const last = [...(messages ?? [])].reverse().find((m) => m?.role === "assistant");
+    if (autoExit && sessionFile && wasAborted(last)) {
+      try { writeFileSync(`${sessionFile}.paused`, "{}"); } catch {}
+    }
+
     if (autoExit) {
       // Reset any recorded manual input marker. Auto-exit is decided by whether
       // the latest agent turn completed normally, not by who initiated it.
@@ -276,48 +281,15 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  pi.on("turn_start", (event) => {
-    recorder.turnStart((event as any).turnIndex);
-  });
-
-  pi.on("turn_end", (event) => {
-    recorder.turnEnd((event as any).turnIndex);
-  });
-
-  pi.on("before_provider_request", () => {
-    recorder.beforeProviderRequest();
-  });
-
-  pi.on("after_provider_response", () => {
-    recorder.afterProviderResponse();
-  });
-
-  pi.on("message_update", (event) => {
-    recorder.messageUpdate((event as any).assistantMessageEvent?.type);
-  });
-
-  pi.on("tool_execution_start", (event) => {
-    recorder.toolExecutionStart((event as any).toolCallId, (event as any).toolName);
-  });
-
-  pi.on("tool_call", (event) => {
-    recorder.toolCall((event as any).toolCallId, (event as any).toolName);
-  });
-
-  pi.on("tool_execution_update", (event) => {
-    recorder.toolExecutionUpdate((event as any).toolCallId, (event as any).toolName);
-  });
-
-  pi.on("tool_result", (event) => {
-    recorder.toolResult((event as any).toolCallId, (event as any).toolName);
-  });
-
-  pi.on("tool_execution_end", (event) => {
-    recorder.toolExecutionEnd((event as any).toolCallId, (event as any).toolName);
-  });
-
+  // The parent learns how this session ended from `${sessionFile}.exit`: an
+  // error marker written above, `done` when the work finished (an autonomous
+  // agent's final turn, or a human leaving an interactive pane), or `quit` when
+  // someone ended an autonomous agent early. A crash leaves no marker.
   pi.on("session_shutdown", (event) => {
-    recorder.sessionShutdown((event as any).reason);
+    const sessionFile = process.env.PI_SUBAGENT_SESSION;
+    if ((event as any).reason !== "quit" || !sessionFile || existsSync(`${sessionFile}.exit`)) return;
+    const type = finished || !autoExit ? "done" : "quit";
+    try { writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type })); } catch {}
   });
 
   // Toggle expand/collapse with Ctrl+Alt+O
@@ -367,7 +339,6 @@ export default function (pi: ExtensionAPI) {
       // "waiting" phase. The parent's watcher picks up the `.ask` signal and
       // notifies the orchestrator, who replies via subagent_message.
       awaitingAnswer = true;
-      recorder.askQuestion();
       const askData = {
         name: process.env.PI_SUBAGENT_NAME ?? "subagent",
         agent: process.env.PI_SUBAGENT_AGENT ?? "",

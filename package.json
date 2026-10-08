@@ -1,7 +1,7 @@
 {
-  "name": "pi-interactive-subagents",
-  "version": "3.7.2",
-  "description": "Interactive subagents for pi - spawn, orchestrate, and manage sub-agent sessions in tmux",
+  "name": "pi-herdr-subagents",
+  "version": "4.0.0",
+  "description": "Interactive subagents for pi - spawn, orchestrate, and manage sub-agent sessions as herdr agents",
   "keywords": [
     "pi-package"
   ],
@@ -9,17 +9,16 @@
   "author": "Amos Blomqvist",
   "repository": {
     "type": "git",
-    "url": "https://github.com/amosblomqvist/pi-interactive-subagents"
+    "url": "https://github.com/fyang93/pi-herdr-subagents"
   },
   "type": "module",
   "scripts": {
-    "test": "node --test test/test.ts",
-    "test:integration": "node --test --test-concurrency=1 test/integration/*.test.ts"
+    "test": "node --test test/test.ts test/*.test.ts"
   },
   "peerDependencies": {
-    "@mariozechner/pi-coding-agent": "*",
-    "@mariozechner/pi-tui": "*",
-    "@sinclair/typebox": "*"
+    "@earendil-works/pi-coding-agent": "^0.99.1",
+    "@earendil-works/pi-tui": "^0.99.1",
+    "typebox": "^1.3.27"
   },
   "pi": {
     "extensions": [
@@ -27,8 +26,8 @@
     ]
   },
   "devDependencies": {
-    "@mariozechner/pi-coding-agent": "^0.65.0",
-    "@mariozechner/pi-tui": "^0.65.0",
-    "@sinclair/typebox": "^0.34.49"
+    "@earendil-works/pi-coding-agent": "^0.99.1",
+    "@earendil-works/pi-tui": "^0.99.1",
+    "typebox": "^1.3.27"
   }
 }
