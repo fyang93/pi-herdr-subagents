@@ -5,8 +5,7 @@ import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { visibleWidth } from "@earendil-works/pi-tui";
-import { setTimeout as delay } from "node:timers/promises";
+import { visibleWidth } from "@mariozechner/pi-tui";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 
 import {
@@ -35,18 +34,6 @@ import {
 } from "../pi-extension/subagents/subagent-done.ts";
 import subagentDoneExtension from "../pi-extension/subagents/subagent-done.ts";
 import { interpretExitSidecar } from "../pi-extension/subagents/herdr.ts";
-
-// Never let lifecycle tests close a real pane inherited from the test runner.
-const herdrTestDir = mkdtempSync(join(tmpdir(), "subagents-herdr-noop-"));
-const previousHerdrBin = process.env.HERDR_BIN_PATH;
-const noopHerdr = join(herdrTestDir, "herdr");
-writeFileSync(noopHerdr, '#!/bin/sh\nprintf \'{"result":{}}\\n\'\n');
-chmodSync(noopHerdr, 0o755);
-process.env.HERDR_BIN_PATH = noopHerdr;
-after(() => {
-  restoreEnvVar("HERDR_BIN_PATH", previousHerdrBin);
-  rmSync(herdrTestDir, { recursive: true, force: true });
-});
 
 // --- Helpers ---
 
@@ -83,8 +70,6 @@ function createMockExtensionApi() {
     sentUserMessages,
     sentMessages,
     api: {
-      registerFlag() {},
-      getFlag() {},
       on() {},
       registerTool(tool: any) {
         registeredTools.push(tool);
@@ -1192,17 +1177,14 @@ describe("subagent-done.ts", () => {
       return { emit, ask, restore };
     }
 
-    it("marks the exit done after its final turn, and quit when someone ends it earlier", async () => {
+    it("marks the exit done after its final turn, and quit when someone ends it earlier", () => {
       for (const finishFirst of [true, false]) {
         const dir = createTestDir();
         const sessionFile = join(dir, "s.jsonl");
         const { emit, restore } = setupCapturingExtension(sessionFile);
         try {
           emit("agent_start");
-          if (finishFirst) {
-            emit("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] });
-            emit("agent_settled", {}, { shutdown() {} });
-          }
+          if (finishFirst) emit("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] }, { shutdown() {} });
           emit("session_shutdown", { reason: "quit" });
           assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")), { type: finishFirst ? "done" : "quit" });
         } finally {
@@ -1242,9 +1224,8 @@ describe("subagent-done.ts", () => {
         // Reply arrives MID-RUN as a steer: input fires, no new agent_start.
         emit("input");
         let shutdown = false;
-        emit("agent_end", { messages: [] });
-        emit("agent_settled", {}, { shutdown() { shutdown = true; } });
-        assert.equal(shutdown, true, "reply consumed mid-run → settled session should exit, not park");
+        emit("agent_end", { messages: [] }, { shutdown() { shutdown = true; } });
+        assert.equal(shutdown, true, "reply consumed mid-run → agent_end should exit, not park");
       } finally {
         restore();
         rmSync(dir, { recursive: true, force: true });
@@ -1280,9 +1261,8 @@ describe("subagent-done.ts", () => {
         emit("input");
         emit("agent_start");
         let shutdown2 = false;
-        emit("agent_end", { messages: [] });
-        emit("agent_settled", {}, { shutdown() { shutdown2 = true; } });
-        assert.equal(shutdown2, true, "after the reply turn, settlement should exit");
+        emit("agent_end", { messages: [] }, { shutdown() { shutdown2 = true; } });
+        assert.equal(shutdown2, true, "after the reply turn, agent_end should exit");
       } finally {
         restore();
         rmSync(dir, { recursive: true, force: true });

@@ -4,7 +4,7 @@
  * started with `herdr agent start` so it shows in herdr's agents sidebar, with
  * state reported by herdr's pi integration. Pane ids look like `w1:p2`.
  */
-import { execFile, execFileSync, spawn } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 
@@ -161,21 +161,6 @@ export function readScreen(surface: string, lines = 50): string {
 
 export function closeSurface(surface: string): void {
   herdr(["pane", "close", surface]);
-}
-
-/** Confirm our current pane (it may have moved), then close only after pi exits. */
-export function closeOwnPaneOnExit(): void {
-  if (!isHerdrAvailable()) return;
-  let pane: unknown;
-  try { pane = herdr(["pane", "current", "--current"])?.pane?.pane_id; } catch { return; }
-  if (typeof pane !== "string" || !pane) return;
-  const target = pane;
-  const executable = bin();
-  process.once("exit", () => {
-    const child = spawn(executable, ["pane", "close", target], { detached: true, stdio: "ignore" });
-    child.on("error", () => {});
-    child.unref();
-  });
 }
 
 export type AgentStatus = "idle" | "working" | "blocked" | "done" | "unknown";

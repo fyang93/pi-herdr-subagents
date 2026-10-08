@@ -1,6 +1,4 @@
 import { it } from "node:test";
-import { execFileSync } from "node:child_process";
-import { setTimeout as delay } from "node:timers/promises";
 import assert from "node:assert/strict";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -21,7 +19,6 @@ case "$1 $2" in
   "agent start") cat ${JSON.stringify(join(dir, "start"))}; [ -s ${JSON.stringify(join(dir, "start"))} ] && grep -q error ${JSON.stringify(join(dir, "start"))} && exit 1; true ;;
   "agent prompt") [ "$3" = blocked ] && { echo '{"error":{"code":"agent_blocked","message":"blocked"}}' >&2; exit 1; }; echo '{"result":{}}' ;;
   "agent get") cat ${JSON.stringify(join(dir, "agent"))}; grep -q error ${JSON.stringify(join(dir, "agent"))} && exit 1; true ;;
-  "pane current") [ -e ${JSON.stringify(join(dir, "current_fail"))} ] && { echo '{"error":{"code":"unknown","message":"unknown pane"}}' >&2; exit 1; }; echo '{"result":{"pane":{"pane_id":"w2:p3"}}}' ;;
   "pane read") printf '{not json\\nlast line\\n' ;;
   "integration status") cat ${JSON.stringify(join(dir, "status"))} ;;
   *) echo '{"result":{}}' ;;
@@ -138,24 +135,6 @@ it("follows the agent by name across pane moves, finishes on the exit marker, an
   const gone = await herdr.waitForExit("scout", signal, { interval: 1, sessionFile: session });
   assert.equal(gone.reason, "interrupted");
   assert.deepEqual(await herdr.waitForExit("scout", signal, { interval: 1, exitIsDone: true }), { reason: "done", exitCode: 0 });
-});
-
-it("closes only its confirmed current pane after process exit, and leaves an uncertain pane alone", async () => {
-  const moduleUrl = new URL("../pi-extension/subagents/herdr.ts", import.meta.url).href;
-  const run = () => execFileSync(process.execPath, ["--input-type=module", "-e", `
-    import { closeOwnPaneOnExit } from ${JSON.stringify(moduleUrl)};
-    closeOwnPaneOnExit();
-  `], { env: process.env });
-  writeFileSync(log, "");
-  run();
-  for (let n = 0; n < 50 && !calls().some(c => c[1] === "close"); n++) await delay(10);
-  assert.deepEqual(calls(), [["pane", "current", "--current"], ["pane", "close", "w2:p3"]]);
-  writeFileSync(log, "");
-  writeFileSync(join(dir, "current_fail"), "");
-  run();
-  await delay(25);
-  assert.deepEqual(calls(), [["pane", "current", "--current"]]);
-  rmSync(join(dir, "current_fail"));
 });
 
 it("installs the pi integration only when it is not current", async () => {

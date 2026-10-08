@@ -100,51 +100,6 @@ auto-exit: true
 You are a specialized agent that does X...
 ```
 
-### Start a top-level role
-
-A host can use the same definitions without parsing Markdown or supplying an auto-exit extension:
-
-```bash
-pi --subagent-agent coordinator --subagent-exit -- "Review this repository"
-# With the package not installed:
-pi -e ./pi-extension/subagents/index.ts --subagent-agent coordinator --subagent-exit -- "Review this repository"
-```
-
-`--subagent-agent <name>` resolves **project > global > bundled**, including hidden and non-spawnable definitions. It applies the role's model (exact `provider/id` or unambiguous model ID), thinking, tool allowlist and `subagent_agents` permissions. `system-prompt: append` appends the body; `replace` replaces the system prompt; omitting it prepends the body to the first task, just as for a child. Missing/invalid roles never run the task with the default loadout. `cli: claude` cannot be used for a top-level pi role.
-
-Use `--` before a positional task: some pi versions otherwise consume it as an extension-flag value. A host can also start pi with these flags and then submit the initial task via `herdr agent prompt`.
-
-`--subagent-exit` requires `--subagent-agent`. It opts the top-level session into auto-exit, independently of the definition's child-only `auto-exit` setting. The shared completion implementation waits until pi is idle with no queued messages, running children or editor draft. Successful completion exits pi and closes its **current** herdr pane after process exit; outside herdr it only exits pi. Escape/abort or human typing after the initial task takes over the session and leaves it open (including across `/reload`); provider errors also leave it open. The initial CLI/host task and extension-delivered child results are not human takeover. Without this flag the top-level role stays open. Child sessions retain their existing error-reporting and manual-input behavior.
-
-The host still chooses the working directory and session/config CLI options: `cwd` and `session-mode` describe child launches, not an in-process directory/session switch. `ask_question` is child-only because top-level roles have no parent orchestrator. Top-level sessions record a custom entry `subagent_role` with `data: { agent: "coordinator" }` for host-side role identification; this entry does not grant permissions.
-
-### Top-level-only roles and project exclusions
-
-```markdown
----
-name: coordinator
-spawnable: false
-model: openai-codex/gpt-5.6-luna
-thinking: high
-tools: read, bash
-subagent_agents: scout, researcher
-system-prompt: append
----
-You coordinate the work and summarize the results.
-```
-
-`spawnable: false` hides a definition from the dispatch list **and rejects explicit spawning/resume**, at every delegation depth. It can still be selected with `--subagent-agent`. Omit it (or set `true`) to keep the current spawn behavior. It controls whether a role can **be spawned**, not whether it may spawn others: `subagent_agents` controls that separately; omitting it denies delegation, even if `tools` names `subagent`.
-
-To exclude a bundled or global role in one project, shadow it with `.pi/agents/<name>.md`. For example, `.pi/agents/scout.md` can contain only:
-
-```markdown
----
-spawnable: false
----
-```
-
-Do the same for `researcher.md` and `worker.md` to exclude all three. The filename supplies the name. Project definitions replace (not merge with) lower-priority definitions; copy the complete role if you also want to retain its loadout for top-level use. No global files or package files need changing. `disable-model-invocation: true` is different: it only hides listings and still permits explicit dispatch.
-
 ### Frontmatter reference
 
 | Field | Type | Description |
@@ -152,7 +107,7 @@ Do the same for `researcher.md` and `worker.md` to exclude all three. The filena
 | `name` | string | Agent name (used in `agent: "my-agent"`) |
 | `description` | string | Shown in `subagents_list` |
 | `model` | string | Default model |
-| `thinking` | string | pi thinking level (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`; clamped to the model's capabilities) |
+| `thinking` | string | `minimal`, `low`, `medium`, or `high` |
 | `tools` | string | Optional comma-separated tool allowlist, passed as `--tools`. Omit or leave empty for the default full toolset. Extensions load normally in both cases; no tool-to-extension path mapping is needed. `ask_question` is added automatically, as are spawning tools when `subagent_agents` grants delegation |
 | `subagent_agents` | string | Comma-separated agent names this agent may spawn. **Presence of this field grants the spawning toolset** (`subagent`, `subagent_message`, `subagents_list`) and restricts spawn targets to the list. Omit it and the agent cannot spawn at all |
 | `skills` | string | Comma-separated skill names to auto-load |
@@ -161,7 +116,6 @@ Do the same for `researcher.md` and `worker.md` to exclude all three. The filena
 | `auto-exit` | boolean | Auto-shutdown when the agent finishes (see below) |
 | `interactive` | boolean | Whether a blocked sub-agent wakes the parent (see below) |
 | `cwd` | string | Default working directory |
-| `spawnable` | boolean | Defaults to `true`; `false` excludes listing, explicit dispatch and resume, but permits `--subagent-agent` |
 | `disable-model-invocation` | boolean | Hide from `subagents_list`; still spawnable by explicit name |
 | `cli` | string | `claude` runs the agent via the Claude Code CLI instead of pi |
 
@@ -194,7 +148,7 @@ Tool restrictions are **optional**:
 
 The saved tool allowlist survives resume. It limits model-callable tools, not extension initialization, event hooks, or background tasks; this is not a security sandbox. Only enable extensions that are suitable for running in child processes.
 
-Spawns must name a known, spawnable agent at **every** depth. An ordinary top-level session may spawn anything discoverable; a role-selected top-level session or a sub-agent may only spawn the agents in its `subagent_agents` list (enforced in-process for top-level roles and via `PI_SUBAGENT_ALLOWED` for children). Allowlisted names must still resolve to a spawnable definition; an allowlist cannot bypass project exclusions. There is no agentless spawn route, so a child can never escalate to a full-toolset profile by omitting its agent.
+Spawns must name a known agent at **every** depth. A top-level session may spawn anything discoverable; a sub-agent may only spawn the agents in its `subagent_agents` list (enforced via `PI_SUBAGENT_ALLOWED`). There is no agentless spawn route, so a child can never escalate to a full-toolset profile by omitting its agent.
 
 Install and enable tool-providing packages normally, for example `pi install npm:pi-web-access` or `pi install npm:pi-mcp-adapter`. Their tools can then be named in `tools`, without registering extension paths. Older sessions with a saved `web_fetch` allowlist should be replaced by new sessions using `fetch_content`.
 

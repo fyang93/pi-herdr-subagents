@@ -1,9 +1,7 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { keyHint } from "@earendil-works/pi-coding-agent";
-import subagentDoneExtension from "./subagent-done.ts";
-import safeBashExtension from "./tools/safe-bash.ts";
-import { Type, type Static } from "typebox";
-import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { keyHint } from "@mariozechner/pi-coding-agent";
+import { Type, type Static } from "@sinclair/typebox";
+import { Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -110,7 +108,6 @@ interface AgentDefaults {
   cli?: string;
   body?: string;
   disableModelInvocation?: boolean;
-  spawnable?: boolean;
 }
 
 type AgentSource = "package" | "global" | "project";
@@ -146,12 +143,11 @@ function getAgentConfigDir(): string {
  * set of agents it may itself spawn via PI_SUBAGENT_ALLOWED. `null` means no
  * restriction (top-level session); an empty set denies delegation.
  */
-let SUBAGENT_ALLOWLIST: Set<string> | null = readSpawnAllowlist();
-function readSpawnAllowlist(): Set<string> | null {
+const SUBAGENT_ALLOWLIST: Set<string> | null = (() => {
   const raw = process.env.PI_SUBAGENT_ALLOWED;
   if (raw === undefined) return process.env.PI_SUBAGENT_AGENT ? new Set<string>() : null;
   return new Set(raw.split(",").map((s) => s.trim()).filter(Boolean));
-}
+})();
 
 function getBundledAgentsDir(): string {
   return join(SUBAGENTS_DIR, "../../agents");
@@ -203,7 +199,6 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
     thinking: getFrontmatterValue(frontmatter, "thinking"),
     subagentAgents: parseCommaList(getFrontmatterValue(frontmatter, "subagent_agents")),
     autoExit: parseOptionalBoolean(getFrontmatterValue(frontmatter, "auto-exit")),
-    spawnable: parseOptionalBoolean(getFrontmatterValue(frontmatter, "spawnable")),
     interactive: parseOptionalBoolean(getFrontmatterValue(frontmatter, "interactive")),
     sessionMode: parseSessionMode(getFrontmatterValue(frontmatter, "session-mode")),
     cwd: getFrontmatterValue(frontmatter, "cwd"),
@@ -214,12 +209,12 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
   };
 }
 
-function discoverAllAgentDefinitions(cwd = process.cwd()): ListedAgentDefinition[] {
+function discoverAgentDefinitions(): ListedAgentDefinition[] {
   const agents = new Map<string, ListedAgentDefinition>();
   const dirs: Array<{ path: string; source: AgentSource }> = [
     { path: getBundledAgentsDir(), source: "package" },
     { path: join(getAgentConfigDir(), "agents"), source: "global" },
-    { path: join(cwd, ".pi", "agents"), source: "project" },
+    { path: join(process.cwd(), ".pi", "agents"), source: "project" },
   ];
 
   for (const { path: dir, source } of dirs) {
@@ -234,12 +229,10 @@ function discoverAllAgentDefinitions(cwd = process.cwd()): ListedAgentDefinition
     }
   }
 
-  return [...agents.values()];
-}
-
-function discoverAgentDefinitions(): ListedAgentDefinition[] {
-  return discoverAllAgentDefinitions().filter(a =>
-    a.spawnable !== false && (!SUBAGENT_ALLOWLIST || SUBAGENT_ALLOWLIST.has(a.name)));
+  // When this process is itself a restricted subagent, only expose the agents
+  // it is permitted to spawn (PI_SUBAGENT_ALLOWED). Top-level sessions see all.
+  const all = [...agents.values()];
+  return SUBAGENT_ALLOWLIST ? all.filter((a) => SUBAGENT_ALLOWLIST.has(a.name)) : all;
 }
 
 function resolveSubagentPaths(
@@ -311,8 +304,21 @@ function resolveEffectiveInteractive(
   return !(agentDefs?.autoExit ?? false);
 }
 
-function loadAgentDefaults(agentName: string, cwd = process.cwd()): ListedAgentDefinition | null {
-  return discoverAllAgentDefinitions(cwd).find(a => a.name === agentName) ?? null;
+function loadAgentDefaults(agentName: string): AgentDefaults | null {
+  const configDir = getAgentConfigDir();
+  const paths = [
+    join(process.cwd(), ".pi", "agents", `${agentName}.md`),
+    join(configDir, "agents", `${agentName}.md`),
+    join(getBundledAgentsDir(), `${agentName}.md`),
+  ];
+
+  for (const p of paths) {
+    if (!existsSync(p)) continue;
+    const parsed = parseAgentDefinition(readFileSync(p, "utf8"), agentName);
+    if (parsed) return parsed;
+  }
+
+  return null;
 }
 
 function formatElapsed(seconds: number): string {
@@ -616,8 +622,6 @@ function applySandboxToArgs(
     const model = loadout.thinking ? `${loadout.model}:${loadout.thinking}` : loadout.model;
     args.push("--model", model);
   }
-
-  if (!loadout.model && loadout.thinking) args.push("--thinking", loadout.thinking);
 
   if (loadout.identity) {
     const flag = loadout.systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt";
@@ -1241,55 +1245,7 @@ async function watchSubagent(
 
 export default function subagentsExtension(pi: ExtensionAPI) {
   latestPi = pi;
-  pi.registerFlag("subagent-agent", { type: "string", description: "Start this session as a named agent role." });
-  pi.registerFlag("subagent-exit", { type: "boolean", description: "Exit a role session and close its pane when settled; Escape or typing keeps it open." });
-  let role: ListedAgentDefinition | null = null;
-  let roleError: string | null = null;
-  let firstRoleInput = true;
-  pi.on("session_start", async (_event, ctx) => {
-    role = null;
-    roleError = null;
-    firstRoleInput = true;
-    SUBAGENT_ALLOWLIST = readSpawnAllowlist();
-    const name = pi.getFlag("subagent-agent");
-    if ((typeof name === "string" && name) || pi.getFlag("subagent-exit") === true) {
-      // Fail closed: a bad role must not run the task with the default loadout.
-      SUBAGENT_ALLOWLIST = new Set();
-      try {
-        if (typeof name !== "string" || !name) throw new Error("--subagent-exit requires --subagent-agent <name>.");
-        const selected = loadAgentDefaults(name, ctx.cwd);
-        if (!selected) throw new Error(`Unknown agent role: ${name}`);
-        if (selected.cli && selected.cli !== "pi") throw new Error("Top-level roles only support pi agents.");
-        if (selected.thinking && !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(selected.thinking)) {
-          throw new Error(`Invalid thinking level: ${selected.thinking}`);
-        }
-        if (selected.model) {
-          const models = ctx.modelRegistry.getAll().filter(m =>
-            m.id === selected.model || `${m.provider}/${m.id}` === selected.model);
-          if (models.length !== 1 || !await pi.setModel(models[0])) {
-            throw new Error(`Model unavailable: ${selected.model}`);
-          }
-        }
-        if (selected.thinking) pi.setThinkingLevel(selected.thinking as Parameters<typeof pi.setThinkingLevel>[0]);
-        const grantSpawning = !!selected.subagentAgents?.length;
-        const tools = buildSubagentToolAllowlist(selected.tools, { grantSpawning });
-        if (!tools || tools.split(",").includes("safe_bash")) safeBashExtension(pi);
-        const active = tools ? tools.split(",") : pi.getActiveTools();
-        // There is no parent for ask_question in a host-started role session.
-        pi.setActiveTools(active.filter(t => t !== "ask_question" && (grantSpawning || !SPAWNING_TOOLS.includes(t as any))));
-        SUBAGENT_ALLOWLIST = new Set(selected.subagentAgents ?? []);
-        role = selected;
-        const previous = ctx.sessionManager.getEntries().filter(e => e.type === "custom" && e.customType === "subagent_role").at(-1);
-        if ((previous as any)?.data?.agent !== role.name) pi.appendEntry("subagent_role", { agent: role.name });
-      } catch (error) {
-        roleError = String((error as any)?.message ?? error);
-        pi.setActiveTools([]);
-        ctx.ui.notify(roleError, "error");
-        if (!ctx.hasUI) console.error(roleError);
-        ctx.shutdown();
-        return;
-      }
-    }
+  pi.on("session_start", (_event, ctx) => {
     latestCtx = ctx;
     // Subagents are new pi processes, so they load herdr's state integration once installed.
     if (isHerdrAvailable()) {
@@ -1306,26 +1262,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     if (!prevAbort || prevAbort.signal.aborted) {
       (globalThis as any)[POLL_ABORT_KEY] = new AbortController();
     }
-  });
-
-  pi.on("before_agent_start", (event, ctx) => {
-    if (roleError) { ctx.abort(); return; }
-    if (role?.body && role.systemPromptMode) {
-      return { systemPrompt: role.systemPromptMode === "replace" ? role.body : `${event.systemPrompt}\n\n${role.body}` };
-    }
-  });
-  pi.on("input", (event) => {
-    if (roleError) return { action: "handled" };
-    if (!role || !firstRoleInput) return;
-    firstRoleInput = false;
-    if (role.body && !role.systemPromptMode) {
-      return { action: "transform", text: `${role.body}\n\n${event.text}`, images: event.images };
-    }
-  });
-  subagentDoneExtension(pi, {
-    topLevel: true,
-    agent: () => role?.name ?? "",
-    autoExit: () => !!role && pi.getFlag("subagent-exit") === true,
   });
 
   // Clean up on session shutdown
@@ -1366,7 +1302,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
         // Prevent self-spawning (e.g. planner spawning another planner)
-        const currentAgent = role?.name ?? process.env.PI_SUBAGENT_AGENT;
+        const currentAgent = process.env.PI_SUBAGENT_AGENT;
         if (params.agent && currentAgent && params.agent === currentAgent) {
           return {
             content: [
@@ -1379,10 +1315,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
-        // Intersect the caller's permissions with current definitions at every
-        // depth: a pinned allowlist must not bypass spawnable:false overrides.
-        // Hidden-but-spawnable roles remain callable by explicit name.
-        const permittedAgents = discoverAgentDefinitions().map((a) => a.name);
+        // Strict whitelist at every depth. The caller's permitted set is:
+        //   • a restricted subagent (PI_SUBAGENT_ALLOWED) → only its pinned agents;
+        //   • a top-level session → every discoverable agent, i.e. exactly what
+        //     `subagents_list` shows.
+        // Every spawn must name an agent in that set. The lone exception is a
+        // top-level `fork: true` clone, which has no role and inherits the
+        // caller's own already-trusted toolset. Without this guard a missing or
+        // unknown `agent` silently launches an unrestricted, full-toolset child.
+        const permittedAgents = SUBAGENT_ALLOWLIST
+          ? [...SUBAGENT_ALLOWLIST]
+          : discoverAgentDefinitions().map((a) => a.name);
         const permittedSet = new Set(permittedAgents);
         const permittedList = permittedAgents.join(", ") || "(none)";
 
@@ -1592,7 +1535,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // "Started" result — tool returned immediately
         if (details?.status === "started") {
           return new Text(
-            theme.fg("accent", "●") +
+            theme.fg("accent", "⟳") +
               " " +
               theme.fg("toolTitle", theme.bold(name)) +
               theme.fg("dim", " — started"),
@@ -1715,7 +1658,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         if (details?.status === "started") {
           return new Text(
-            theme.fg("accent", "●") +
+            theme.fg("accent", "⟳") +
               " " +
               theme.fg("toolTitle", theme.bold(details.name ?? "Resume")) +
               theme.fg("dim", " — resumed"),
@@ -1744,9 +1687,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // A name that matches a currently-running subagent always steers it.
         const runningMatch = Array.from(runningSubagents.values()).find((r) => r.name === requestedName);
         if (runningMatch) {
-          if (SUBAGENT_ALLOWLIST && (!runningMatch.agent || !SUBAGENT_ALLOWLIST.has(runningMatch.agent))) {
-            throw new Error("Agent not in your allowlist.");
-          }
           return handleSubagentSteer({ name: requestedName, message: params.message });
         }
 
@@ -1801,12 +1741,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
 
-        const definition = loadout.agent ? loadAgentDefaults(loadout.agent) : null;
-        if (definition?.spawnable === false || (SUBAGENT_ALLOWLIST && (!loadout.agent || !SUBAGENT_ALLOWLIST.has(loadout.agent)))) {
-          const err = `You may not resume the "${loadout.agent ?? requestedName}" agent — spawning is not permitted.`;
-          return { content: [{ type: "text" as const, text: err }], details: { error: err } };
-        }
-
         const resumedSessionId = entry.sessionId ?? getSessionId(sessionPath) ?? requestedName;
 
         // Record entry count before resuming so we can extract new messages.
@@ -1846,7 +1780,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           id,
           name,
           task: message,
-          agent: loadout.agent ?? undefined,
           surface,
           herdrName,
           startTime,
@@ -1934,7 +1867,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       const agentName = spaceIdx === -1 ? trimmed : trimmed.slice(0, spaceIdx);
       const task = spaceIdx === -1 ? "" : trimmed.slice(spaceIdx + 1).trim();
 
-      if (!discoverAgentDefinitions().some(a => a.name === agentName)) {
+      const defs = loadAgentDefaults(agentName);
+      if (!defs) {
         ctx.ui.notify(
           `Agent "${agentName}" not found in ~/.pi/agent/agents/ or .pi/agents/`,
           "error",

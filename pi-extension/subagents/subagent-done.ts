@@ -12,10 +12,9 @@
  * (auto-exit is suppressed for that turn via `awaitingAnswer`), and the parent
  * replies with subagent_message — which lands as the subagent's next turn.
  */
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Box, Text, matchesKey } from "@earendil-works/pi-tui";
-import { closeOwnPaneOnExit } from "./herdr.ts";
-import { Type } from "typebox";
+import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { Box, Text } from "@mariozechner/pi-tui";
+import { Type } from "@sinclair/typebox";
 import { existsSync, writeFileSync } from "node:fs";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
@@ -120,11 +119,7 @@ export function parseDeniedTools(rawValue: string | undefined): string[] {
     .filter(Boolean);
 }
 
-export default function (pi: ExtensionAPI, options: {
-  topLevel?: boolean;
-  agent?: () => string;
-  autoExit?: () => boolean;
-} = {}) {
+export default function (pi: ExtensionAPI) {
   let toolNames: string[] = [];
   let denied: string[] = [];
   let expanded = false;
@@ -133,7 +128,7 @@ export default function (pi: ExtensionAPI, options: {
   const subagentName = process.env.PI_SUBAGENT_NAME ?? "";
   const subagentAgent = process.env.PI_SUBAGENT_AGENT ?? "";
   const deniedToolsValue = process.env.PI_DENY_TOOLS;
-  const autoExit = () => options.autoExit?.() ?? (process.env.PI_SUBAGENT_AUTO_EXIT === "1");
+  const autoExit = process.env.PI_SUBAGENT_AUTO_EXIT === "1";
 
   function renderWidget(ctx: { ui: { setWidget: Function } }, _theme: any) {
     ctx.ui.setWidget(
@@ -195,55 +190,9 @@ export default function (pi: ExtensionAPI, options: {
   let awaitingAnswer = false;
   // Set when this extension ends the session after a completed final turn.
   let finished = false;
-  let stopWatchingKeys: (() => void) | undefined;
-  let sessionKey: string | undefined;
-  let completionMessages: any[] | undefined;
-  let completionCandidate = false;
-  const TAKEOVER_KEY = Symbol.for("pi-subagents/top-level-takeover");
-
-  function finishIfReady(ctx: any) {
-    if (!completionCandidate || finished || !autoExit() || awaitingAnswer || runningChildrenCount() ||
-        (options.topLevel && userTookOver) || ctx.ui?.getEditorText?.() ||
-        ctx.hasPendingMessages?.() || (ctx.isIdle && !ctx.isIdle())) return;
-    const errorInfo = findLatestAssistantError(completionMessages);
-    if (options.topLevel && errorInfo) return;
-    const sessionFile = process.env.PI_SUBAGENT_SESSION;
-    if (errorInfo && sessionFile) {
-      try { writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "error", ...errorInfo })); } catch {}
-    }
-    finished = true;
-    ctx.shutdown();
-  }
-
-  pi.on("agent_before_settle", (event) => {
-    if (event.outcome === "aborted" || (options.topLevel && event.outcome === "error")) completionCandidate = false;
-  });
-  pi.on("agent_settled", (_event, ctx) => finishIfReady(ctx));
-
-  pi.on("session_start", (_event, ctx) => {
-    stopWatchingKeys?.();
-    finished = false;
-    completionCandidate = false;
-    awaitingAnswer = false;
-    agentStarted = false;
-    sessionKey = ctx.sessionManager?.getSessionFile() ?? ctx.sessionManager?.getSessionId();
-    userTookOver = options.topLevel && (globalThis as any)[TAKEOVER_KEY] === sessionKey;
-    if (options.topLevel && options.agent?.() && ctx.hasUI && ctx.ui.onTerminalInput) {
-      stopWatchingKeys = ctx.ui.onTerminalInput(data => {
-        // Ignore terminal replies/mouse/focus reports; observe Escape, typing and paste.
-        const text = data.replace(/\x1b\[[0-9;?<>]*[A-Za-z]/g, "").replace(/\x1b\[(?:200|201)~/g, "");
-        if (matchesKey(data, "escape") || (agentStarted && /[^\x00-\x1f\x7f]/.test(text))) {
-          userTookOver = true;
-          (globalThis as any)[TAKEOVER_KEY] = sessionKey;
-        }
-        return undefined;
-      });
-    }
-  });
 
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
-    if (options.topLevel) return;
     const tools = pi.getAllTools();
     toolNames = tools.map((t) => t.name).sort();
     denied = parseDeniedTools(deniedToolsValue);
@@ -251,8 +200,7 @@ export default function (pi: ExtensionAPI, options: {
     renderWidget(ctx, null);
   });
 
-  pi.on("input", (event) => {
-    completionCandidate = false;
+  pi.on("input", () => {
     // A submitted message is the orchestrator's (or a human's) reply — the
     // pending ask_question has been answered, however it was delivered. Clear
     // here, not only on agent_start, because a reply steered in *mid-run* is
@@ -265,21 +213,17 @@ export default function (pi: ExtensionAPI, options: {
     // Ignore the initial task message that starts an autonomous subagent.
     // Only inputs after the first agent run has started count as user takeover.
     if (!shouldMarkUserTookOver(agentStarted)) return;
-    if (!options.topLevel || event?.source === "interactive") {
-      userTookOver = true;
-      if (options.topLevel) (globalThis as any)[TAKEOVER_KEY] = sessionKey;
-    }
+    userTookOver = true;
   });
 
   pi.on("agent_start", () => {
-    completionCandidate = false;
     agentStarted = true;
     // A new turn is starting — any pending ask_question has now been answered
     // (or superseded), so let auto-exit resume normally when this turn ends.
     awaitingAnswer = false;
   });
 
-  pi.on("agent_end", (event) => {
+  pi.on("agent_end", (event, ctx) => {
     const messages = (event as any).messages as any[] | undefined;
     // Never shut down while this session still has work in flight:
     //  - awaitingAnswer: an ask_question is pending the orchestrator's reply.
@@ -292,26 +236,45 @@ export default function (pi: ExtensionAPI, options: {
     const shouldExit =
       !awaitingAnswer &&
       !hasPendingChildren &&
-      autoExit() &&
-      !(options.topLevel && userTookOver) &&
+      autoExit &&
       shouldAutoExitOnAgentEnd(userTookOver, messages);
 
-    completionCandidate = shouldExit;
-    completionMessages = messages;
-    if (shouldExit) return;
+    if (shouldExit) {
+      // Surface stopReason: "error" turns (auto-retry exhausted, provider
+      // overload, etc.) to the parent via the .exit sidecar so the watcher
+      // can report a clear failure with the underlying error message.
+      // Without this the parent would only see exit code 0 and a stale
+      // assistant message, mistaking the crash for a successful completion.
+      const errorInfo = findLatestAssistantError(messages);
+      const sessionFile = process.env.PI_SUBAGENT_SESSION;
+      if (errorInfo && sessionFile) {
+        try {
+          writeFileSync(
+            `${sessionFile}.exit`,
+            JSON.stringify({
+              type: "error",
+              errorMessage: errorInfo.errorMessage,
+              stopReason: errorInfo.stopReason,
+            }),
+          );
+        } catch {
+          // Best effort: without the marker the parent reports an interruption.
+        }
+      }
+
+      finished = true;
+      ctx.shutdown();
+      return;
+    }
 
     // Escape stopped an autonomous subagent mid-turn: it waits for input, so tell the parent.
     const sessionFile = process.env.PI_SUBAGENT_SESSION;
     const last = [...(messages ?? [])].reverse().find((m) => m?.role === "assistant");
-    if (options.topLevel && wasAborted(last)) {
-      userTookOver = true;
-      (globalThis as any)[TAKEOVER_KEY] = sessionKey;
-    }
-    if (autoExit() && sessionFile && wasAborted(last)) {
+    if (autoExit && sessionFile && wasAborted(last)) {
       try { writeFileSync(`${sessionFile}.paused`, "{}"); } catch {}
     }
 
-    if (autoExit() && !options.topLevel) {
+    if (autoExit) {
       // Reset any recorded manual input marker. Auto-exit is decided by whether
       // the latest agent turn completed normally, not by who initiated it.
       userTookOver = false;
@@ -323,20 +286,11 @@ export default function (pi: ExtensionAPI, options: {
   // agent's final turn, or a human leaving an interactive pane), or `quit` when
   // someone ended an autonomous agent early. A crash leaves no marker.
   pi.on("session_shutdown", (event) => {
-    stopWatchingKeys?.();
-    stopWatchingKeys = undefined;
-    if (options.topLevel) {
-      if (finished && (event as any).reason === "quit") closeOwnPaneOnExit();
-      if ((event as any).reason !== "reload" && (globalThis as any)[TAKEOVER_KEY] === sessionKey) delete (globalThis as any)[TAKEOVER_KEY];
-      return;
-    }
     const sessionFile = process.env.PI_SUBAGENT_SESSION;
     if ((event as any).reason !== "quit" || !sessionFile || existsSync(`${sessionFile}.exit`)) return;
-    const type = finished || !autoExit() ? "done" : "quit";
+    const type = finished || !autoExit ? "done" : "quit";
     try { writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type })); } catch {}
   });
-
-  if (options.topLevel) return;
 
   // Toggle expand/collapse with Ctrl+Alt+O
   pi.registerShortcut("ctrl+alt+o", {
