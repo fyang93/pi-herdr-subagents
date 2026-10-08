@@ -230,8 +230,9 @@ export default function (pi: ExtensionAPI, options: {
     userTookOver = options.topLevel && (globalThis as any)[TAKEOVER_KEY] === sessionKey;
     if (options.topLevel && options.agent?.() && ctx.hasUI && ctx.ui.onTerminalInput) {
       stopWatchingKeys = ctx.ui.onTerminalInput(data => {
-        // Submitted input is work; only Escape explicitly keeps the pane open.
-        if (matchesKey(data, "escape")) {
+        // Ignore terminal replies/mouse/focus reports; observe Escape, typing and paste.
+        const text = data.replace(/\x1b\[[0-9;?<>]*[A-Za-z]/g, "").replace(/\x1b\[(?:200|201)~/g, "");
+        if (matchesKey(data, "escape") || (agentStarted && /[^\x00-\x1f\x7f]/.test(text))) {
           userTookOver = true;
           (globalThis as any)[TAKEOVER_KEY] = sessionKey;
         }
@@ -264,7 +265,10 @@ export default function (pi: ExtensionAPI, options: {
     // Ignore the initial task message that starts an autonomous subagent.
     // Only inputs after the first agent run has started count as user takeover.
     if (!shouldMarkUserTookOver(agentStarted)) return;
-    if (!options.topLevel) userTookOver = true;
+    if (!options.topLevel || event?.source === "interactive") {
+      userTookOver = true;
+      if (options.topLevel) (globalThis as any)[TAKEOVER_KEY] = sessionKey;
+    }
   });
 
   pi.on("agent_start", () => {

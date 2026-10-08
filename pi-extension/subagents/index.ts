@@ -1240,7 +1240,7 @@ async function watchSubagent(
 export default function subagentsExtension(pi: ExtensionAPI) {
   latestPi = pi;
   pi.registerFlag("subagent-agent", { type: "string", description: "Start this session as a named agent role." });
-  pi.registerFlag("subagent-exit", { type: "boolean", description: "Exit a role session and close its pane when settled; Escape or an editor draft keeps it open." });
+  pi.registerFlag("subagent-exit", { type: "boolean", description: "Exit a role session and close its pane when settled; Escape or typing keeps it open." });
   let role: ListedAgentDefinition | null = null;
   let roleError: string | null = null;
   let firstRoleInput = true;
