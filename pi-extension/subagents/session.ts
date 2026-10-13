@@ -1,9 +1,9 @@
 import {
   closeSync,
-  existsSync,
   fstatSync,
   mkdirSync,
   openSync,
+  readdirSync,
   readFileSync,
   readSync,
   renameSync,
@@ -29,35 +29,27 @@ export interface MessageEntry extends SessionEntry {
 
 export type SeededSubagentSessionMode = "lineage-only" | "fork";
 
-function getForkContentLines(parentSessionFile: string): string[] {
-  const raw = readFileSync(parentSessionFile, "utf8");
-  const lines = raw.split("\n").filter((line) => line.trim());
-
-  let truncateAt = lines.length;
-  for (let i = lines.length - 1; i >= 0; i--) {
-    try {
-      const entry = JSON.parse(lines[i]);
-      if (entry.type === "message" && entry.message?.role === "user") {
-        truncateAt = i;
-        break;
-      }
-    } catch {
-      // ignore malformed lines
-    }
-  }
-
-  return lines.slice(0, truncateAt).filter((line) => {
-    try {
-      return JSON.parse(line).type !== "session";
-    } catch {
-      return true;
-    }
-  });
+/**
+ * The active branch up to the turn that spawns the fork: the assistant message holding
+ * the spawning tool call is left out, since its batch is unresolved. A run need not
+ * start with a user message (a subagent's result can start one), so that is no boundary.
+ * A call made from a codemode script has a nested id (`call-1/1`); the transcript holds
+ * its enclosing call (`call-1`).
+ */
+function forkContext(branch: SessionEntry[], forkPoint?: string): SessionEntry[] {
+  const encloses = (id: unknown) => typeof id === "string" && (forkPoint === id || !!forkPoint?.startsWith(`${id}/`));
+  const spawning = branch.findIndex((entry) =>
+    entry.type === "message" && (entry as MessageEntry).message?.content?.some?.((part) => part.type === "toolCall" && encloses(part.id)));
+  return spawning === -1 ? branch : branch.slice(0, spawning);
 }
 
 export function seedSubagentSessionFile(params: {
   mode: SeededSubagentSessionMode;
   parentSessionFile: string;
+  /** The parent's active branch (root to leaf), copied in fork mode. */
+  parentBranch: SessionEntry[];
+  /** The tool call spawning the fork; the branch is copied up to the message holding it. */
+  forkPoint?: string;
   childSessionFile: string;
   childCwd: string;
 }): void {
@@ -69,42 +61,38 @@ export function seedSubagentSessionFile(params: {
     cwd: params.childCwd,
     parentSession: params.parentSessionFile,
   };
-  const contentLines =
-    params.mode === "fork" ? getForkContentLines(params.parentSessionFile) : [];
-  const lines = [JSON.stringify(header), ...contentLines];
-
+  const entries = params.mode === "fork" ? forkContext(params.parentBranch, params.forkPoint) : [];
   mkdirSync(dirname(params.childSessionFile), { recursive: true });
-  writeFileSync(params.childSessionFile, lines.join("\n") + "\n", "utf8");
+  writeFileSync(params.childSessionFile, [header, ...entries].map((entry) => JSON.stringify(entry)).join("\n") + "\n", "utf8");
 }
 
 /**
  * A snapshot of the subagent loadout used by `subagent_message({ name })`.
  *
  * Written next to the session file as `<sessionFile>.loadout.json` at spawn
- * time. Resume replays this exact snapshot so the reincarnated process gets the
- * same optional `--tools` restriction, model, identity, spawn whitelist, cwd,
- * and config dir. Extensions are discovered from the current configuration.
+ * time. Native resume restores history, model and thinking, but rebuilds the
+ * system prompt and tools from the current CLI flags and patches the session
+ * to match — a bare `--session` resume drops the identity and tool restriction.
+ * Resume therefore replays this snapshot's `--tools` restriction, identity,
+ * spawn whitelist, cwd, and config dir (not the model, which the session
+ * owns). Extensions are discovered from the current configuration.
  * Storing the resolved loadout (rather than re-deriving from the agent `.md` by name) keeps
  * resume faithful even if the agent definition is later edited, moved, or
  * deleted.
  */
 export interface SubagentLoadout {
-  /** Agent profile name (for PI_SUBAGENT_AGENT); null for agentless spawns. */
+  /** Agent profile name (for PI_SUBAGENT_AGENT); older snapshots may have null. */
   agent: string | null;
   /** The `--tools` allowlist string, or null when the spawn was unrestricted. */
   toolAllowlist: string | null;
-  /** Model id (without thinking suffix), or null to use the session default. */
-  model: string | null;
-  /** Thinking level appended to the model as `model:level`, or null. */
-  thinking: string | null;
   /** How the identity text was applied: append/replace, or null. */
   systemPromptMode: "append" | "replace" | null;
   /** The system-prompt/identity text, only when it lived in the system prompt. */
   identity: string | null;
   /** Agents this subagent was allowed to spawn (for PI_SUBAGENT_ALLOWED). */
   spawnable: string[] | null;
-  /** Whether the agent auto-exits (informational; resume forces autonomous). */
-  autoExit: boolean;
+  /** Whether a human drives it, so a blocked dialog does not wake the parent; absent in older snapshots. */
+  interactive?: boolean;
   /** Working directory the subagent ran in, or null. */
   cwd: string | null;
   /** PI_CODING_AGENT_DIR the subagent resolved config/extensions from, or null. */
@@ -116,27 +104,60 @@ export function loadoutSidecarPath(sessionFile: string): string {
   return `${sessionFile}.loadout.json`;
 }
 
-/** Persist a subagent's resolved sandbox loadout beside its session file. */
+/** Persist a subagent's resolved sandbox loadout beside its session file; a failure fails the launch. */
 export function writeSubagentLoadout(sessionFile: string, loadout: SubagentLoadout): void {
-  try {
-    writeFileSync(loadoutSidecarPath(sessionFile), JSON.stringify(loadout), "utf8");
-  } catch {
-    // Best-effort: a missing snapshot only means resume will refuse, never that
-    // it launches unrestricted.
-  }
+  writeFileSync(loadoutSidecarPath(sessionFile), JSON.stringify(loadout), "utf8");
 }
 
-/** Read a subagent's loadout snapshot, or null if absent/unparseable. */
+const isNullableString = (value: unknown) => value === null || typeof value === "string";
+
+/** Read a subagent's loadout snapshot, or null if absent, unparseable, or malformed. */
 export function readSubagentLoadout(sessionFile: string): SubagentLoadout | null {
   try {
-    const p = loadoutSidecarPath(sessionFile);
-    if (!existsSync(p)) return null;
-    const parsed = JSON.parse(readFileSync(p, "utf8"));
-    if (!parsed || typeof parsed !== "object") return null;
-    return parsed as SubagentLoadout;
+    const parsed = JSON.parse(readFileSync(loadoutSidecarPath(sessionFile), "utf8"));
+    // A malformed snapshot must refuse resume, not launch with default prompt/tools.
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    const valid =
+      ["agent", "toolAllowlist", "identity", "cwd", "agentDir"].every((key) => isNullableString(parsed[key])) &&
+      (parsed.systemPromptMode === null || parsed.systemPromptMode === "append" || parsed.systemPromptMode === "replace") &&
+      (parsed.spawnable === null || (Array.isArray(parsed.spawnable) && parsed.spawnable.every((name: unknown) => typeof name === "string"))) &&
+      (parsed.interactive === undefined || typeof parsed.interactive === "boolean");
+    return valid ? (parsed as SubagentLoadout) : null;
   } catch {
     return null;
   }
+}
+
+// ── Questions ────────────────────────────────────────────────────────────────
+// A subagent's questions are immutable files in `<session>.ask/`, each published by
+// rename: the child never rewrites what the parent may be reading, and the parent
+// removes only the questions it delivered.
+
+/** Publish a question for the parent; throws when it cannot be written. */
+export function publishQuestion(sessionFile: string, question: string): void {
+  const dir = `${sessionFile}.ask`;
+  mkdirSync(dir, { recursive: true });
+  const tmp = `${dir}-${randomUUID()}.tmp`; // outside the directory: never read half-written
+  writeFileSync(tmp, JSON.stringify({ question }));
+  // Named by the monotonic clock, so they sort in the order asked, even within a millisecond.
+  renameSync(tmp, join(dir, `${String(process.hrtime.bigint()).padStart(20, "0")}-${randomUUID()}.json`));
+}
+
+/** Questions waiting for delivery, in the order asked, and the files holding them (malformed ones included). */
+export function pendingQuestions(sessionFile: string): { files: string[]; questions: string[] } {
+  const dir = `${sessionFile}.ask`;
+  let names: string[] = [];
+  try { names = readdirSync(dir).filter((name) => name.endsWith(".json")).sort(); } catch {} // none asked
+  const files = names.map((name) => join(dir, name));
+  const questions = files.flatMap((file) => {
+    try {
+      const { question } = JSON.parse(readFileSync(file, "utf8"));
+      return typeof question === "string" && question.trim() ? [question] : [];
+    } catch {
+      return [];
+    }
+  });
+  return { files, questions };
 }
 
 // ── Name registry ────────────────────────────────────────────────────────────
@@ -149,10 +170,8 @@ export function readSubagentLoadout(sessionFile: string): SubagentLoadout | null
 // the spawner's session id (no sessions-tree scan, so resume stays fast).
 
 export interface NameRegistryEntry {
-  /** Absolute path to the subagent's session .jsonl file. */
+  /** Absolute path to the subagent's session .jsonl file; its header holds the session id. */
   sessionFile: string;
-  /** Canonical session header id (kept for display/lineage). */
-  sessionId: string | null;
 }
 
 export type NameRegistry = Record<string, NameRegistryEntry>;
@@ -165,9 +184,7 @@ export function nameRegistryPath(artifactDir: string): string {
 /** Read a spawner session's name registry, or {} if absent/corrupt. */
 export function readNameRegistry(artifactDir: string): NameRegistry {
   try {
-    const p = nameRegistryPath(artifactDir);
-    if (!existsSync(p)) return {};
-    const parsed = JSON.parse(readFileSync(p, "utf8"));
+    const parsed = JSON.parse(readFileSync(nameRegistryPath(artifactDir), "utf8"));
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
     return parsed as NameRegistry;
   } catch {
@@ -178,42 +195,26 @@ export function readNameRegistry(artifactDir: string): NameRegistry {
 /**
  * Register (or overwrite) a name → session mapping for a spawner session.
  * Writes atomically (temp file + rename) so a concurrent reader never sees a
- * partial registry.
+ * partial registry. A failure throws: the name would otherwise not be addressable.
  */
 export function registerName(
   artifactDir: string,
   name: string,
   entry: NameRegistryEntry,
 ): void {
-  try {
-    mkdirSync(artifactDir, { recursive: true });
-    const registry = readNameRegistry(artifactDir);
-    registry[name] = entry;
-    const p = nameRegistryPath(artifactDir);
-    const tmp = `${p}.tmp-${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
-    writeFileSync(tmp, JSON.stringify(registry, null, 2), "utf8");
-    renameSync(tmp, p);
-  } catch {
-    // Best-effort: a failed registration only means resume-by-name won't find
-    // this subagent later; it never breaks the spawn itself.
-  }
+  mkdirSync(artifactDir, { recursive: true });
+  // A computed key defines an own property for any name, `__proto__` included.
+  const registry = { ...readNameRegistry(artifactDir), [name]: entry };
+  const p = nameRegistryPath(artifactDir);
+  const tmp = `${p}.tmp-${process.pid}-${randomUUID()}`;
+  writeFileSync(tmp, JSON.stringify(registry, null, 2), "utf8");
+  renameSync(tmp, p);
 }
 
-/** Resolve a name to its registry entry within a spawner session, or null. */
-export function resolveNameInRegistry(
-  artifactDir: string,
-  name: string,
-): NameRegistryEntry | null {
-  const entry = readNameRegistry(artifactDir)[name];
+/** A name's entry in a registry, or null: only its own entries are names, `__proto__` included. */
+export function registryEntry(registry: NameRegistry, name: string): NameRegistryEntry | null {
+  const entry = Object.hasOwn(registry, name) ? registry[name] : undefined;
   return entry && typeof entry.sessionFile === "string" ? entry : null;
-}
-
-function readEntries(sessionFile: string): SessionEntry[] {
-  const raw = readFileSync(sessionFile, "utf8");
-  return raw
-    .split("\n")
-    .filter((line) => line.trim())
-    .map((line) => JSON.parse(line) as SessionEntry);
 }
 
 /**
@@ -262,35 +263,6 @@ export function getSessionId(sessionFile: string): string | null {
 }
 
 /**
- * Count the number of entry lines in a session file without parsing each line
- * into an object. Used by the resume path, which only needs the *count* of
- * pre-existing entries (so it can later slice out the new ones). Parsing every
- * line of a large resumed transcript synchronously at resume time would block
- * the UI; counting newlines is dramatically cheaper.
- */
-export function countSessionEntryLines(sessionFile: string): number {
-  try {
-    const raw = readFileSync(sessionFile, "utf8");
-    // Count non-blank lines, mirroring getNewEntries' `.filter(line => line.trim())`
-    // but skipping the per-line JSON.parse that makes resume slow on big files.
-    let count = 0;
-    for (const line of raw.split("\n")) {
-      if (line.trim()) count++;
-    }
-    return count;
-  } catch {
-    return 0;
-  }
-}
-
-/** Return entries added after `afterLine` (1-indexed count of existing entries). */
-export function getNewEntries(sessionFile: string, afterLine: number): SessionEntry[] {
-  const raw = readFileSync(sessionFile, "utf8");
-  const lines = raw.split("\n").filter((line) => line.trim());
-  return lines.slice(afterLine).map((line) => JSON.parse(line) as SessionEntry);
-}
-
-/**
  * Find the last assistant message text in a list of entries.
  *
  * Falls back to the `errorMessage` field when the last assistant message has
@@ -299,20 +271,41 @@ export function getNewEntries(sessionFile: string, afterLine: number): SessionEn
  * without this fallback the parent would silently see a stale earlier message.
  */
 export function findLastAssistantMessage(entries: SessionEntry[]): string | null {
+  const last = findLastAssistantText(entries);
+  if (last === null || last.startsWith("Subagent error: ")) return last;
+  // An extension message (e.g. a background fetch finishing) can start another run
+  // after the agent already gave its answer; that run's short reply must not
+  // replace it. Keep every completed reply since the last user input.
+  const replies: string[] = [];
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    if (entry.type !== "message") continue;
+    const message = (entry as MessageEntry).message as { role: string; content: any[]; stopReason?: unknown };
+    if (message.role === "user") break;
+    if (message.role !== "assistant" || message.stopReason !== "stop") continue;
+    const text = textOf(message.content);
+    if (text) replies.unshift(text);
+  }
+  return replies.length > 1 && replies[replies.length - 1] === last ? replies.join("\n\n") : last;
+}
+
+function textOf(content: any[]): string {
+  const text = content
+    .filter((block) => block.type === "text" && typeof block.text === "string" && block.text.trim() !== "")
+    .map((block) => block.text as string)
+    .join("\n");
+  return text.trim() ? text : "";
+}
+
+function findLastAssistantText(entries: SessionEntry[]): string | null {
   for (let i = entries.length - 1; i >= 0; i--) {
     const entry = entries[i];
     if (entry.type !== "message") continue;
     const msg = entry as MessageEntry;
     if (msg.message.role !== "assistant") continue;
 
-    const texts = msg.message.content
-      .filter(
-        (block) =>
-          block.type === "text" && typeof block.text === "string" && block.text.trim() !== "",
-      )
-      .map((block) => block.text as string);
-
-    if (texts.length > 0 && texts.join("").trim()) return texts.join("\n");
+    const text = textOf(msg.message.content);
+    if (text) return text;
 
     const stopReason = (msg.message as { stopReason?: unknown }).stopReason;
     const errorMessage = (msg.message as { errorMessage?: unknown }).errorMessage;
@@ -329,6 +322,9 @@ export function findLastAssistantMessage(entries: SessionEntry[]): string | null
 
 export interface SessionStats {
   model: string | null;
+  provider: string | null;
+  /** The model's context window from pi's model registry, when known. */
+  contextWindow?: number;
   toolCount: number;
   /** Cumulative token usage across all assistant turns. */
   inputTokens: number;
@@ -342,22 +338,16 @@ export interface SessionStats {
 }
 
 /**
- * Parse a completed subagent session JSONL into aggregate stats for display:
- * model, tool-call count, cumulative token usage + cost, and current context
- * size. Cumulative usage fields are summed across every assistant turn; the
- * context size is taken from the last assistant turn's `totalTokens` (the live
- * context window occupancy). Returns null if the file can't be read.
+ * Aggregate a completed subagent session's entries into stats for display: model,
+ * tool-call count, billed token usage + cost, and current context size. Billing counts
+ * what Pi's own session stats count: assistant turns, tool results that ran a model,
+ * standalone usage entries, compactions and branch summaries. The context size is the
+ * last assistant turn's `totalTokens` (the live context window occupancy).
  */
-export function summarizeSessionStats(sessionFile: string): SessionStats | null {
-  let entries: SessionEntry[];
-  try {
-    entries = readEntries(sessionFile);
-  } catch {
-    return null;
-  }
-
+export function summarizeSessionStats(entries: SessionEntry[]): SessionStats {
   const stats: SessionStats = {
     model: null,
+    provider: null,
     toolCount: 0,
     inputTokens: 0,
     outputTokens: 0,
@@ -366,35 +356,33 @@ export function summarizeSessionStats(sessionFile: string): SessionStats | null 
     contextTokens: 0,
     cost: 0,
   };
+  const num = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+  const bill = (usage: any) => {
+    if (!usage || typeof usage !== "object") return;
+    stats.inputTokens += num(usage.input);
+    stats.outputTokens += num(usage.output);
+    stats.cacheReadTokens += num(usage.cacheRead);
+    stats.cacheWriteTokens += num(usage.cacheWrite);
+    stats.cost += num(usage.cost?.total);
+  };
 
-  for (const entry of entries) {
+  for (const entry of entries as any[]) {
     if (entry.type === "model_change") {
-      const modelId = (entry as { modelId?: unknown }).modelId;
-      if (typeof modelId === "string" && modelId) stats.model = modelId;
-      continue;
-    }
-    if (entry.type !== "message") continue;
-    const msg = (entry as MessageEntry).message;
-    if (msg.role !== "assistant") continue;
-
-    const model = (msg as { model?: unknown }).model;
-    if (typeof model === "string" && model) stats.model = model;
-
-    for (const block of msg.content) {
-      if (block.type === "toolCall") stats.toolCount++;
-    }
-
-    const usage = (msg as { usage?: Record<string, unknown> }).usage;
-    if (usage && typeof usage === "object") {
-      const num = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) ? v : 0);
-      stats.inputTokens += num(usage.input);
-      stats.outputTokens += num(usage.output);
-      stats.cacheReadTokens += num(usage.cacheRead);
-      stats.cacheWriteTokens += num(usage.cacheWrite);
-      const total = num(usage.totalTokens);
-      if (total > 0) stats.contextTokens = total;
-      const cost = usage.cost;
-      if (cost && typeof cost === "object") stats.cost += num((cost as Record<string, unknown>).total);
+      if (typeof entry.modelId === "string" && entry.modelId) stats.model = entry.modelId;
+      if (typeof entry.provider === "string" && entry.provider) stats.provider = entry.provider;
+    } else if (entry.type === "usage" || entry.type === "compaction" || entry.type === "branch_summary") {
+      bill(entry.usage);
+      // After a compaction the context size is unknown until the next assistant turn, as Pi treats it.
+      if (entry.type === "compaction") stats.contextTokens = 0;
+    } else if (entry.type === "message" && entry.message?.role === "toolResult") {
+      bill(entry.message.usage);
+    } else if (entry.type === "message" && entry.message?.role === "assistant") {
+      const msg = entry.message;
+      if (typeof msg.model === "string" && msg.model) stats.model = msg.model;
+      if (typeof msg.provider === "string" && msg.provider) stats.provider = msg.provider;
+      if (Array.isArray(msg.content)) stats.toolCount += msg.content.filter((block: any) => block?.type === "toolCall").length;
+      bill(msg.usage);
+      if (num(msg.usage?.totalTokens) > 0) stats.contextTokens = num(msg.usage.totalTokens);
     }
   }
 

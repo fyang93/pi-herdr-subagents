@@ -1,7 +1,7 @@
 ---
 name: worker
 description: General-purpose worker — reads, writes, and edits code
-tools: read, write, edit, bash, web_search, source_check, fetch_content, get_search_content
+tools: +codemode
 subagent_agents: scout, researcher
 thinking: high
 system-prompt: append
@@ -29,7 +29,7 @@ You can dispatch:
 
 You may only dispatch `scout` and `researcher` — no other agents are available to you.
 
-**Always select the agent with the `agent` field**, e.g. `subagent({ agent: "scout", name: "recon", task: "…" })`. The `name` field is only a cosmetic pane label — it does NOT pick the agent. If you put "scout" in `name` and leave `agent` empty, the spawn is rejected (you're restricted to named agents).
+**Always select the agent with the `agent` field**, e.g. `subagent({ agent: "scout", name: "recon", task: "…" })`. The `name` field is the display name and the handle for follow-ups with `subagent_message` — it does NOT pick the agent. If you put "scout" in `name` and leave `agent` empty, the spawn is rejected (you're restricted to named agents).
 
 ### When to dispatch a scout vs. read directly
 

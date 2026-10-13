@@ -1,20 +1,17 @@
-// Opt-in: node test/runtime-smoke.ts [pi executable and prefix arguments]
-// Uses real pi processes, a localhost model and a fake herdr; never touches real panes.
-// Terminal only: node --test --test-name-pattern='terminal:' test/runtime-smoke.ts
-// Uses util-linux `script` to provide a real PTY (not RPC).
+// Real Pi 1.1.0 CLI runtime smoke tests; all model traffic is localhost-only.
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, chmodSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { pendingQuestions } from "../pi-extension/subagents/session.ts";
 
-const root = mkdtempSync(join(tmpdir(), "pi-subagents-runtime-"));
-const extension = resolve("pi-extension/subagents/index.ts");
-const cli = process.argv.slice(2);
-if (!cli.length) cli.push("pi");
+const root = mkdtempSync(join(tmpdir(), "pi-runtime-smoke-"));
+const doneExtension = resolve("pi-extension/subagents/subagent-done.ts");
+const cli = resolve("node_modules/.bin/pi");
 const requests: any[] = [];
 let replies: any[] = [];
 const server = createServer(async (req, res) => {
@@ -24,304 +21,261 @@ const server = createServer(async (req, res) => {
   const reply = replies.shift() ?? { text: "SIMULATED_OK" };
   if (reply.delay) await delay(reply.delay);
   if (res.destroyed) return;
-  if (reply.error) {
-    res.writeHead(400, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: { message: "SIMULATED_PROVIDER_ERROR", type: "invalid_request_error" } }));
-    return;
-  }
-  res.writeHead(200, { "Content-Type": "text/event-stream" });
-  const delta = reply.tool
-    ? { role: "assistant", tool_calls: [{ index: 0, id: "sim-call", type: "function", function: { name: reply.tool, arguments: JSON.stringify(reply.args ?? {}) } }] }
-    : { role: "assistant", content: reply.text ?? "SIMULATED_OK" };
-  const chunk = (delta: any, finish_reason: string | null) => ({ id: "sim", object: "chat.completion.chunk", created: 1, model: "role-model", choices: [{ index: 0, delta, finish_reason }] });
+  res.writeHead(reply.status ?? 200, { "Content-Type": reply.status ? "application/json" : "text/event-stream" });
+  if (reply.status) return res.end(JSON.stringify({ error: { message: reply.message ?? "SIMULATED_PROVIDER_ERROR", type: "server_error" } }));
+  const delta = reply.tool ? { role: "assistant", tool_calls: [{ index: 0, id: `call-${requests.length}`, type: "function", function: { name: reply.tool, arguments: JSON.stringify(reply.args ?? {}) } }] } : { role: "assistant", content: reply.text ?? "SIMULATED_OK" };
+  const chunk = (d: any, finish_reason: string | null) => ({ id: "sim", object: "chat.completion.chunk", created: 1, model: "sim-model", choices: [{ index: 0, delta: d, finish_reason }] });
   res.end(`data: ${JSON.stringify(chunk(delta, null))}\n\ndata: ${JSON.stringify(chunk({}, reply.tool ? "tool_calls" : "stop"))}\n\ndata: [DONE]\n\n`);
 });
-await new Promise<void>(done => server.listen(0, "127.0.0.1", done));
+await new Promise<void>(r => server.listen(0, "127.0.0.1", r));
 const port = (server.address() as any).port;
 const children = new Set<ReturnType<typeof spawn>>();
-let sequence = 0;
+let serial = 0;
 
-async function waitFor(check: () => any, detail: () => string = () => "condition", timeout = 12_000) {
-  const deadline = Date.now() + timeout;
-  while (Date.now() < deadline) {
-    const value = check();
-    if (value) return value;
-    await delay(10);
-  }
+async function waitFor(check: () => any, detail: () => string, timeout = 5000) {
+  const until = Date.now() + timeout;
+  while (Date.now() < until) { const value = check(); if (value) return value; await delay(10); }
   throw new Error(`Timed out: ${detail()}`);
 }
-
-function start(fields: string | null, body = "ROLE_MARKER", autoExit = false, herdr = false, terminal?: { task?: string; agent?: string }) {
-  requests.length = 0;
-  replies = [];
-  const dir = join(root, String(++sequence));
+function start(opts: { tools?: string; toolArgs?: string[]; extensions?: string[]; autoRetry?: boolean; retryDelay?: number; terminal?: boolean; initialTask?: string; session?: string; model?: string | null} = {}) {
+  requests.length = 0; replies = [];
+  const dir = join(root, String(++serial)); mkdirSync(join(dir, "config"), { recursive: true });
   const config = join(dir, "config");
-  mkdirSync(join(dir, ".pi/agents"), { recursive: true });
-  mkdirSync(join(config, "agents"), { recursive: true });
-  writeFileSync(join(config, "models.json"), JSON.stringify({ providers: { simulation: {
-    baseUrl: `http://127.0.0.1:${port}/v1`, api: "openai-completions", apiKey: "dummy",
-    models: ["base-model", "role-model"].map(id => ({ id, name: id, reasoning: true, input: ["text"], contextWindow: 100000, maxTokens: 1024, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } })),
-  } } }));
-  writeFileSync(join(config, "settings.json"), JSON.stringify({ retry: { enabled: false }, compaction: { enabled: false } }));
-  const definition = (fields: string, body: string) => `---\nname: host\n${fields}\n---\n${body}\n`;
-  writeFileSync(join(config, "agents/host.md"), definition("model: missing/global", "GLOBAL_MARKER"));
-  if (fields !== null) writeFileSync(join(dir, ".pi/agents/different-filename.md"), definition(fields, body));
-  const log = join(dir, "herdr.log");
-  writeFileSync(log, "");
-  const fakeHerdr = join(dir, "herdr");
-  writeFileSync(fakeHerdr, `#!${process.execPath}\nconst fs = require('node:fs'); const args = process.argv.slice(2); fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(args)+'\\n'); console.log(args[0] === 'integration' ? 'pi: current (v1)' : JSON.stringify({ result: { pane: { pane_id: 'sim:current' } } }));\n`);
-  chmodSync(fakeHerdr, 0o755);
-  const env = { ...process.env, PI_CODING_AGENT_DIR: config, PI_OFFLINE: "1", PI_TELEMETRY: "0", HERDR_BIN_PATH: fakeHerdr };
-  for (const key of Object.keys(env)) if (key.startsWith("HERDR_") && key !== "HERDR_BIN_PATH" || key.startsWith("PI_SUBAGENT_") || key.startsWith("PI_SESSION_")) delete env[key];
-  if (herdr) Object.assign(env, { HERDR_ENV: "1", HERDR_PANE_ID: "sim:original" });
-  const roleFlags = fields === null ? [] : ["--subagent-agent", terminal?.agent ?? "host"];
-  const args = [...cli, ...(terminal ? [] : ["--mode", "rpc"]), "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--session", join(dir, "session.jsonl"), "--model", "simulation/base-model", "-e", extension, ...roleFlags, ...(autoExit ? ["--subagent-exit"] : []), ...(terminal?.task ? ["--", terminal.task] : [])];
-  const command = "exec " + args.map(arg => "'" + arg.replace(/'/g, "'\\''") + "'").join(" ");
-  const child = terminal
+  writeFileSync(join(config, "models.json"), JSON.stringify({ providers: { simulation: { baseUrl: `http://127.0.0.1:${port}/v1`, api: "openai-completions", apiKey: "dummy", models: [{ id: "sim-model", name: "sim-model", reasoning: false, input: ["text"], contextWindow: 32000, maxTokens: 512, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }, { id: "sim-model-2", name: "sim-model-2", reasoning: true, input: ["text"], contextWindow: 32000, maxTokens: 512, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }] } } }));
+  writeFileSync(join(config, "settings.json"), JSON.stringify({ retry: { enabled: opts.autoRetry ?? false, maxRetries: 1, baseDelayMs: opts.retryDelay ?? 30, maxDelayMs: opts.retryDelay ?? 30 }, compaction: { enabled: false } }));
+  const session = opts.session ?? join(dir, "session.jsonl");
+  const env = { ...process.env, PI_CODING_AGENT_DIR: config, PI_OFFLINE: "1", PI_TELEMETRY: "0", PI_SUBAGENT_SESSION: session, PI_SUBAGENT_NAME: "smoke", PI_SUBAGENT_AGENT: "scout", PI_SUBAGENT_AUTO_EXIT: "1" };
+  // Never inherit the harness's real pane or herdr executable.
+  for (const key of Object.keys(env)) {
+    if (key.startsWith("HERDR_") || key.startsWith("PI_SESSION_") || key === "PI_DENY_TOOLS" ||
+        (key.startsWith("PI_SUBAGENT_") && !["PI_SUBAGENT_SESSION", "PI_SUBAGENT_NAME", "PI_SUBAGENT_AGENT", "PI_SUBAGENT_AUTO_EXIT"].includes(key))) delete (env as any)[key];
+  }
+  const args = [...(opts.terminal ? ["--tui-mode", "regular"] : ["--mode", "rpc"]), "--no-skills", "--no-prompt-templates", "--no-themes", "--session", session];
+  // null leaves the model to the loadout args or, on resume, to the session.
+  if (opts.model !== null) args.push("--model", opts.model ?? "simulation/sim-model");
+  for (const ext of [doneExtension, ...(opts.extensions ?? [])]) args.push("-e", ext);
+  if (opts.tools) args.push("--tools", opts.tools);
+  if (opts.toolArgs) args.push(...opts.toolArgs);
+  if (opts.terminal && opts.initialTask) args.push("--", opts.initialTask);
+  const command = "exec " + [cli, ...args].map(arg => "'" + arg.replace(/'/g, "'\\''") + "'").join(" ");
+  const child = opts.terminal
     ? spawn("script", ["-qef", "-E", "never", "/dev/null", "-c", command], { cwd: dir, env: { ...env, SHELL: "/bin/sh", TERM: "xterm-256color" }, stdio: "pipe" })
-    : spawn(args[0], args.slice(1), { cwd: dir, env, stdio: "pipe" });
-  children.add(child);
-  const records: any[] = [];
-  let buffer = "", stderr = "", terminalOutput = "", closed = false, code: number | null = null;
-  child.stdout!.setEncoding("utf8").on("data", data => {
-    if (terminal) { terminalOutput += data; return; }
-    buffer += data;
-    let end: number;
-    while ((end = buffer.indexOf("\n")) >= 0) {
-      const line = buffer.slice(0, end); buffer = buffer.slice(end + 1);
-      if (line.trim()) { try { records.push(JSON.parse(line)); } catch { stderr += line + "\n"; } }
-    }
-  });
-  child.stderr!.setEncoding("utf8").on("data", data => { stderr += data; });
-  child.stdin!.on("error", () => {});
-  child.on("error", error => { stderr += String(error); });
-  child.on("close", value => { closed = true; code = value; children.delete(child); });
-  const diagnostic = () => stderr + "\n" + (terminal ? terminalOutput.slice(-2000) : JSON.stringify(records.slice(-4).map(r => ({ type: r.type, message: r.message?.errorMessage ?? (typeof r.message === "string" ? r.message : undefined), error: r.error }))));
-  let id = 0;
-  return {
-    records, log, dir, diagnostic,
-    get closed() { return closed; },
-    get output() { return terminalOutput; },
-    keys(text: string) { child.stdin!.write(text); },
-    entries() { try { return readFileSync(join(dir, "session.jsonl"), "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line)); } catch { return []; } },
-    send(type: string, params: any = {}) { const key = String(++id); child.stdin!.write(JSON.stringify({ id: key, type, ...params }) + "\n"); return key; },
-    async command(type: string, params: any = {}) {
-      const key = this.send(type, params);
-      return waitFor(() => records.find(r => r.type === "response" && r.id === key), diagnostic);
+    : spawn(cli, args, { cwd: dir, env, stdio: "pipe" }); children.add(child);
+  const records: any[] = []; let buffer = "", stderr = "", terminalOutput = "", closed = false, code: number | null = null; let id = 0;
+  child.stdout!.setEncoding("utf8").on("data", data => { if (opts.terminal) { terminalOutput += data; return; } buffer += data; let end; while ((end = buffer.indexOf("\n")) >= 0) { const line = buffer.slice(0, end); buffer = buffer.slice(end + 1); if (line.trim()) try { records.push(JSON.parse(line)); } catch { stderr += line; } } });
+  child.stderr!.setEncoding("utf8").on("data", d => stderr += d);
+  child.stdin!.on("error", () => {}); child.on("close", c => { closed = true; code = c; children.delete(child); });
+  const diagnostic = () => stderr + (opts.terminal ? terminalOutput.slice(-1000) : JSON.stringify(records.slice(-5).map(r => ({ type: r.type, error: r.error, message: r.message?.errorMessage }))));
+  const send = (type: string, params: any = {}) => { const key = String(++id); child.stdin!.write(JSON.stringify({ id: key, type, ...params }) + "\n"); return key; };
+  return { dir, session, records, diagnostic, get closed() { return closed; }, send,
+    async command(type: string, params: any = {}) { const key = send(type, params); return waitFor(() => records.find(r => r.type === "response" && r.id === key), diagnostic); },
+    // Call only when this test expects autonomous completion, never for a parked question or abort.
+    // The helper requests shutdown while Pi forwards agent_settled, so pi exits by itself.
+    async exited(expectedSettlements = 1) {
+      if (!opts.terminal) await waitFor(() => records.filter(r => r.type === "agent_settled").length >= expectedSettlements, diagnostic);
+      await waitFor(() => closed, diagnostic);
+      assert.equal(code, 0, diagnostic());
     },
-    async exited() { await waitFor(() => closed, diagnostic); assert.equal(code, 0, diagnostic()); },
-    async stop() { if (!closed) { if (terminal) this.keys("\x03/quit\r"); else child.stdin!.end(); } await this.exited(); },
-    calls() { return readFileSync(log, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line)); },
+    async stop() { if (!closed) child.stdin!.end(); await waitFor(() => closed, diagnostic); assert.equal(code, 0, diagnostic()); },
+    sidecar(suffix: string) { try { return JSON.parse(readFileSync(session + suffix, "utf8")); } catch { return null; } },
+    tools() { return requests[0]?.tools?.map((t: any) => t.function.name) ?? []; },
   };
 }
-const role = "model: simulation/role-model\nthinking: high\ntools: read\nsystem-prompt: append";
-const userTexts = (request: any) => request.messages.filter((m: any) => m.role === "user").map((m: any) => typeof m.content === "string" ? m.content : m.content.filter((b: any) => b.type === "text").map((b: any) => b.text).join("\n"));
-after(async () => {
-  for (const child of children) child.kill("SIGKILL");
-  server.closeAllConnections();
-  await new Promise<void>(done => server.close(() => done()));
-  rmSync(root, { recursive: true, force: true });
+const prompt = (h: ReturnType<typeof start>, message = "DO_TASK") => h.send("prompt", { message });
+const sessionEntries = (h: ReturnType<typeof start>) => readFileSync(h.session, "utf8").trim().split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line));
+const lastAssistant = (h: ReturnType<typeof start>) => sessionEntries(h).filter(entry => entry.type === "message" && entry.message.role === "assistant").at(-1)?.message;
+after(async () => { for (const child of children) child.kill("SIGKILL"); server.closeAllConnections(); await new Promise<void>(r => server.close(() => r())); rmSync(root, { recursive: true, force: true }); });
+
+test("Pi 1.1 modifier loadout retains defaults, adds codemode and excludes bash; allowlist includes helper", async () => {
+  const testApi = (await import("../pi-extension/subagents/index.ts")).__test__;
+  const allow = testApi.buildSubagentToolAllowlist("+codemode,-bash");
+  const childArgs: string[] = [];
+  testApi.applySandboxToArgs(childArgs, { toolAllowlist: allow });
+  const h = start({ toolArgs: childArgs });
+  await h.command("get_state"); prompt(h); await h.exited();
+  assert.deepEqual(h.tools().sort(), ["ask_question", "codemode", "edit", "read", "write"].sort());
+  assert.equal(testApi.buildSubagentToolAllowlist("read"), "read,ask_question");
+  assert.deepEqual(allow, "+codemode,-bash,+ask_question");
 });
 
-test("project/hidden role: real model, thinking, prompt, delegation tools and autonomous RPC exit", async () => {
-  const h = start(role.replace("tools: read", "tools: read, safe_bash, subagent\nsubagent_agents: scout\ndisable-model-invocation: true"), "ROLE_MARKER", true);
-  const state = await h.command("get_state");
-  assert.equal(state.data.model.id, "role-model", h.diagnostic());
-  assert.equal(state.data.thinkingLevel, "high");
-  h.send("prompt", { message: "FIRST_TASK" });
-  await h.exited();
-  assert.equal(requests.length, 1, h.diagnostic());
-  assert.match(JSON.stringify(requests[0].messages), /ROLE_MARKER/);
-  assert.doesNotMatch(JSON.stringify(requests[0].messages), /GLOBAL_MARKER/);
-  const names = requests[0].tools.map((t: any) => t.function.name).sort();
-  assert.deepEqual(names, ["read", "safe_bash", "subagent", "subagent_message", "subagents_list"].sort());
-  assert.match(readFileSync(join(h.dir, "session.jsonl"), "utf8"), /subagent_role/);
+test("resume replays the loadout snapshot; a bare resume would drop identity and tools", async () => {
+  const testApi = (await import("../pi-extension/subagents/index.ts")).__test__;
+  const identity = "IDENTITY_MARKER: you are a read-only scout.";
+  const loadout = { agent: "scout", toolAllowlist: testApi.buildSubagentToolAllowlist("read"), model: null, thinking: null,
+    systemPromptMode: "append" as const, identity, spawnable: null, cwd: null, agentDir: null };
+  const launchArgs: string[] = [];
+  testApi.applySandboxToArgs(launchArgs, loadout);
+  const first = start({ toolArgs: launchArgs });
+  await first.command("get_state"); prompt(first); await first.exited();
+  const session = first.session;
+  const lastRequest = () => JSON.stringify(requests.at(-1)?.messages ?? []);
+  const lastTools = () => requests.at(-1)?.tools?.map((t: any) => t.function.name).sort() ?? [];
+  assert.match(lastRequest(), /IDENTITY_MARKER/);
+  assert.deepEqual(lastTools(), ["ask_question", "read"]);
+
+  const resumeArgs: string[] = [];
+  testApi.applySandboxToArgs(resumeArgs, loadout);
+  const resumed = start({ session, toolArgs: resumeArgs });
+  await resumed.command("get_state"); prompt(resumed, "CONTINUE"); await resumed.exited();
+  assert.match(lastRequest(), /IDENTITY_MARKER/, "replayed resume keeps the identity");
+  assert.deepEqual(lastTools(), ["ask_question", "read"], "replayed resume keeps the tool restriction");
+
+  // Control: Pi patches the session to the current flags, so a bare resume loses both.
+  const bare = start({ session });
+  await bare.command("get_state"); prompt(bare, "CONTINUE_BARE"); await bare.exited();
+  assert.doesNotMatch(lastRequest(), /IDENTITY_MARKER/);
+  assert.ok(lastTools().includes("bash"), lastTools().join(","));
 });
 
-test("no exit flag: stays open; default body prepends only the first task; no delegation despite named tools", async () => {
-  const h = start(role.replace("tools: read", "tools: read, subagent, subagent_message, subagents_list").replace("\nsystem-prompt: append", ""));
+test("resume keeps a replace-mode identity and the session's later model/thinking switch", async () => {
+  const testApi = (await import("../pi-extension/subagents/index.ts")).__test__;
+  const loadout = {
+    toolAllowlist: testApi.buildSubagentToolAllowlist("read"), systemPromptMode: "replace",
+    identity: "REPLACE_MARKER: you are a read-only scout.", model: "simulation/sim-model", thinking: null,
+  };
+  const launchArgs: string[] = [];
+  testApi.applySandboxToArgs(launchArgs, loadout);
+  const first = start({ model: null, toolArgs: launchArgs });
+  await first.command("get_state");
+  // The subagent switches model and thinking mid-session; resume must not undo it.
+  assert.equal((await first.command("set_model", { provider: "simulation", modelId: "sim-model-2" })).success, true);
+  assert.equal((await first.command("set_thinking_level", { level: "high" })).success, true);
+  prompt(first); await first.exited();
+  const defaultPreamble = /You are an expert coding assistant/;
+  const lastRequest = () => JSON.stringify(requests.at(-1)?.messages ?? []);
+  assert.match(lastRequest(), /REPLACE_MARKER/);
+  assert.doesNotMatch(lastRequest(), defaultPreamble);
+
+  const resumeArgs: string[] = [];
+  testApi.applySandboxToArgs(resumeArgs, loadout);
+  assert.equal(resumeArgs.includes("--model"), false);
+  const resumed = start({ session: first.session, model: null, toolArgs: resumeArgs });
+  const state = (await resumed.command("get_state")).data;
+  assert.equal(state.model?.id, "sim-model-2", JSON.stringify(state.model));
+  assert.equal(state.thinkingLevel, "high");
+  prompt(resumed, "CONTINUE"); await resumed.exited();
+  assert.equal(requests.at(-1)?.model, "sim-model-2");
+  assert.match(lastRequest(), /REPLACE_MARKER/);
+  assert.doesNotMatch(lastRequest(), defaultPreamble, "replace mode survives resume");
+});
+
+test("an append-mode identity reaches every request, also of a run a subagent's result starts", async () => {
+  const testApi = (await import("../pi-extension/subagents/index.ts")).__test__;
+  const identityArgs: string[] = [];
+  testApi.applySandboxToArgs(identityArgs, { systemPromptMode: "append", identity: "IDENTITY_MARKER: you are a worker." });
+  // Stands in for a delegated child: keeps the worker open, then its result starts another run.
+  const child = join(root, "child-result.ts");
+  writeFileSync(child, `export default (pi:any)=>{let pending=true;(globalThis as any)[Symbol.for("pi-subagents/running-children-count")]=()=>pending?1:0;
+    pi.on("agent_settled",()=>{if(!pending)return;pending=false;setTimeout(()=>pi.sendMessage({customType:"subagent_result",content:"CHILD_RESULT",display:true},{triggerTurn:true,deliverAs:"steer"}),10);});};`);
+  const h = start({ toolArgs: identityArgs, extensions: [child] });
   await h.command("get_state");
-  h.send("prompt", { message: "FIRST_TASK" });
-  await waitFor(() => h.records.some(r => r.type === "agent_end"), h.diagnostic);
-  await delay(100); assert.equal(h.closed, false);
-  assert.match(userTexts(requests[0]).join("\n"), /ROLE_MARKER[\s\S]*FIRST_TASK/);
-  assert.deepEqual(requests[0].tools.map((t: any) => t.function.name), ["read"]);
-  h.send("prompt", { message: "SECOND_TASK" });
-  await waitFor(() => h.records.filter(r => r.type === "agent_end").length === 2, h.diagnostic);
-  assert.equal(userTexts(requests[1]).at(-1), "SECOND_TASK");
-  await h.stop();
+  replies = [{ text: "DISPATCHED" }, { tool: "read", args: { path: "missing.txt" } }, { text: "DONE" }];
+  prompt(h); await h.exited(2);
+  assert.equal(requests.length, 3, h.diagnostic());
+  for (const [index, request] of requests.entries()) assert.match(JSON.stringify(request.messages), /IDENTITY_MARKER/, `request ${index}`);
 });
 
-test("replace system prompt and follow-up queue finish before closing only the confirmed fake pane", async () => {
-  const h = start(role.replace("append", "replace"), "REPLACEMENT_MARKER", true, true);
+test("a prompt survives a child's result starting a run while an earlier input handler prepares it", async () => {
+  // Loaded before this package's extension: a slow input handler (like inline-bash running a
+  // command), during which a child's result arrives and starts a run.
+  const slow = join(root, "slow-input.ts");
+  writeFileSync(slow, `export default (pi:any)=>{let once=false;pi.on("input",async(e:any)=>{if(e.text!=="USER_TASK"||once)return;once=true;
+    pi.sendMessage({customType:"subagent_result",content:"CHILD_RESULT",display:true},{triggerTurn:true,deliverAs:"steer"});
+    await new Promise(r=>setTimeout(r,300));});};`);
+  const extension = resolve("pi-extension/subagents/index.ts");
+  const h = start({ extensions: [slow, extension] });
   await h.command("get_state");
-  replies = [{ delay: 300 }, { text: "FOLLOW_UP_DONE" }];
-  h.send("prompt", { message: "FIRST_TASK" });
-  await waitFor(() => requests.length === 1, h.diagnostic);
-  assert.equal(requests[0].messages[0].content, "REPLACEMENT_MARKER");
-  await h.command("follow_up", { message: "QUEUED_TASK" });
+  replies = [{ delay: 1000, text: "ON_THE_RESULT" }, { text: "BOTH_SEEN" }];
+  prompt(h, "USER_TASK");
   await h.exited();
-  assert.equal(requests.length, 2, h.diagnostic());
-  assert.match(userTexts(requests[1]).join("\n"), /QUEUED_TASK/);
-  await waitFor(() => h.calls().some(c => c[0] === "pane" && c[1] === "close"), h.diagnostic);
-  assert.deepEqual(h.calls().filter(c => c[0] === "pane"), [["pane", "current", "--current"], ["pane", "close", "sim:current"]]);
+  assert.match(JSON.stringify(requests), /USER_TASK/, "the submitted prompt reached the model");
+  assert.match(JSON.stringify(requests), /CHILD_RESULT/);
 });
 
-test("invalid role configurations reject the host task without a model request or herdr initialization", async () => {
-  for (const fields of [null, "model: missing/model", "thinking: turbo", "cli: claude"]) {
-    const h = start(fields, "MUST_NOT_RUN", true, true);
-    // RPC checks startup shutdown requests at the next command boundary.
-    await waitFor(() => h.records.some(r => r.type === "extension_ui_request" && r.notifyType === "error"), h.diagnostic);
-    h.send("prompt", { message: "MUST_NOT_RUN" });
-    await h.exited();
-    assert.equal(requests.length, 0, h.diagnostic());
-    assert.deepEqual(h.calls(), [], h.diagnostic());
-    assert.match(h.diagnostic(), /requires|unavailable|Invalid thinking|only support/);
+test("YAML quoted/list tools become a real CLI loadout", async () => {
+  const config = join(root, "yaml-agent-config"); const cwd = join(root, "yaml-project");
+  mkdirSync(join(config, "agents"), { recursive: true }); mkdirSync(cwd, { recursive: true });
+  const testApi = (await import("../pi-extension/subagents/index.ts")).__test__;
+  for (const [yaml, expectedDefinition, expectedTools] of [
+    ['tools: "read"', "read", ["ask_question", "read"]],
+    ['tools:\n  - "+codemode"\n  - "-bash"', ["+codemode", "-bash"], ["ask_question", "codemode", "edit", "read", "write"]],
+  ] as const) {
+    writeFileSync(join(config, "agents/scout.md"), `---\nname: scout\n${yaml}\n---\nYAML_ROLE_MARKER\n`);
+    const previousCwd = process.cwd(), previousConfig = process.env.PI_CODING_AGENT_DIR;
+    let definition: any;
+    try {
+      process.chdir(cwd); process.env.PI_CODING_AGENT_DIR = config;
+      definition = testApi.loadAgentDefaults("scout");
+    } finally {
+      process.chdir(previousCwd);
+      if (previousConfig === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousConfig;
+    }
+    assert.deepEqual(definition.tools, expectedDefinition);
+    const childArgs: string[] = [];
+    testApi.applySandboxToArgs(childArgs, { toolAllowlist: testApi.buildSubagentToolAllowlist(definition.tools) });
+    const h = start({ toolArgs: childArgs }); await h.command("get_state"); prompt(h); await h.exited();
+    // Provider declarations prove plain read is a true allowlist, not merely a helper string assertion.
+    assert.deepEqual(h.tools().sort(), [...expectedTools].sort());
   }
 });
 
-test("provider error leaves role open; a later successful RPC task can finish", async () => {
-  const h = start(role, "ROLE_MARKER", true);
-  await h.command("get_state"); replies = [{ error: true }];
-  h.send("prompt", { message: "FAIL_TASK" });
-  await waitFor(() => h.records.some(r => r.type === "agent_end"), h.diagnostic);
-  await delay(100); assert.equal(h.closed, false, h.diagnostic());
-  assert.match(JSON.stringify(h.records), /SIMULATED_PROVIDER_ERROR/);
-  h.send("prompt", { message: "RECOVER_TASK" });
-  await h.exited();
-  assert.equal(requests.length, 2);
+test("RPC asks a question without auto-exit; answer permits settled completion", async () => {
+  const h = start(); await h.command("get_state");
+  replies = [{ tool: "ask_question", args: { question: "Which option?" } }, { text: "ANSWERED" }]; prompt(h);
+  await waitFor(() => pendingQuestions(h.session).questions.length > 0 && h.records.some(r => r.type === "agent_settled"), h.diagnostic);
+  const askEntries = readFileSync(h.session, "utf8").trim().split(/\r?\n/).map(line => JSON.parse(line));
+  const persistedAsk = askEntries.filter(entry => entry.type === "message" && entry.message.role === "assistant")
+    .flatMap(entry => entry.message.content ?? []).find(part => part.type === "toolCall" && part.name === "ask_question");
+  assert.ok(persistedAsk, "the question is already durably represented by Pi's native tool call");
+  assert.equal(persistedAsk.arguments.question, "Which option?");
+  // Let the settled exit timer run while parked. Do not send get_state (or end stdin) to manufacture an exit.
+  await delay(100); assert.equal(h.closed, false, h.diagnostic()); assert.equal(h.sidecar(".exit"), null);
+  assert.equal(requests.length, 2); assert.deepEqual(pendingQuestions(h.session).questions, ["Which option?"]);
+  h.send("prompt", { message: "CHOOSE A" }); await h.exited(2);
+  assert.equal(requests.length, 3); assert.match(JSON.stringify(requests[2].messages), /CHOOSE A/); assert.equal(lastAssistant(h).stopReason, "stop"); assert.deepEqual(h.sidecar(".exit"), { type: "done", summary: "SIMULATED_OK" });
 });
 
-test("abort permanently retains the top-level session, even after a later successful task", async () => {
-  const h = start(role, "ROLE_MARKER", true);
-  await h.command("get_state"); replies = [{ delay: 500 }];
-  h.send("prompt", { message: "ABORT_TASK" });
-  await waitFor(() => requests.length === 1, h.diagnostic);
-  await h.command("abort");
-  h.send("prompt", { message: "AFTER_ABORT_TASK" });
-  await waitFor(() => requests.length === 2 && h.records.filter(r => r.type === "agent_end").length === 2, h.diagnostic);
-  await delay(100); assert.equal(h.closed, false, h.diagnostic());
-  await h.stop();
+test("queued follow-up is consumed before settled auto-exit", async () => {
+  const h = start(); await h.command("get_state"); replies = [{ delay: 250 }, { text: "FOLLOWUP_DONE" }]; prompt(h);
+  await waitFor(() => requests.length === 1, h.diagnostic); await h.command("follow_up", { message: "QUEUED_FOLLOWUP" });
+  await h.exited(); assert.equal(requests.length, 2); assert.match(JSON.stringify(requests[1].messages), /QUEUED_FOLLOWUP/);
+  assert.equal(lastAssistant(h).stopReason, "stop"); assert.deepEqual(h.sidecar(".exit"), { type: "done", summary: "FOLLOWUP_DONE" });
 });
 
-test("real spawn tool rejects forbidden, missing and self roles before touching herdr", async () => {
-  for (const [agent, expected] of [["worker", /not in your allowlist/], ["missing", /not in your allowlist/], ["host", /do not start another host/], ["scout", /require herdr/]]) {
-    const h = start(role + "\nsubagent_agents: scout, missing", "ROLE_MARKER", true);
-    await h.command("get_state");
-    replies = [{ tool: "subagent", args: { agent, task: "SIMULATED_CHILD_TASK" } }, { text: "CHECKED" }];
-    h.send("prompt", { message: "DISPATCH_TASK" });
-    await h.exited();
-    assert.equal(requests.length, 2, h.diagnostic());
-    const result = requests[1].messages.find((m: any) => m.role === "tool");
-    assert.match(JSON.stringify(result), expected as RegExp);
-    assert.deepEqual(h.calls(), []);
-  }
+test("agent_before_settle continuation runs before final sidecar", async () => {
+  const inject = join(root, "continue.ts"); const log = join(root, "continuations.log"); writeFileSync(inject, `import {appendFileSync} from "node:fs"; export default (pi:any)=>{let once=false;pi.on("agent_before_settle",()=>{appendFileSync(${JSON.stringify(log)},"boundary\\n");if(!once){once=true;pi.sendUserMessage("BOUNDARY_CONTINUATION",{deliverAs:"followUp"})}});};`);
+  const h = start({ extensions: [inject] }); await h.command("get_state"); prompt(h); await h.exited();
+  assert.ok(readFileSync(log, "utf8").split(/\r?\n/).filter(Boolean).length >= 2); assert.ok(requests.length >= 2); assert.match(JSON.stringify(requests), /BOUNDARY_CONTINUATION/); assert.equal(lastAssistant(h).stopReason, "stop"); assert.deepEqual(h.sidecar(".exit"), { type: "done", summary: "SIMULATED_OK" });
 });
 
-test("real delegation tool execution lists only known allowlisted definitions", async () => {
-  const h = start(role + "\nsubagent_agents: scout, missing", "ROLE_MARKER", true);
-  await h.command("get_state"); replies = [{ tool: "subagents_list" }, { text: "LIST_CHECKED" }];
-  h.send("prompt", { message: "LIST_TASK" });
-  await h.exited();
-  assert.equal(requests.length, 2, h.diagnostic());
-  const result = requests[1].messages.find((m: any) => m.role === "tool");
-  assert.match(JSON.stringify(result), /scout/);
-  assert.doesNotMatch(JSON.stringify(result), /researcher|worker|missing/);
+test("abort parks with a .paused sidecar and no .exit", async () => {
+  const h = start(); await h.command("get_state"); replies = [{ delay: 500 }]; prompt(h);
+  await waitFor(() => requests.length === 1, h.diagnostic); await h.command("abort");
+  await waitFor(() => h.records.some(r => r.type === "agent_settled"), h.diagnostic); assert.deepEqual(h.sidecar(".paused"), {}); assert.equal(h.sidecar(".exit"), null); await h.stop();
 });
 
-const assistantMessages = (h: ReturnType<typeof start>) => h.entries().filter(e => e.type === "message" && e.message?.role === "assistant").map(e => e.message);
-
-test("terminal: positional task applies project role, model, thinking and tools, then exits", async () => {
-  const h = start(role.replace("tools: read", "tools: read, safe_bash\nsubagent_agents: scout"), "ROLE_MARKER", true, true, { task: "CLI INITIAL TASK" });
-  await h.exited();
-  assert.equal(requests.length, 1, h.diagnostic());
-  assert.equal(requests[0].model, "role-model");
-  assert.match(userTexts(requests[0]).join("\n"), /CLI INITIAL TASK/);
-  assert.match(JSON.stringify(requests[0].messages), /ROLE_MARKER/);
-  assert.doesNotMatch(JSON.stringify(requests[0].messages), /GLOBAL_MARKER/);
-  assert.deepEqual(requests[0].tools.map((t: any) => t.function.name).sort(), ["read", "safe_bash", "subagent", "subagent_message", "subagents_list"].sort());
-  assert.ok(h.entries().some(e => e.type === "thinking_level_change" && e.thinkingLevel === "high"));
-  await waitFor(() => h.calls().some(c => c[1] === "close"), h.diagnostic);
-  assert.deepEqual(h.calls().filter(c => c[0] === "pane"), [["pane", "current", "--current"], ["pane", "close", "sim:current"]]);
+test("retry transient failure does not write exit until successful settled retry", async () => {
+  const h = start({ autoRetry: true, retryDelay: 40 }); await h.command("get_state"); replies = [{ status: 429 }, { text: "RECOVERED" }]; prompt(h);
+  await waitFor(() => h.records.some(r => r.type === "auto_retry_start"), h.diagnostic);
+  await delay(10); assert.equal(h.sidecar(".exit"), null); await h.exited(); assert.equal(requests.length, 2); assert.equal(lastAssistant(h).stopReason, "stop"); assert.deepEqual(h.sidecar(".exit"), { type: "done", summary: "RECOVERED" });
 });
 
-test("terminal: role without exit flag stays interactive and prepends body only once", async () => {
-  const h = start(role.replace("\nsystem-prompt: append", ""), "ROLE_MARKER", false, false, { task: "FIRST_CLI_TASK" });
-  await waitFor(() => assistantMessages(h).length === 1, h.diagnostic);
-  await delay(200); assert.equal(h.closed, false);
-  h.keys("SECOND_CLI_TASK\r");
-  await waitFor(() => assistantMessages(h).length === 2, h.diagnostic);
-  assert.match(userTexts(requests[0]).join("\n"), /ROLE_MARKER[\s\S]*FIRST_CLI_TASK/);
-  assert.equal(userTexts(requests[1]).at(-1), "SECOND_CLI_TASK");
-  await h.stop();
+test("final provider error writes error sidecar after retry exhaustion", async () => {
+  const h = start({ autoRetry: true, retryDelay: 10 }); await h.command("get_state"); replies = [{ status: 429, message: "FINAL_SIMULATED_ERROR" }, { status: 429, message: "FINAL_SIMULATED_ERROR" }]; prompt(h);
+  await h.exited(); assert.equal(h.sidecar(".exit")?.type, "error"); assert.equal(lastAssistant(h).stopReason, "error"); assert.match(lastAssistant(h).errorMessage, /FINAL_SIMULATED_ERROR/);
 });
 
-test("terminal: role with no positional task accepts initial keyboard input without takeover", async () => {
-  const h = start(role, "ROLE_MARKER", true, false, {});
-  await waitFor(() => h.output.includes("role-model"), h.diagnostic);
-  await delay(200); assert.equal(requests.length, 0);
-  h.keys("FIRST_TYPED_TASK\r");
-  await h.exited();
-  assert.equal(requests.length, 1, h.diagnostic());
-  assert.match(userTexts(requests[0]).join("\n"), /FIRST_TYPED_TASK/);
+test("real PTY modifier loadout exits naturally after settled task", async () => {
+  const testApi = (await import("../pi-extension/subagents/index.ts")).__test__;
+  const args: string[] = [];
+  testApi.applySandboxToArgs(args, { toolAllowlist: testApi.buildSubagentToolAllowlist("+codemode,-bash") });
+  const h = start({ terminal: true, initialTask: "PTY_TASK", toolArgs: args }); await h.exited();
+  assert.equal(requests.length, 1); assert.equal(lastAssistant(h).stopReason, "stop"); assert.deepEqual(h.sidecar(".exit"), { type: "done", summary: "SIMULATED_OK" });
 });
 
-test("terminal: invalid roles report errors and exit without any extra input", async () => {
-  const cases: Array<[string | null, string | undefined, RegExp]> = [
-    [role, "unknown-role", /Unknown agent role/],
-    ["model: missing/model", undefined, /Model unavailable/],
-    ["thinking: turbo", undefined, /Invalid thinking/],
-    ["cli: claude", undefined, /only support pi/],
-    [null, undefined, /requires --subagent-agent/],
-  ];
-  for (const [fields, agent, error] of cases) {
-    const h = start(fields, "MUST_NOT_RUN", true, true, { agent, task: "MUST_NOT_RUN" });
-    await h.exited();
-    assert.equal(requests.length, 0, h.diagnostic());
-    assert.deepEqual(h.calls(), []);
-    assert.match(h.output, error);
-  }
-});
-
-test("terminal: typing takes over the session and survives /reload", async () => {
-  const h = start(role, "ROLE_MARKER", true, true, { task: "SLOW_TASK" });
-  replies = [{ delay: 500 }];
-  await waitFor(() => requests.length === 1, h.diagnostic);
-  h.keys("HUMAN_DRAFT");
-  await waitFor(() => assistantMessages(h).length === 1, h.diagnostic);
-  await delay(200); assert.equal(h.closed, false, h.diagnostic());
-  h.keys("\x03/reload\r");
-  await waitFor(() => h.output.includes("Reloaded keybindings"), h.diagnostic);
-  h.keys("AFTER_RELOAD_TASK\r");
-  await waitFor(() => assistantMessages(h).length === 2, h.diagnostic);
-  await delay(200); assert.equal(h.closed, false, h.diagnostic());
-  assert.match(userTexts(requests[1]).join("\n"), /AFTER_RELOAD_TASK/);
-  assert.ok(!h.calls().some(c => c[1] === "close"));
-  await h.stop();
-});
-
-test("terminal: Escape abort retains the session after the next completed task", async () => {
-  const h = start(role, "ROLE_MARKER", true, false, { task: "ABORT_TASK" });
-  replies = [{ delay: 1000 }];
-  await waitFor(() => requests.length === 1, h.diagnostic);
-  h.keys("\x1b");
-  await waitFor(() => assistantMessages(h).some(m => m.stopReason === "aborted"), h.diagnostic);
-  await delay(200); assert.equal(h.closed, false);
-  h.keys("\x03AFTER_ESCAPE_TASK\r");
-  await waitFor(() => assistantMessages(h).some(m => m.stopReason === "stop"), h.diagnostic);
-  await delay(200); assert.equal(h.closed, false, h.diagnostic());
-  await h.stop();
-});
-
-test("terminal: provider error leaves pane open for a human follow-up", async () => {
-  const h = start(role, "ROLE_MARKER", true, true, { task: "FAIL_TASK" });
-  replies = [{ error: true }];
-  await waitFor(() => assistantMessages(h).some(m => m.stopReason === "error"), h.diagnostic);
-  await delay(200); assert.equal(h.closed, false, h.diagnostic());
-  assert.match(h.output, /SIMULATED_PROVIDER_ERROR/);
-  h.keys("RETRY_TASK\r");
-  await waitFor(() => assistantMessages(h).some(m => m.stopReason === "stop"), h.diagnostic);
-  await delay(200); assert.equal(h.closed, false, h.diagnostic());
-  assert.ok(!h.calls().some(c => c[1] === "close"));
-  await h.stop();
+test("real PTY drains agent_end follow-up before naturally exiting", async () => {
+  const inject = join(root, "pty-followup.ts");
+  writeFileSync(inject, `export default (pi:any)=>{let once=false;pi.on("agent_end",()=>{if(!once){once=true;pi.sendUserMessage("PTY_FOLLOWUP",{deliverAs:"followUp"})}})};`);
+  const h = start({ terminal: true, initialTask: "PTY_FIRST_TASK", extensions: [inject] }); await h.exited();
+  assert.equal(requests.length, 2); assert.match(JSON.stringify(requests[1].messages), /PTY_FOLLOWUP/); assert.equal(lastAssistant(h).stopReason, "stop"); assert.deepEqual(h.sidecar(".exit"), { type: "done", summary: "SIMULATED_OK" });
 });

@@ -1,0 +1,329 @@
+// Standalone, opt-in: node test/session-e2e.ts
+// Real local Pi 1.1 + production herdr helpers, with a registered in-memory model.
+// Every native CLI invocation is pinned to an owned named server, never the caller's server.
+import assert from "node:assert/strict";
+import { execFile, execFileSync, spawn } from "node:child_process";
+import { promisify } from "node:util";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { dirname, join, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
+import { setTimeout as sleep } from "node:timers/promises";
+import { closeSurface, startAgent, steer, waitForExit } from "../pi-extension/subagents/herdr.ts";
+
+assert.notEqual(process.platform, "win32", "This private PTY fixture needs a POSIX shell.");
+const repo = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const realHerdr = execFileSync("/bin/sh", ["-c", "command -v herdr"], { encoding: "utf8" }).trim();
+const bash = execFileSync("/bin/sh", ["-c", "command -v bash"], { encoding: "utf8" }).trim();
+const piCLI = join(repo, "node_modules/@earendil-works/pi-coding-agent/dist/cli.js");
+const installedIntegration = join(homedir(), ".pi/agent/extensions/herdr-agent-state.ts");
+assert.ok(existsSync(installedIntegration), "Install the official herdr Pi integration first.");
+assert.ok(existsSync(piCLI), "Install this repository's local Pi 1.1 dependencies first.");
+const originalEnv = { ...process.env };
+const base = mkdtempSync(join(tmpdir(), "pi-session-e2e-"));
+const server = `pi-session-e2e-${process.pid}-${Date.now().toString(36)}`;
+const project = join(base, "project"), agentDir = join(base, "agent"), binDir = join(base, "bin");
+const auditFile = join(base, "herdr-calls.jsonl");
+const integration = join(agentDir, "extensions/herdr-agent-state.ts");
+const fixture = join(agentDir, "extensions/session-fixture.ts");
+const done = join(repo, "pi-extension/subagents/subagent-done.ts");
+const exec = promisify(execFile);
+const quote = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
+const controllers: AbortController[] = [];
+const watches: Promise<unknown>[] = [];
+let daemon: ReturnType<typeof spawn> | undefined;
+let ownsServer = false;
+
+async function cli(args: string[], raw = false): Promise<any> {
+  const { stdout } = await exec(realHerdr, ["--session", server, ...args], {
+    env: process.env, encoding: "utf8", timeout: 20_000, maxBuffer: 2 * 1024 * 1024,
+  });
+  if (raw || !stdout.trim()) return stdout;
+  const reply = JSON.parse(stdout);
+  if (reply.error) throw new Error(JSON.stringify(reply.error));
+  return reply.result;
+}
+async function wait<T>(get: () => T | Promise<T>, label: string, timeout = 30_000): Promise<NonNullable<T>> {
+  const until = Date.now() + timeout;
+  let last: unknown;
+  while (Date.now() < until) {
+    try { const value = await get(); if (value) return value as NonNullable<T>; }
+    catch (error) { last = error; }
+    await sleep(100);
+  }
+  throw new Error(`Timed out: ${label}${last ? `; last error: ${last}` : ""}`);
+}
+const live = async () => (await cli(["agent", "list"])).agents as any[];
+const entries = (file: string): any[] => {
+  try { return readFileSync(file, "utf8").split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line)); }
+  catch (error: any) { if (error.code === "ENOENT") return []; throw error; }
+};
+const received = (file: string, text: string) => entries(file).some(e => e.type === "message" && e.message.role === "user" && JSON.stringify(e.message.content).includes(text));
+const answered = (file: string, text: string) => entries(file).some(e => e.type === "message" && e.message.role === "assistant" && JSON.stringify(e.message.content).includes(text));
+const audit = () => entries(auditFile);
+async function gone(pane: string) {
+  await wait(async () => {
+    try { await cli(["pane", "get", pane]); return false; }
+    catch (error: any) {
+      // A failed socket/CLI request is not proof the pane vanished.
+      for (const output of [error.stdout, error.stderr]) {
+        try { if (JSON.parse(output).error?.code === "pane_not_found") return true; } catch {}
+      }
+      throw error;
+    }
+  }, `${pane} removed`);
+}
+const plan = (tag: string, gate?: string, error?: string) => `SESSION_E2E:${JSON.stringify({ tag, steps: gate ? [{ tool: "session_e2e_gate", args: { gate } }] : [], error })}`;
+function watch(agent: string, file: string) {
+  const controller = new AbortController(); controllers.push(controller);
+  const ticks: { status: string | null; pane?: string }[] = [];
+  const result = waitForExit(agent, controller.signal, {
+    interval: 100, sessionFile: file,
+    onTick(status, pane) { ticks.push({ status, pane }); },
+  });
+  // Attach a rejection handler immediately, including when assertions fail before awaiting it.
+  watches.push(result.catch(() => {}));
+  return { result, ticks };
+}
+// The extensible options also allow future error/start-failure cases without changing production interfaces.
+async function launch(name: string, options: { autoExit?: boolean; prompt?: string; args?: string[] } = {}) {
+  const file = join(project, `${name}.jsonl`);
+  const started = await startAgent({
+    name, cwd: project,
+    env: { HERDR_BIN_PATH: join(binDir, "herdr-private"), PI_SUBAGENT_SESSION: file, PI_SUBAGENT_NAME: name, PI_SUBAGENT_AGENT: "session-e2e", PI_SUBAGENT_AUTO_EXIT: options.autoExit === false ? "0" : "1" },
+    args: ["--session", file, "--offline", "--no-extensions", "--no-mcp", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--no-approve",
+      "-e", integration, "-e", fixture, "-e", done, "--model", "session-e2e/scripted", "--thinking", "off", "--tools", "session_e2e_gate", ...(options.args ?? [])],
+    prompt: options.prompt,
+  });
+  return { ...started, file };
+}
+async function moved(pane: string, label: string) {
+  const result = await cli(["pane", "move", pane, "--new-workspace", "--no-focus", "--label", label]);
+  const current = result.move_result?.pane?.pane_id;
+  assert.equal(typeof current, "string", JSON.stringify(result));
+  assert.notEqual(current, pane, "Cross-workspace move must change the public pane ID.");
+  return current as string;
+}
+
+try {
+  for (const dir of [project, binDir, join(agentDir, "extensions"), join(base, "home"), join(base, "xdg")]) mkdirSync(dir, { recursive: true });
+  copyFileSync(installedIntegration, integration); // Never install/update the user's managed extension.
+  const privateEnv = { ...originalEnv };
+  for (const key of Object.keys(privateEnv)) {
+    if (key.startsWith("HERDR_") || key.startsWith("PI_SUBAGENT_") || key.startsWith("PI_SESSION_") || key.startsWith("PI_CODING_AGENT_") || key === "PI_DENY_TOOLS" || key === "BASH_ENV" || key === "ENV") delete privateEnv[key];
+  }
+  Object.assign(privateEnv, {
+    HOME: join(base, "home"), XDG_CONFIG_HOME: join(base, "xdg"),
+    HERDR_CONFIG_PATH: join(base, "herdr.toml"), HERDR_BIN_PATH: join(binDir, "herdr-private"),
+    PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1", PI_TELEMETRY: "0", PI_SESSION_E2E: server,
+    PI_SUBAGENT_MIN_COLUMNS: "10000", PI_SUBAGENT_MIN_ROWS: "10000", // Stable background-tab topology.
+    PATH: `${binDir}:${originalEnv.PATH ?? ""}`, TERM: "xterm-256color",
+  });
+  for (const key of Object.keys(process.env)) delete process.env[key];
+  Object.assign(process.env, privateEnv);
+  writeFileSync(join(binDir, "pi"), `#!/bin/sh\nexec ${quote(process.execPath)} ${quote(piCLI)} "$@"\n`, { mode: 0o700 });
+  writeFileSync(join(binDir, "shell"), `#!/bin/sh\nexec ${quote(bash)} --noprofile --norc -i\n`, { mode: 0o700 });
+  writeFileSync(join(base, "herdr.toml"), `onboarding = false\n[terminal]\ndefault_shell = ${JSON.stringify(join(binDir, "shell"))}\nshell_mode = "non_login"\n[update]\nversion_check = false\nmanifest_check = false\n[session]\nresume_agents_on_restore = false\n`);
+  writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ retry: { enabled: false }, compaction: { enabled: false }, cacheWarming: "off" }));
+  // This wrapper is also inherited by detached child closers. The literal named-server
+  // prefix and removal of socket selectors prevent any fallback to the harness server.
+  writeFileSync(join(binDir, "herdr-private"), `#!${process.execPath}
+const {execFileSync} = require("node:child_process");
+const {appendFileSync} = require("node:fs");
+const args = process.argv.slice(2), env = {...process.env};
+delete env.HERDR_SOCKET_PATH; delete env.HERDR_SESSION; delete env.HERDR_SESSION_NAME;
+let stdout = "", stderr = "", code = 0;
+try { stdout = execFileSync(${JSON.stringify(realHerdr)}, ["--session", ${JSON.stringify(server)}, ...args], {env, encoding:"utf8", timeout:15000, stdio:["ignore","pipe","pipe"]}); }
+catch (e) { stdout = e.stdout || ""; stderr = e.stderr || ""; code = typeof e.status === "number" ? e.status : 1; }
+appendFileSync(${JSON.stringify(auditFile)}, JSON.stringify({args, session:process.env.PI_SUBAGENT_SESSION, inheritedPane:process.env.HERDR_PANE_ID, stdout, stderr, code})+"\\n");
+process.stdout.write(stdout); process.stderr.write(stderr); process.exit(code);
+`, { mode: 0o700 });
+  // The fixture registers only an in-memory provider: no localhost HTTP service or external model traffic.
+  writeFileSync(fixture, `import {fauxProvider,fauxAssistantMessage,fauxToolCall} from ${JSON.stringify(fileURLToPath(import.meta.resolve("@earendil-works/pi-ai")))};
+import {Type} from ${JSON.stringify(fileURLToPath(import.meta.resolve("typebox")))};
+import {existsSync,appendFileSync} from "node:fs";
+import {resolve,sep} from "node:path";
+import {setTimeout as sleep} from "node:timers/promises";
+import {execFileSync} from "node:child_process";
+export default function(pi:any) {
+ if (process.env.PI_SESSION_E2E !== ${JSON.stringify(server)}) throw new Error("Not an owned session-e2e server");
+ const faux=fauxProvider({provider:"session-e2e",models:[{id:"scripted",contextWindow:1000000}]});
+ const respond=(ctx:any)=>{
+  // Replay system messages in order, as a provider does, for the effective prompt and tools.
+  const sections:any={},tools=new Set<string>();let text="";
+  for(const m of ctx.messages){if(m.role!=="system")continue;
+   text+=typeof m.content==="string"?m.content:m.content.map((c:any)=>c.text??"").join("");
+   for(const [k,v] of Object.entries(m.sections??{})){if(v===null)delete sections[k];else sections[k]=v;}
+   for(const t of m.toolsAdded??[])tools.add(t.name);for(const t of m.toolsRemoved??[])tools.delete(t.name);}
+  for(const t of ctx.tools??[])tools.add(t.name);
+  const prompt=(ctx.systemPrompt??"")+text+Object.values(sections).join("\\n");
+  appendFileSync(${JSON.stringify(join(base, "requests.jsonl"))},JSON.stringify({session:process.env.PI_SUBAGENT_SESSION,tools:[...tools].sort(),identity:prompt.includes("E2E_IDENTITY_MARKER")})+"\\n");
+  let index=-1,plan:any;
+  for(let i=ctx.messages.length-1;i>=0;i--){
+   const m=ctx.messages[i];if(m.role!=="user")continue;
+   const text=typeof m.content==="string"?m.content:m.content.filter((c:any)=>c.type==="text").map((c:any)=>c.text).join("\\n");
+   const match=text.match(/SESSION_E2E:(\\{[^\\n]+\\})/);
+   if(match){index=i;plan=JSON.parse(match[1]);break;}
+  }
+  if(!plan) return fauxAssistantMessage("NOTED");
+  if(plan.error)return fauxAssistantMessage("",{stopReason:"error",errorMessage:plan.error});
+  const n=ctx.messages.slice(index+1).filter((m:any)=>m.role==="toolResult").length;
+  const step=plan.steps[n];return step?fauxAssistantMessage(fauxToolCall(step.tool,step.args)):fauxAssistantMessage("RESULT:"+plan.tag);
+ };
+ faux.setResponses(Array.from({length:200},()=>respond)); pi.registerProvider(faux.provider);
+ pi.registerTool({name:"session_e2e_gate",label:"Private gate",description:"Wait for an owned test barrier.",parameters:Type.Object({gate:Type.String()}),
+  async execute(_id:any,args:any,signal:any,_update:any,ctx:any){
+   const file=resolve(ctx.cwd,args.gate);if(!file.startsWith(resolve(ctx.cwd)+sep))throw new Error("Non-private barrier");
+   appendFileSync(${JSON.stringify(join(base, "tools.jsonl"))},JSON.stringify({session:ctx.sessionManager.getSessionFile(),gate:args.gate})+"\\n");
+   while(!existsSync(file))await sleep(50,undefined,{signal});
+   return {content:[{type:"text",text:"gate released"}],details:undefined};
+  }});
+}
+`);
+  const piVersion = execFileSync(process.execPath, [piCLI, "--version"], { encoding: "utf8" }).trim();
+  assert.equal(piVersion, "1.1.0", "Use the repository's real Pi 1.1.0, not a global CLI.");
+  console.log(`${execFileSync(realHerdr, ["--version"], { encoding: "utf8" }).trim()} / pi ${piVersion}; private server ${server}`);
+  // Refuse an existing server, including if the probe fails for an unexpected reason.
+  await assert.rejects(cli(["agent", "list"]), (error: any) => {
+    for (const output of [error.stdout, error.stderr]) {
+      try { if (JSON.parse(output).error?.code === "server_not_running") return true; } catch {}
+    }
+    return false;
+  });
+  daemon = spawn(realHerdr, ["--session", server, "server"], { env: privateEnv, stdio: "pipe" });
+  ownsServer = true;
+  let daemonLog = "";
+  daemon.stdout?.on("data", data => { daemonLog += data; });
+  daemon.stderr?.on("data", data => { daemonLog += data; });
+  daemon.on("error", error => { daemonLog += String(error); });
+  await wait(() => cli(["agent", "list"]), `private server startup: ${daemonLog}`);
+  assert.equal((await live()).length, 0);
+  const parent = await cli(["workspace", "create", "--no-focus", "--label", "session-e2e-parent", "--cwd", project]);
+  Object.assign(process.env, { HERDR_ENV: "1", HERDR_PANE_ID: parent.root_pane.pane_id, HERDR_WORKSPACE_ID: parent.workspace.workspace_id, HERDR_TAB_ID: parent.tab.tab_id });
+  await sleep(300); // The newly created shell must reach its interactive prompt.
+
+  // The herdr agent name follows the agent across a cross-workspace move (its pane id changes).
+  const normal = await launch("normal-child", { prompt: plan("normal-initial", "normal-release") });
+  const normalWatch = watch(normal.agent, normal.file);
+  await wait(() => normalWatch.ticks.some(t => t.status === "working"), "normal child working");
+  const normalPane = await moved(normal.surface, "normal-moved");
+  await wait(() => normalWatch.ticks.some(t => t.pane === normalPane && t.status === "working"), "watcher follows the moved pane by name");
+  await steer(normal.agent, plan("steered-after-move")); // Queue while its private gate is running.
+  writeFileSync(join(project, "normal-release"), "released");
+  await wait(() => received(normal.file, "steered-after-move"), "steering by name reached the moved agent");
+  assert.deepEqual(await normalWatch.result, { reason: "done", exitCode: 0, summary: "RESULT:steered-after-move" });
+  assert.ok(answered(normal.file, "RESULT:steered-after-move"));
+  // pi exited and left its pane at a shell prompt; the parent closes the last observed pane.
+  await closeSurface(normalWatch.ticks.at(-1)!.pane!);
+  await gone(normalPane);
+  console.log("PASS: start, name-based supervision and steering across a move, parent closes the finished pane");
+
+  // Closing an autonomous subagent's pane mid-task ends it early: a failure, never a success.
+  const cancelled = await launch("cancel-child", { prompt: plan("cancel", "cancel-release") });
+  const cancelWatch = watch(cancelled.agent, cancelled.file);
+  await wait(() => cancelWatch.ticks.some(t => t.status === "working"), "cancel child working");
+  await closeSurface(cancelled.surface);
+  await gone(cancelled.surface);
+  const cancellation = await cancelWatch.result;
+  assert.equal(cancellation.reason, "quit", JSON.stringify(cancellation));
+  assert.equal(cancellation.exitCode, 1);
+  console.log(`PASS: closing a running autonomous subagent's pane reports failure (${cancellation.reason})`);
+
+  // ── Real extension: spawn → finish → resume by name ──
+
+  mkdirSync(join(agentDir, "agents"), { recursive: true });
+  writeFileSync(join(agentDir, "agents", "e2e-scout.md"), [
+    "---", "name: e2e-scout", "description: e2e read-only scout", "model: session-e2e/scripted", "thinking: off",
+    "tools: -edit,-write,+session_e2e_gate", "system-prompt: append", "auto-exit: true", "---",
+    "E2E_IDENTITY_MARKER: you are a read-only scout.", "",
+  ].join("\n"));
+  const parentSession = join(project, "parent.jsonl");
+  writeFileSync(parentSession, JSON.stringify({ type: "session", id: "parent-e2e", version: 3, cwd: project, timestamp: new Date().toISOString() }) + "\n");
+  const ext = await import("../pi-extension/subagents/index.ts");
+  const tools: any[] = [], delivered: any[] = [];
+  ext.default({
+    on() {}, registerTool(tool: any) { tools.push(tool); }, registerCommand() {}, registerMessageRenderer() {}, registerShortcut() {},
+    sendUserMessage() {}, sendMessage(message: any) { delivered.push(message); }, getAllTools() { return []; },
+  } as any);
+  const tool = (name: string) => tools.find(t => t.name === name);
+  const ctx = { cwd: project, sessionManager: { getSessionFile: () => parentSession, getSessionDir: () => join(project, "parent-sessions"), getSessionId: () => "parent-e2e" } };
+  const finished = (tag: string) => wait(() => delivered.find(m => JSON.stringify(m).includes(`RESULT:${tag}`)), `result ${tag} delivered`, 60_000);
+  const requestsFor = (file: string) => entries(join(base, "requests.jsonl")).filter(r => resolve(r.session) === resolve(file));
+  const spawned = await tool("subagent").execute("call-1", { name: "resumable", agent: "e2e-scout", task: plan("first-run") }, undefined, undefined, ctx);
+  assert.equal(spawned.details?.error, undefined, JSON.stringify(spawned));
+  await finished("first-run");
+  const childFile = ext.__test__.runningSubagents.size === 0
+    ? JSON.parse(readFileSync(join(project, "parent-sessions", "artifacts", "parent-e2e", "subagent-registry.json"), "utf8")).resumable.sessionFile
+    : assert.fail("child still tracked after completion");
+  // The parent closes the finished child's pane (it is labelled with the subagent name).
+  await wait(async () => !(await cli(["pane", "list"])).panes.some((pane: any) => pane.label === "resumable"), "finished child pane closed by the parent");
+  const first = requestsFor(childFile);
+  assert.ok(first.length > 0, "first run reached the model");
+  assert.ok(first.every(r => r.identity), "profile identity reached the model on first run");
+  assert.deepEqual(first.at(-1).tools, ["ask_question", "read", "bash", "session_e2e_gate"].sort());
+
+  const resumed = await tool("subagent_message").execute("call-2", { name: "resumable", message: plan("after-resume") }, undefined, undefined, ctx);
+  assert.equal(resumed.details?.error, undefined, JSON.stringify(resumed));
+  await finished("after-resume");
+  const afterResume = requestsFor(childFile).slice(first.length);
+  assert.ok(afterResume.length > 0, "resume reached the model");
+  assert.ok(afterResume.every(r => r.identity), "identity survives resume: " + JSON.stringify(afterResume));
+  assert.deepEqual(afterResume.at(-1).tools, first.at(-1).tools, "tool restriction survives resume");
+
+  // Control: a bare resume really loses both, so the checks above have teeth.
+  const bare = await startAgent({
+    name: "bare-resume", cwd: project,
+    env: { PI_SUBAGENT_SESSION: childFile, PI_SUBAGENT_NAME: "bare-resume", PI_SUBAGENT_AUTO_EXIT: "1" },
+    args: ["--session", childFile, "-e", done], prompt: plan("bare-resume"),
+  });
+  await watch(bare.agent, childFile).result;
+  const bareRequests = requestsFor(childFile).slice(first.length + afterResume.length);
+  assert.ok(bareRequests.length > 0);
+  assert.equal(bareRequests.at(-1).identity, false, "bare resume drops the identity");
+  assert.ok(bareRequests.at(-1).tools.includes("write"), "bare resume restores default tools");
+  await closeSurface(bare.surface);
+  await gone(bare.surface);
+  console.log("PASS: real extension spawn+resume keeps identity and tools and closes finished panes; bare resume control loses them");
+
+  // Optional failure coverage; launch.args also permits future CLI/start-failure probes.
+  if (originalEnv.PI_SESSION_E2E_ERRORS === "1") {
+    const failed = await launch("error-child", { prompt: plan("error", undefined, "SESSION_E2E_PROVIDER_ERROR") });
+    const failure = await watch(failed.agent, failed.file).result;
+    assert.equal(failure.reason, "error"); assert.match(failure.errorMessage!, /SESSION_E2E_PROVIDER_ERROR/);
+    await closeSurface(failed.surface);
+    await gone(failed.surface);
+    console.log("PASS: provider error sidecar");
+  }
+  console.log(`PASS: isolated session e2e (${server})`);
+} catch (error) {
+  if (ownsServer) {
+    try {
+      console.error("Private agents:", JSON.stringify(await live()));
+      const panes = (await cli(["pane", "list"])).panes;
+      for (const pane of panes) console.error(pane.pane_id, await cli(["pane", "read", pane.pane_id, "--source", "recent-unwrapped", "--lines", "30"], true));
+    } catch {}
+  }
+  throw error;
+} finally {
+  for (const controller of controllers) controller.abort();
+  await Promise.allSettled(watches);
+  try {
+    if (ownsServer) {
+      // Stop only our literal named server. No workspace/pane cleanup targets caller state.
+      await cli(["session", "stop", server], true);
+      if (daemon && daemon.exitCode === null && daemon.signalCode === null) {
+        await new Promise<void>((resolveExit, reject) => {
+          const timer = setTimeout(() => reject(new Error("Owned herdr server did not stop")), 10_000);
+          daemon!.once("exit", () => { clearTimeout(timer); resolveExit(); });
+        });
+      }
+      await cli(["session", "delete", server], true);
+    }
+  } finally {
+    // Never kill an inherited herdr process; this handle belongs solely to spawn above.
+    if (daemon && daemon.exitCode === null && daemon.signalCode === null) daemon.kill("SIGTERM");
+    for (const key of Object.keys(process.env)) delete process.env[key];
+    Object.assign(process.env, originalEnv);
+    rmSync(base, { recursive: true, force: true });
+  }
+}
