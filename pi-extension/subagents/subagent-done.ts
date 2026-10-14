@@ -15,9 +15,9 @@
 import { parseFrontmatter, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { appendFileSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
-import { findLastAssistantMessage, publishQuestion, type SessionEntry } from "./session.ts";
+import { findLastAssistantMessage, pendingInboxMessages, publishQuestion, type SessionEntry } from "./session.ts";
 
 /**
  * Number of child subagents this session itself still has in flight.
@@ -38,14 +38,9 @@ export function runningChildrenCount(): number {
   return (globalThis as any)[Symbol.for("pi-subagents/running-children-count")]?.() ?? 0;
 }
 
-/**
- * Escape ends a turn as `aborted`, or, when it interrupts a running tool, as
- * `error` with an abort message. Keep this fallback for the last assistant
- * message alongside the structured settled event's `aborted` flag.
- */
+/** Pi marks Escape aborts on the assistant message or settled event. */
 export function wasAborted(message: any): boolean {
-  return message?.stopReason === "aborted" ||
-    (message?.stopReason === "error" && /operation was aborted|AbortError/i.test(String(message.errorMessage ?? "")));
+  return message?.stopReason === "aborted";
 }
 
 export interface SubagentErrorInfo {
@@ -106,9 +101,6 @@ function skillBlock(pi: ExtensionAPI, name: string): string {
   }
 }
 
-/** The envelope of an orchestrator's message, `[subagent-delivery:<id>]` on a line of its own. */
-export const DELIVERY_ENVELOPE = /^\[subagent-delivery:([\w-]+)\]\n/;
-
 /** A task whose prompt starts no run in this long was refused by Pi; it starts one in ms, or s for an OAuth refresh. */
 export const RUN_START_TIMEOUT = 30_000;
 
@@ -156,11 +148,35 @@ export default function (pi: ExtensionAPI) {
   let finished = false;
   // A done task found Pi still busy (a manual /compact): it exits when that ends.
   let exitAfterCompaction = false;
+  let exitAfterInbox = false;
   // Kept process-wide so a /reload, which re-runs this factory, does not forget it.
   const state = ((globalThis as any)[CHILD_STATE_KEY] ??= newChildState(null)) as ChildState;
   // Why a task never started a run: Pi refuses a prompt without a model or credentials before any.
   let startError: SubagentErrorInfo | null = null;
   let runPending: ReturnType<typeof setTimeout> | undefined;
+  let inboxTimer: ReturnType<typeof setInterval> | undefined;
+
+  function processInbox(ctx: ExtensionContext) {
+    if (!sessionFile || finished) return;
+    for (const file of pendingInboxMessages(sessionFile)) {
+      if (finished) return;
+      let message: unknown;
+      try { ({ message } = JSON.parse(readFileSync(file, "utf8"))); } catch {}
+      if (typeof message !== "string") {
+        rmSync(file, { force: true });
+        continue;
+      }
+      const idle = ctx.isIdle();
+      try {
+        pi.sendUserMessage(message, { deliverAs: "steer" });
+      } catch {
+        return; // keep it, and retry in order next tick
+      }
+      rmSync(file, { force: true });
+      if (idle) return; // let the prompt start before submitting the next file
+    }
+    if (exitAfterInbox && pendingInboxMessages(sessionFile).length === 0) exitIfDone(ctx);
+  }
 
   /** End an autonomous subagent whose task has started no run by its deadline. */
   function watchRunStart(ctx: ExtensionContext) {
@@ -172,7 +188,7 @@ export default function (pi: ExtensionAPI) {
       const model = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "no model";
       startError = { errorMessage: `Pi started no run for the task within ${RUN_START_TIMEOUT / 1000} s (${model}); it refuses a prompt when the model has no usable credentials, or none is selected.` };
       finished = true;
-      if (sessionFile) try { writeFileSync(`${sessionFile}.exiting`, "{}"); } catch {}
+      if (sessionFile) try { writeFileSync(`${sessionFile}.exiting`, "{}", { mode: 0o600 }); } catch {}
       ctx.shutdown();
     }, Math.max(0, state.runDeadline - Date.now()));
     runPending.unref(); // Pi's own loop keeps the process alive
@@ -197,13 +213,14 @@ export default function (pi: ExtensionAPI) {
       errorInfo ??= findLatestAssistantError(entries.flatMap((entry) => (entry.type === "message" ? [(entry as any).message] : [])));
     } catch {} // the parent then reports the run without its answer
     const type = errorInfo ? "error" : finished || !autoExit ? "done" : "quit";
-    try { writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type, ...errorInfo, summary })); } catch {}
+    try { writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type, ...errorInfo, summary }), { mode: 0o600 }); } catch {}
   }
 
   // Show widget + status bar on session start
   pi.on("session_start", (event, ctx) => {
     messages = undefined;
     finished = false;
+    exitAfterInbox = false;
     if (event.reason !== "reload") {
       Object.assign(state, newChildState(ctx.sessionManager.getLeafId()));
       delete process.env.PI_SUBAGENT_SKILLS;
@@ -211,6 +228,11 @@ export default function (pi: ExtensionAPI) {
     if (autoExit) watchRunStart(ctx); // a deadline set before a /reload, with this session's ctx
 
     renderWidget(ctx);
+    if (subagentName) pi.setSessionName(`subagent ${subagentName}`);
+    clearInterval(inboxTimer);
+    inboxTimer = setInterval(() => processInbox(ctx), 250);
+    inboxTimer.unref();
+    processInbox(ctx);
   });
 
   pi.on("input", (event, ctx) => {
@@ -223,12 +245,6 @@ export default function (pi: ExtensionAPI) {
     // though the answer already arrived and was consumed. (The `input` event
     // fires for mid-run steers because prompt() emits it before queueing.)
     state.awaitingAnswer = false;
-    // The orchestrator's messages arrive in a delivery envelope: a receipt of exactly that one
-    // tells it the message arrived even as this session began exiting (the transcript cannot,
-    // once Pi expands a prompt). The envelope is dropped before Pi reads the text.
-    const delivery = DELIVERY_ENVELOPE.exec(event.text);
-    if (delivery && sessionFile) try { appendFileSync(`${sessionFile}.inputs`, `${delivery[1]}\n`); } catch {}
-    let text = delivery ? event.text.slice(delivery[0].length) : event.text;
     // Someone is answering or continuing it already: an unsent question or interruption notice is obsolete.
     if (sessionFile) for (const marker of [".ask", ".paused"]) rmSync(sessionFile + marker, { recursive: true, force: true });
     // Pi refuses a prompt without a model or credentials before starting any run, so the task
@@ -239,8 +255,7 @@ export default function (pi: ExtensionAPI) {
     }
     // The first task carries the configured skills, expanded as Pi expands `/skill:name`.
     const skills = state.skills.splice(0).map((name) => skillBlock(pi, name)).filter(Boolean);
-    if (skills.length) text = `${skills.join("\n\n")}\n\n${text}`;
-    if (delivery || skills.length) return { action: "transform" as const, text, images: event.images };
+    if (skills.length) return { action: "transform" as const, text: `${skills.join("\n\n")}\n\n${event.text}`, images: event.images };
   });
 
   // A run starting, or a prompt being prepared (an extension's before_agent_start), means the
@@ -261,6 +276,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_start", () => {
     runStarting();
     exitAfterCompaction = false;
+    exitAfterInbox = false;
   });
 
   // Low-level runs can still be followed by retries, compaction or queued work.
@@ -271,7 +287,7 @@ export default function (pi: ExtensionAPI) {
     const last = [...(messages ?? [])].reverse().find((m) => m?.role === "assistant");
     if (event.aborted || wasAborted(last)) {
       if (sessionFile) {
-        try { writeFileSync(`${sessionFile}.paused`, "{}"); } catch {}
+        try { writeFileSync(`${sessionFile}.paused`, "{}", { mode: 0o600 }); } catch {}
       }
       return;
     }
@@ -280,7 +296,7 @@ export default function (pi: ExtensionAPI) {
   });
   // A manual /compact runs outside any run: a settle during it waits for it to end. Pi
   // announces the end before it clears its busy state, so look once it has.
-  const afterCompaction = (_event: unknown, ctx: ExtensionContext) => {
+  const afterCompaction = (event: { reason: string }, ctx: ExtensionContext) => {
     if (!exitAfterCompaction) return;
     const check = () => {
       if (!exitAfterCompaction) return; // a run started meanwhile; its own settle decides
@@ -295,8 +311,13 @@ export default function (pi: ExtensionAPI) {
   /** End an autonomous subagent whose task is done, once nothing keeps it open. */
   function exitIfDone(ctx: ExtensionContext) {
     exitAfterCompaction = false;
+    exitAfterInbox = false;
     // A pending answer, unfinished child or unsent draft keeps the session open for the next turn.
     if (finished || state.awaitingAnswer || runningChildrenCount() > 0) return;
+    if (sessionFile && pendingInboxMessages(sessionFile).length) {
+      exitAfterInbox = true;
+      return;
+    }
     if (ctx.hasUI && ctx.ui.getEditorText().trim()) return;
     if (!ctx.isIdle()) {
       exitAfterCompaction = true;
@@ -305,13 +326,14 @@ export default function (pi: ExtensionAPI) {
     // Pi stops reading input as it shuts down, before the exit marker can be written on quit:
     // say so first, so a message sent meanwhile is not taken for received.
     finished = true;
-    if (sessionFile) try { writeFileSync(`${sessionFile}.exiting`, "{}"); } catch {}
+    if (sessionFile) try { writeFileSync(`${sessionFile}.exiting`, "{}", { mode: 0o600 }); } catch {}
     ctx.shutdown();
   }
 
   // Sidecars communicate completion/interruption across the child-parent process boundary.
   pi.on("session_shutdown", (event, ctx) => {
     clearTimeout(runPending);
+    clearInterval(inboxTimer);
     if (event.reason === "quit" && sessionFile && !existsSync(`${sessionFile}.exit`)) writeExit(ctx);
   });
 

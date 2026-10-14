@@ -6,8 +6,9 @@
  */
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { createConnection, type Socket } from "node:net";
+import { resolve } from "node:path";
 
 const execFileAsync = promisify(execFile);
 // Bound CLI stalls, not agent execution time. Never retry mutating actions.
@@ -97,8 +98,6 @@ export interface AgentLaunch {
   /** Display name; the herdr agent name is derived from it. */
   name: string;
   args: string[];
-  /** Submitted once the agent is ready; an agent started with a task would never look ready. */
-  prompt?: string;
   env: Record<string, string>;
   cwd: string;
 }
@@ -127,15 +126,15 @@ async function openPane(launch: AgentLaunch, signal?: AbortSignal): Promise<stri
 }
 
 /**
- * Open a pane, start the agent once it is ready for input, then submit its prompt.
+ * Open a pane and start the agent, waiting for Pi to be ready.
  * Every failure after the pane exists closes it, and so does `signal`: the caller
  * never learns the pane, so nothing else would.
  */
 export async function startAgent(launch: AgentLaunch, signal?: AbortSignal): Promise<{ surface: string; agent: string }> {
   if (!isHerdrAvailable()) throw new Error(`herdr is not available. ${herdrSetupHint()}`);
-  // A resume must not mistake the previous run's markers for its own.
-  const session = launch.env.PI_SUBAGENT_SESSION;
-  if (session) for (const marker of [".exit", ".exiting", ".paused", ".ask"]) rmSync(session + marker, { recursive: true, force: true });
+  // herdr refuses agent arguments it cannot encode for the pane's shell, such as line breaks.
+  const unsafe = launch.args.find((arg) => /[\r\n]/.test(arg));
+  if (unsafe !== undefined) throw new Error(`A pi argument for "${launch.name}" spans lines, which herdr cannot pass: ${JSON.stringify(unsafe.slice(0, 80))}`);
   const opening = creationQueue.then(() => openPane(launch, signal));
   creationQueue = opening.catch(() => {});
   const surface = await opening;
@@ -158,7 +157,6 @@ export async function startAgent(launch: AgentLaunch, signal?: AbortSignal): Pro
         throw error;
       }
     }
-    if (launch.prompt) await herdrAsync(["agent", "prompt", agent, launch.prompt], { signal });
     return { surface, agent };
   } catch (error) {
     // Keep what the pane printed (a bad model, an extension error) before closing it.
@@ -167,13 +165,6 @@ export async function startAgent(launch: AgentLaunch, signal?: AbortSignal): Pro
     const leftOpen = await closePane(surface).then(() => "", () => `\nIts herdr pane ${surface} could not be closed; close it in herdr.`);
     throw new Error(`${String((error as any)?.message ?? error)}${output ? `\nLast output in the pane:\n${output}` : ""}${leftOpen}`);
   }
-}
-
-// ── Talking to running agents ──
-
-/** Submit a (multi-line) message as one prompt; herdr rejects it while the agent awaits a confirmation. */
-export async function steer(surface: string, message: string): Promise<void> {
-  await herdrAsync(["agent", "prompt", surface, message]);
 }
 
 /** Recent output with soft wraps joined. */
@@ -205,10 +196,10 @@ export type AgentStatus = "idle" | "working" | "blocked" | "done" | "unknown";
  * agent when its pane moves, a pane id does not. "exited" once herdr no longer
  * lists it; null when herdr could not answer.
  */
-export async function agentStatus(agent: string, signal?: AbortSignal): Promise<{ status: AgentStatus; pane: string } | "exited" | null> {
+export async function agentStatus(agent: string, signal?: AbortSignal): Promise<{ status: AgentStatus; pane: string; session: string | null } | "exited" | null> {
   try {
     const result = (await herdrAsync(["agent", "get", agent], { signal })).agent;
-    return { status: result.agent_status ?? "unknown", pane: result.pane_id };
+    return { status: result.agent_status ?? "unknown", pane: result.pane_id, session: result.agent_session?.kind === "path" && typeof result.agent_session.value === "string" ? result.agent_session.value : null };
   } catch (error) {
     return error instanceof HerdrError && error.code === "agent_not_found" ? "exited" : null;
   }
@@ -217,7 +208,7 @@ export async function agentStatus(agent: string, signal?: AbortSignal): Promise<
 /** The live pi agent running a session file, by herdr's session report; null when none is. */
 export async function findSessionAgent(sessionFile: string): Promise<{ agent: string; pane: string } | null> {
   const agents: any[] = (await herdrAsync(["agent", "list"]))?.agents ?? [];
-  const live = agents.find((a) => a.name && a.agent_session?.kind === "path" && a.agent_session.value === sessionFile);
+  const live = agents.find((a) => a.name && a.agent_session?.kind === "path" && typeof a.agent_session.value === "string" && resolve(a.agent_session.value) === resolve(sessionFile));
   return live ? { agent: live.name, pane: live.pane_id } : null;
 }
 
@@ -348,6 +339,7 @@ export async function waitForExit(
       if (check || !live || exitedBefore || marker || Date.now() - lastCheck >= 15_000) {
         check = false;
         found = await agentStatus(agent, signal);
+        if (found && found !== "exited" && options.sessionFile && found.session && resolve(found.session) !== resolve(options.sessionFile)) found = "exited";
         lastCheck = Date.now();
         if (found && found !== "exited" && found.pane !== pane) {
           pane = found.pane;

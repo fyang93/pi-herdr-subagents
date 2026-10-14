@@ -62,8 +62,8 @@ export function seedSubagentSessionFile(params: {
     parentSession: params.parentSessionFile,
   };
   const entries = params.mode === "fork" ? forkContext(params.parentBranch, params.forkPoint) : [];
-  mkdirSync(dirname(params.childSessionFile), { recursive: true });
-  writeFileSync(params.childSessionFile, [header, ...entries].map((entry) => JSON.stringify(entry)).join("\n") + "\n", "utf8");
+  mkdirSync(dirname(params.childSessionFile), { recursive: true, mode: 0o700 });
+  writeFileSync(params.childSessionFile, [header, ...entries].map((entry) => JSON.stringify(entry)).join("\n") + "\n", { encoding: "utf8", mode: 0o600 });
 }
 
 /**
@@ -104,9 +104,9 @@ export function loadoutSidecarPath(sessionFile: string): string {
   return `${sessionFile}.loadout.json`;
 }
 
-/** Persist a subagent's resolved sandbox loadout beside its session file; a failure fails the launch. */
+/** Persist a subagent's resolved loadout beside its session file; a failure fails the launch. */
 export function writeSubagentLoadout(sessionFile: string, loadout: SubagentLoadout): void {
-  writeFileSync(loadoutSidecarPath(sessionFile), JSON.stringify(loadout), "utf8");
+  writeFileSync(loadoutSidecarPath(sessionFile), JSON.stringify(loadout), { encoding: "utf8", mode: 0o600 });
 }
 
 const isNullableString = (value: unknown) => value === null || typeof value === "string";
@@ -128,6 +128,29 @@ export function readSubagentLoadout(sessionFile: string): SubagentLoadout | null
   }
 }
 
+// ── Inbox ────────────────────────────────────────────────────────────────────
+
+/** Publish privately by rename, with monotonic filenames preserving send order. */
+function publishJson(directory: string, value: unknown): string {
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const tmp = `${directory}-${randomUUID()}.tmp`; // outside the directory: never read half-written
+  writeFileSync(tmp, JSON.stringify(value), { mode: 0o600 });
+  const file = join(directory, `${String(process.hrtime.bigint()).padStart(20, "0")}-${randomUUID()}.json`);
+  renameSync(tmp, file);
+  return file;
+}
+
+/** Publish a message atomically; the child deletes the file once it enters Pi's conversation. */
+export function publishInboxMessage(sessionFile: string, message: string): string {
+  return publishJson(`${sessionFile}.inbox`, { message });
+}
+
+/** Pending message files in send order, including malformed ones. */
+export function pendingInboxMessages(sessionFile: string): string[] {
+  const dir = `${sessionFile}.inbox`;
+  try { return readdirSync(dir).filter((name) => name.endsWith(".json")).sort().map((name) => join(dir, name)); } catch { return []; }
+}
+
 // ── Questions ────────────────────────────────────────────────────────────────
 // A subagent's questions are immutable files in `<session>.ask/`, each published by
 // rename: the child never rewrites what the parent may be reading, and the parent
@@ -135,12 +158,7 @@ export function readSubagentLoadout(sessionFile: string): SubagentLoadout | null
 
 /** Publish a question for the parent; throws when it cannot be written. */
 export function publishQuestion(sessionFile: string, question: string): void {
-  const dir = `${sessionFile}.ask`;
-  mkdirSync(dir, { recursive: true });
-  const tmp = `${dir}-${randomUUID()}.tmp`; // outside the directory: never read half-written
-  writeFileSync(tmp, JSON.stringify({ question }));
-  // Named by the monotonic clock, so they sort in the order asked, even within a millisecond.
-  renameSync(tmp, join(dir, `${String(process.hrtime.bigint()).padStart(20, "0")}-${randomUUID()}.json`));
+  publishJson(`${sessionFile}.ask`, { question });
 }
 
 /** Questions waiting for delivery, in the order asked, and the files holding them (malformed ones included). */
@@ -202,12 +220,12 @@ export function registerName(
   name: string,
   entry: NameRegistryEntry,
 ): void {
-  mkdirSync(artifactDir, { recursive: true });
+  mkdirSync(artifactDir, { recursive: true, mode: 0o700 });
   // A computed key defines an own property for any name, `__proto__` included.
   const registry = { ...readNameRegistry(artifactDir), [name]: entry };
   const p = nameRegistryPath(artifactDir);
   const tmp = `${p}.tmp-${process.pid}-${randomUUID()}`;
-  writeFileSync(tmp, JSON.stringify(registry, null, 2), "utf8");
+  writeFileSync(tmp, JSON.stringify(registry, null, 2), { encoding: "utf8", mode: 0o600 });
   renameSync(tmp, p);
 }
 

@@ -3,11 +3,11 @@ import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { pendingQuestions } from "../pi-extension/subagents/session.ts";
+import { pendingQuestions, pendingInboxMessages, publishInboxMessage } from "../pi-extension/subagents/session.ts";
 
 const root = mkdtempSync(join(tmpdir(), "pi-runtime-smoke-"));
 const doneExtension = resolve("pi-extension/subagents/subagent-done.ts");
@@ -37,12 +37,13 @@ async function waitFor(check: () => any, detail: () => string, timeout = 5000) {
   while (Date.now() < until) { const value = check(); if (value) return value; await delay(10); }
   throw new Error(`Timed out: ${detail()}`);
 }
-function start(opts: { tools?: string; toolArgs?: string[]; extensions?: string[]; autoRetry?: boolean; retryDelay?: number; terminal?: boolean; initialTask?: string; session?: string; model?: string | null} = {}) {
+function start(opts: { tools?: string; toolArgs?: string[]; extensions?: string[]; beforeExtensions?: string[]; autoRetry?: boolean; retryDelay?: number; terminal?: boolean; initialTask?: string; session?: string; model?: string | null; skillNames?: string; configure?: (dir: string, config: string) => void } = {}) {
   requests.length = 0; replies = [];
   const dir = join(root, String(++serial)); mkdirSync(join(dir, "config"), { recursive: true });
   const config = join(dir, "config");
   writeFileSync(join(config, "models.json"), JSON.stringify({ providers: { simulation: { baseUrl: `http://127.0.0.1:${port}/v1`, api: "openai-completions", apiKey: "dummy", models: [{ id: "sim-model", name: "sim-model", reasoning: false, input: ["text"], contextWindow: 32000, maxTokens: 512, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }, { id: "sim-model-2", name: "sim-model-2", reasoning: true, input: ["text"], contextWindow: 32000, maxTokens: 512, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }] } } }));
   writeFileSync(join(config, "settings.json"), JSON.stringify({ retry: { enabled: opts.autoRetry ?? false, maxRetries: 1, baseDelayMs: opts.retryDelay ?? 30, maxDelayMs: opts.retryDelay ?? 30 }, compaction: { enabled: false } }));
+  opts.configure?.(dir, config);
   const session = opts.session ?? join(dir, "session.jsonl");
   const env = { ...process.env, PI_CODING_AGENT_DIR: config, PI_OFFLINE: "1", PI_TELEMETRY: "0", PI_SUBAGENT_SESSION: session, PI_SUBAGENT_NAME: "smoke", PI_SUBAGENT_AGENT: "scout", PI_SUBAGENT_AUTO_EXIT: "1" };
   // Never inherit the harness's real pane or herdr executable.
@@ -50,13 +51,14 @@ function start(opts: { tools?: string; toolArgs?: string[]; extensions?: string[
     if (key.startsWith("HERDR_") || key.startsWith("PI_SESSION_") || key === "PI_DENY_TOOLS" ||
         (key.startsWith("PI_SUBAGENT_") && !["PI_SUBAGENT_SESSION", "PI_SUBAGENT_NAME", "PI_SUBAGENT_AGENT", "PI_SUBAGENT_AUTO_EXIT"].includes(key))) delete (env as any)[key];
   }
-  const args = [...(opts.terminal ? ["--tui-mode", "regular"] : ["--mode", "rpc"]), "--no-skills", "--no-prompt-templates", "--no-themes", "--session", session];
+  if (opts.skillNames) (env as any).PI_SUBAGENT_SKILLS = opts.skillNames;
+  const args = [...(opts.terminal ? ["--tui-mode", "regular"] : ["--mode", "rpc"]), "--no-themes", "--session", session];
   // null leaves the model to the loadout args or, on resume, to the session.
   if (opts.model !== null) args.push("--model", opts.model ?? "simulation/sim-model");
-  for (const ext of [doneExtension, ...(opts.extensions ?? [])]) args.push("-e", ext);
+  for (const ext of [...(opts.beforeExtensions ?? []), doneExtension, ...(opts.extensions ?? [])]) args.push("-e", ext);
   if (opts.tools) args.push("--tools", opts.tools);
   if (opts.toolArgs) args.push(...opts.toolArgs);
-  if (opts.terminal && opts.initialTask) args.push("--", opts.initialTask);
+  if (opts.initialTask) publishInboxMessage(session, opts.initialTask);
   const command = "exec " + [cli, ...args].map(arg => "'" + arg.replace(/'/g, "'\\''") + "'").join(" ");
   const child = opts.terminal
     ? spawn("script", ["-qef", "-E", "never", "/dev/null", "-c", command], { cwd: dir, env: { ...env, SHELL: "/bin/sh", TERM: "xterm-256color" }, stdio: "pipe" })
@@ -81,16 +83,17 @@ function start(opts: { tools?: string; toolArgs?: string[]; extensions?: string[
     tools() { return requests[0]?.tools?.map((t: any) => t.function.name) ?? []; },
   };
 }
-const prompt = (h: ReturnType<typeof start>, message = "DO_TASK") => h.send("prompt", { message });
+const prompt = (h: ReturnType<typeof start>, message = "DO_TASK") => publishInboxMessage(h.session, message);
 const sessionEntries = (h: ReturnType<typeof start>) => readFileSync(h.session, "utf8").trim().split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line));
 const lastAssistant = (h: ReturnType<typeof start>) => sessionEntries(h).filter(entry => entry.type === "message" && entry.message.role === "assistant").at(-1)?.message;
+const userTexts = (messages: any[]) => messages.filter(message => message.role === "user").map(message => typeof message.content === "string" ? message.content : message.content.filter((part: any) => part.type === "text").map((part: any) => part.text).join("\n"));
 after(async () => { for (const child of children) child.kill("SIGKILL"); server.closeAllConnections(); await new Promise<void>(r => server.close(() => r())); rmSync(root, { recursive: true, force: true }); });
 
 test("Pi 1.1 modifier loadout retains defaults, adds codemode and excludes bash; allowlist includes helper", async () => {
   const testApi = (await import("../pi-extension/subagents/index.ts")).__test__;
   const allow = testApi.buildSubagentToolAllowlist("+codemode,-bash");
   const childArgs: string[] = [];
-  testApi.applySandboxToArgs(childArgs, { toolAllowlist: allow });
+  testApi.applyLoadoutToArgs(childArgs, { toolAllowlist: allow }, join(root, "modifier.jsonl"));
   const h = start({ toolArgs: childArgs });
   await h.command("get_state"); prompt(h); await h.exited();
   assert.deepEqual(h.tools().sort(), ["ask_question", "codemode", "edit", "read", "write"].sort());
@@ -101,10 +104,10 @@ test("Pi 1.1 modifier loadout retains defaults, adds codemode and excludes bash;
 test("resume replays the loadout snapshot; a bare resume would drop identity and tools", async () => {
   const testApi = (await import("../pi-extension/subagents/index.ts")).__test__;
   const identity = "IDENTITY_MARKER: you are a read-only scout.";
-  const loadout = { agent: "scout", toolAllowlist: testApi.buildSubagentToolAllowlist("read"), model: null, thinking: null,
+  const loadout = { agent: "scout", toolAllowlist: testApi.buildSubagentToolAllowlist("read"),
     systemPromptMode: "append" as const, identity, spawnable: null, cwd: null, agentDir: null };
   const launchArgs: string[] = [];
-  testApi.applySandboxToArgs(launchArgs, loadout);
+  testApi.applyLoadoutToArgs(launchArgs, loadout, join(root, "append-identity.jsonl"));
   const first = start({ toolArgs: launchArgs });
   await first.command("get_state"); prompt(first); await first.exited();
   const session = first.session;
@@ -114,7 +117,7 @@ test("resume replays the loadout snapshot; a bare resume would drop identity and
   assert.deepEqual(lastTools(), ["ask_question", "read"]);
 
   const resumeArgs: string[] = [];
-  testApi.applySandboxToArgs(resumeArgs, loadout);
+  testApi.applyLoadoutToArgs(resumeArgs, loadout, join(root, "append-identity.jsonl"));
   const resumed = start({ session, toolArgs: resumeArgs });
   await resumed.command("get_state"); prompt(resumed, "CONTINUE"); await resumed.exited();
   assert.match(lastRequest(), /IDENTITY_MARKER/, "replayed resume keeps the identity");
@@ -131,11 +134,11 @@ test("resume keeps a replace-mode identity and the session's later model/thinkin
   const testApi = (await import("../pi-extension/subagents/index.ts")).__test__;
   const loadout = {
     toolAllowlist: testApi.buildSubagentToolAllowlist("read"), systemPromptMode: "replace",
-    identity: "REPLACE_MARKER: you are a read-only scout.", model: "simulation/sim-model", thinking: null,
+    identity: "REPLACE_MARKER: you are a read-only scout.",
   };
   const launchArgs: string[] = [];
-  testApi.applySandboxToArgs(launchArgs, loadout);
-  const first = start({ model: null, toolArgs: launchArgs });
+  testApi.applyLoadoutToArgs(launchArgs, loadout, join(root, "replace-identity.jsonl"));
+  const first = start({ model: "simulation/sim-model", toolArgs: launchArgs });
   await first.command("get_state");
   // The subagent switches model and thinking mid-session; resume must not undo it.
   assert.equal((await first.command("set_model", { provider: "simulation", modelId: "sim-model-2" })).success, true);
@@ -147,7 +150,7 @@ test("resume keeps a replace-mode identity and the session's later model/thinkin
   assert.doesNotMatch(lastRequest(), defaultPreamble);
 
   const resumeArgs: string[] = [];
-  testApi.applySandboxToArgs(resumeArgs, loadout);
+  testApi.applyLoadoutToArgs(resumeArgs, loadout, join(root, "replace-identity.jsonl"));
   assert.equal(resumeArgs.includes("--model"), false);
   const resumed = start({ session: first.session, model: null, toolArgs: resumeArgs });
   const state = (await resumed.command("get_state")).data;
@@ -162,7 +165,7 @@ test("resume keeps a replace-mode identity and the session's later model/thinkin
 test("an append-mode identity reaches every request, also of a run a subagent's result starts", async () => {
   const testApi = (await import("../pi-extension/subagents/index.ts")).__test__;
   const identityArgs: string[] = [];
-  testApi.applySandboxToArgs(identityArgs, { systemPromptMode: "append", identity: "IDENTITY_MARKER: you are a worker." });
+  testApi.applyLoadoutToArgs(identityArgs, { systemPromptMode: "append", identity: "IDENTITY_MARKER: you are a worker.\n\nKeep going." }, join(root, "worker-identity.jsonl"));
   // Stands in for a delegated child: keeps the worker open, then its result starts another run.
   const child = join(root, "child-result.ts");
   writeFileSync(child, `export default (pi:any)=>{let pending=true;(globalThis as any)[Symbol.for("pi-subagents/running-children-count")]=()=>pending?1:0;
@@ -212,7 +215,7 @@ test("YAML quoted/list tools become a real CLI loadout", async () => {
     }
     assert.deepEqual(definition.tools, expectedDefinition);
     const childArgs: string[] = [];
-    testApi.applySandboxToArgs(childArgs, { toolAllowlist: testApi.buildSubagentToolAllowlist(definition.tools) });
+    testApi.applyLoadoutToArgs(childArgs, { toolAllowlist: testApi.buildSubagentToolAllowlist(definition.tools) }, join(root, "yaml.jsonl"));
     const h = start({ toolArgs: childArgs }); await h.command("get_state"); prompt(h); await h.exited();
     // Provider declarations prove plain read is a true allowlist, not merely a helper string assertion.
     assert.deepEqual(h.tools().sort(), [...expectedTools].sort());
@@ -231,15 +234,70 @@ test("RPC asks a question without auto-exit; answer permits settled completion",
   // Let the settled exit timer run while parked. Do not send get_state (or end stdin) to manufacture an exit.
   await delay(100); assert.equal(h.closed, false, h.diagnostic()); assert.equal(h.sidecar(".exit"), null);
   assert.equal(requests.length, 2); assert.deepEqual(pendingQuestions(h.session).questions, ["Which option?"]);
-  h.send("prompt", { message: "CHOOSE A" }); await h.exited(2);
+  prompt(h, "CHOOSE A\nwith a multi-line reply"); await h.exited(2);
   assert.equal(requests.length, 3); assert.match(JSON.stringify(requests[2].messages), /CHOOSE A/); assert.equal(lastAssistant(h).stopReason, "stop"); assert.deepEqual(h.sidecar(".exit"), { type: "done", summary: "SIMULATED_OK" });
 });
 
-test("queued follow-up is consumed before settled auto-exit", async () => {
-  const h = start(); await h.command("get_state"); replies = [{ delay: 250 }, { text: "FOLLOWUP_DONE" }]; prompt(h);
-  await waitFor(() => requests.length === 1, h.diagnostic); await h.command("follow_up", { message: "QUEUED_FOLLOWUP" });
-  await h.exited(); assert.equal(requests.length, 2); assert.match(JSON.stringify(requests[1].messages), /QUEUED_FOLLOWUP/);
-  assert.equal(lastAssistant(h).stopReason, "stop"); assert.deepEqual(h.sidecar(".exit"), { type: "done", summary: "FOLLOWUP_DONE" });
+test("busy Pi takes an inbox message as a steer before settled auto-exit", async () => {
+  const h = start(); await h.command("get_state"); replies = [{ delay: 1000 }, { text: "STEER_DONE" }]; prompt(h);
+  await waitFor(() => requests.length === 1, h.diagnostic);
+  const file = prompt(h, "BUSY_STEER\nsecond line");
+  await waitFor(() => !pendingInboxMessages(h.session).includes(file), h.diagnostic);
+  await h.exited(); assert.equal(requests.length, 2);
+  assert.match(JSON.stringify(requests[1].messages), /BUSY_STEER\\nsecond line/);
+  assert.deepEqual(h.sidecar(".exit"), { type: "done", summary: "STEER_DONE" });
+});
+
+test("an earlier input extension can prepend and append context without replaying an inbox delivery", async () => {
+  const transform = join(root, "append-context.ts");
+  writeFileSync(transform, `export default (pi:any)=>pi.on("input",(event:any)=>({action:"transform",text:"PREPENDED_CONTEXT\\n"+event.text+"\\nAPPENDED_CONTEXT"}));`);
+  const h = start({ beforeExtensions: [transform] });
+  await h.command("get_state");
+  const file = prompt(h, "TRANSFORMED_TASK");
+  await h.exited();
+  assert.equal(existsSync(file), false, "submitted input no longer needs an inbox file");
+  assert.deepEqual(pendingInboxMessages(h.session), []);
+  assert.equal(requests.length, 1, "no repeated task after settlement");
+  const expected = ["PREPENDED_CONTEXT\nTRANSFORMED_TASK\nAPPENDED_CONTEXT"];
+  assert.deepEqual(userTexts(requests[0].messages), expected);
+  assert.deepEqual(userTexts(sessionEntries(h).filter(entry => entry.type === "message").map(entry => entry.message)), expected);
+  assert.doesNotMatch(JSON.stringify(requests), /subagent-delivery:/);
+});
+
+test("a busy inbox message steers the current run, including while tools are running", async () => {
+  const h = start(); await h.command("get_state");
+  replies = [{ delay: 1000, tool: "read", args: { path: "missing.txt" } }, { text: "STEERED_DONE" }];
+  prompt(h);
+  await waitFor(() => requests.length === 1, h.diagnostic);
+  publishInboxMessage(h.session, "AFTER_CURRENT_WORK\nsecond line");
+  await h.exited();
+  assert.equal(requests.length, 2);
+  assert.match(JSON.stringify(requests[1].messages), /AFTER_CURRENT_WORK/);
+  assert.deepEqual(pendingInboxMessages(h.session), []);
+  assert.deepEqual(h.sidecar(".exit"), { type: "done", summary: "STEERED_DONE" });
+});
+
+test("Escape stops the waiting tool, not supervision or the published inbox message", async () => {
+  const testApi = (await import("../pi-extension/subagents/index.ts")).__test__;
+  const h = start(); await h.command("get_state");
+  replies = [{ delay: 1500 }, { text: "AFTER_ESCAPE" }]; prompt(h);
+  await waitFor(() => requests.length === 1, h.diagnostic);
+  const child: any = { id: "runtime-wait", name: "runtime-wait", sessionFile: h.session,
+    watching: waitFor(() => h.closed, h.diagnostic) };
+  testApi.runningSubagents.set(child.id, child);
+  try {
+    const escape = new AbortController();
+    const waiting = testApi.steerLive(child, "MESSAGE_AFTER_ESCAPE\nsecond line", escape.signal);
+    escape.abort(); // cancel in the same tick, without waiting for submission
+    await assert.rejects(waiting, /abort/i);
+    assert.equal(testApi.runningSubagents.has(child.id), true);
+    await h.exited();
+    assert.deepEqual(pendingInboxMessages(h.session), []);
+    const users = sessionEntries(h).filter(e => e.type === "message" && e.message.role === "user");
+    assert.equal(users.filter(e => JSON.stringify(e).includes("MESSAGE_AFTER_ESCAPE")).length, 1);
+    assert.match(JSON.stringify(requests.at(-1).messages), /MESSAGE_AFTER_ESCAPE\\nsecond line/);
+    assert.deepEqual(h.sidecar(".exit"), { type: "done", summary: "AFTER_ESCAPE" });
+  } finally { testApi.runningSubagents.delete(child.id); }
 });
 
 test("agent_before_settle continuation runs before final sidecar", async () => {
@@ -268,7 +326,7 @@ test("final provider error writes error sidecar after retry exhaustion", async (
 test("real PTY modifier loadout exits naturally after settled task", async () => {
   const testApi = (await import("../pi-extension/subagents/index.ts")).__test__;
   const args: string[] = [];
-  testApi.applySandboxToArgs(args, { toolAllowlist: testApi.buildSubagentToolAllowlist("+codemode,-bash") });
+  testApi.applyLoadoutToArgs(args, { toolAllowlist: testApi.buildSubagentToolAllowlist("+codemode,-bash") }, join(root, "pty.jsonl"));
   const h = start({ terminal: true, initialTask: "PTY_TASK", toolArgs: args }); await h.exited();
   assert.equal(requests.length, 1); assert.equal(lastAssistant(h).stopReason, "stop"); assert.deepEqual(h.sidecar(".exit"), { type: "done", summary: "SIMULATED_OK" });
 });

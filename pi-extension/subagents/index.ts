@@ -1,4 +1,4 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { getAgentDir, keyHint, parseFrontmatter, parseSessionEntries, ProjectTrustStore } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
 import { Box, Text, TruncatedText, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
@@ -13,6 +13,7 @@ import {
   mkdirSync,
   unlinkSync,
   rmSync,
+  writeFileSync,
 } from "node:fs";
 import {
   isHerdrAvailable,
@@ -22,7 +23,6 @@ import {
   startAgent,
   findSessionAgent,
   type AgentLaunch,
-  steer,
   waitForExit,
   closePane,
 } from "./herdr.ts";
@@ -32,6 +32,7 @@ import {
   getSessionId,
   readNameRegistry,
   pendingQuestions,
+  publishInboxMessage,
   readSubagentLoadout,
   registerName,
   registryEntry,
@@ -44,7 +45,7 @@ import {
 } from "./session.ts";
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
-const launchDeps = { startAgent, findSessionAgent, steer, watchSubagent };
+const launchDeps = { startAgent, findSessionAgent, watchSubagent };
 
 // Survive /reload: abort watchers from the previous module load.
 // /reload re-imports this file, giving fresh module-level state, but closures from
@@ -66,22 +67,20 @@ function getModuleAbortSignal(): AbortSignal {
 const SubagentParams = Type.Object({
   agent: Type.String({
     description:
-      "Which agent to spawn (e.g. 'worker', 'scout', 'researcher'). This loads the agent's " +
-      "fixed profile — its model, tool loadout, and system prompt. Must be one of the available agents.",
+      "Agent profile to spawn, e.g. worker, scout or researcher (subagents_list shows all).",
   }),
-  task: Type.String({ description: "Task/prompt for the sub-agent" }),
+  task: Type.String({ description: "Task for the subagent." }),
   name: Type.Optional(
     Type.String({
       description:
-        "Optional display name for the subagent's pane and herdr agent. Defaults to the agent name. " +
-        "Has no effect on which agent runs — use `agent` for that.",
+        "Display name; defaults to the agent name.",
     }),
   ),
-  model: Type.Optional(Type.String({ description: "Model override (overrides agent default)" })),
+  model: Type.Optional(Type.String({ description: "Override the agent's default model." })),
   cwd: Type.Optional(
     Type.String({
       description:
-        "Working directory for the sub-agent. The agent starts in this folder and picks up its local .pi/ config, AGENTS.md, skills, and extensions. Use for role-specific subfolders.",
+        "Working directory for the subagent.",
     }),
   ),
 });
@@ -181,7 +180,7 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
     model: field("model"),
     tools: Array.isArray(frontmatter.tools) ? frontmatter.tools.map(String) : field("tools"),
     systemPromptMode: oneOf(field("system-prompt"), ["append", "replace"] as const),
-    skills: field("skill") ?? field("skills"),
+    skills: field("skill") ?? (typeof frontmatter.skills === "boolean" ? undefined : field("skills")),
     thinking: field("thinking"),
     subagentAgents: parseCommaList(field("subagent_agents")),
     autoExit: parseOptionalBoolean(frontmatter["auto-exit"]),
@@ -220,7 +219,7 @@ function discoverAgentDefinitions(cwd = process.cwd()): ListedAgentDefinition[] 
 function getDefaultSessionDirFor(cwd: string, agentDir: string): string {
   const safePath = `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
   const sessionDir = join(agentDir, "sessions", safePath);
-  mkdirSync(sessionDir, { recursive: true });
+  mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
   return sessionDir;
 }
 
@@ -286,9 +285,7 @@ function watchAndDeliver(running: RunningSubagent): void {
   if (!pi) return;
   const { signal } = running.abortController = new AbortController();
   const lifecycle = getModuleAbortSignal();
-  // Handed to the reloaded extension, which reports the real result, or stopped by this
-  // session's shutdown — even one that came after its watcher finished — which must not
-  // start another turn; its pi is stale soon after.
+  // Reload hands delivery to the new watcher; shutdown must not start a turn on a stale pi.
   const silenced = () => running.handedOff || signal.aborted || lifecycle.aborted;
   refreshWidget();
   unconsumed.add(running.id);
@@ -323,7 +320,7 @@ function resolveResultPresentation(
 ): string {
   // Name is the persistent handle: the same name steers a running subagent or
   // resumes a finished one, so follow-ups always reference it.
-  const sessionRef = `\n\nIf more work is needed, follow up with subagent_message({ name: "${name}", message: "…" }); no reply is needed otherwise.`;
+  const sessionRef = `\n\nIf more work is needed, follow up with subagent_message({ name: ${JSON.stringify(name)}, message: "…" }); no reply is needed otherwise.`;
 
   if (result.errorMessage) {
     // A provider or agent-loop error, or an answer cut off at the output limit: surface it so the
@@ -377,7 +374,7 @@ interface RunningSubagent {
   agent?: string;
   /** herdr pane hosting the agent, as last seen; it changes if the pane moves. */
   surface: string;
-  /** herdr agent name: follows the agent when its pane moves, so it is the supervision and messaging handle. */
+  /** herdr agent name: follows the agent when its pane moves, so it is the supervision handle. */
   herdrName: string;
   startTime: number;
   sessionFile: string;
@@ -430,28 +427,22 @@ let latestCtx: ExtensionContext | null = null;
 
 // ── Running-subagents widget ──
 
-const ACCENT = "\x1b[38;2;77;163;255m";
-const YELLOW = "\x1b[38;2;214;181;94m";
-const RED = "\x1b[38;2;224;108;117m";
-const DIM = "\x1b[38;2;128;128;128m";
-const RST = "\x1b[0m";
-
 function formatClock(ms: number): string {
   const seconds = Math.max(0, Math.floor(ms / 1000));
   return `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
 }
 
 /** Right-hand label: herdr's state, plus the tool a working pi subagent is in. */
-function widgetStatus(running: RunningSubagent): string {
+function widgetStatus(running: RunningSubagent, theme: Pick<Theme, "fg">): string {
   const status = running.status ?? "starting";
-  if (status === "blocked") return `${RED}blocked${RST}`;
-  if (status !== "working") return `${DIM}${status}${RST}`;
+  if (status === "blocked") return theme.fg("error", status);
+  if (status !== "working") return theme.fg("dim", status);
   const tool = currentTool(running.sessionFile);
-  return `${YELLOW}working${RST}${tool ? ` · ${tool}` : ""}`;
+  return theme.fg("warning", "working") + (tool ? ` · ${tool}` : "");
 }
 
 /** One bordered line per running subagent: elapsed, name (agent), state. */
-function renderSubagentWidgetLines(agents: RunningSubagent[], width: number, now = Date.now()): string[] {
+function renderSubagentWidgetLines(agents: RunningSubagent[], width: number, theme: Pick<Theme, "fg">, now = Date.now()): string[] {
   if (width < 4) return [];
   const inner = width - 2;
   const title = `─ Subagents `;
@@ -459,15 +450,15 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number, now
   const top = title.length + info.length <= inner
     ? `${title}${"─".repeat(inner - title.length - info.length)}${info}`
     : "─".repeat(inner);
-  const lines = [`${ACCENT}╭${top}╮${RST}`];
+  const lines = [theme.fg("accent", `╭${top}╮`)];
   for (const agent of agents) {
-    const right = ` ${widgetStatus(agent)} `;
+    const right = ` ${widgetStatus(agent, theme)} `;
     const left = truncateToWidth(` ${formatClock(now - agent.startTime)}  ${agent.name}${agent.agent ? ` (${agent.agent})` : ""}`,
       Math.max(0, inner - visibleWidth(right)));
     const row = truncateToWidth(left + " ".repeat(Math.max(0, inner - visibleWidth(left) - visibleWidth(right))) + right, inner);
-    lines.push(`${ACCENT}│${RST}${row}${" ".repeat(Math.max(0, inner - visibleWidth(row)))}${ACCENT}│${RST}`);
+    lines.push(theme.fg("accent", "│") + row + " ".repeat(Math.max(0, inner - visibleWidth(row))) + theme.fg("accent", "│"));
   }
-  lines.push(`${ACCENT}╰${"─".repeat(inner)}╯${RST}`);
+  lines.push(theme.fg("accent", `╰${"─".repeat(inner)}╯`));
   return lines;
 }
 
@@ -482,14 +473,14 @@ function refreshWidget(): void {
     return;
   }
   if (requestWidgetRender) return requestWidgetRender();
-  ui.setWidget("subagent-status", (tui) => {
+  ui.setWidget("subagent-status", (tui, theme) => {
     // Elapsed times and tool names change between events: redraw once a second.
     const timer = setInterval(() => tui.requestRender(), 1000);
     timer.unref();
     requestWidgetRender = () => tui.requestRender();
     return {
       invalidate() {},
-      render: (width: number) => renderSubagentWidgetLines([...runningSubagents.values()], width),
+      render: (width: number) => renderSubagentWidgetLines([...runningSubagents.values()], width, theme),
       dispose() {
         clearInterval(timer);
         requestWidgetRender = undefined;
@@ -552,16 +543,23 @@ function discoveredAppendFile(cwd: string, agentDir: string): string | undefined
  * are the launch's alone: the session keeps them, including a later switch.
  * Env vars and cwd are the caller's responsibility.
  */
-function applySandboxToArgs(
+function applyLoadoutToArgs(
   args: string[],
   loadout: Partial<SubagentLoadout>,
+  sessionFile: string,
 ): void {
-  if (loadout.identity && loadout.systemPromptMode === "replace") args.push("--system-prompt", loadout.identity);
-  if (loadout.identity && loadout.systemPromptMode === "append") {
-    // --append-system-prompt replaces Pi's APPEND_SYSTEM.md discovery, so pass that file along.
-    const discovered = loadout.cwd && loadout.agentDir ? discoveredAppendFile(loadout.cwd, loadout.agentDir) : undefined;
-    if (discovered) args.push("--append-system-prompt", discovered);
-    args.push("--append-system-prompt", loadout.identity);
+  if (loadout.identity && loadout.systemPromptMode) {
+    // Passed as a file: herdr refuses agent arguments with line breaks. One per session, rewritten on resume.
+    const identityFile = `${sessionFile}.identity.md`;
+    writeFileSync(identityFile, loadout.identity, { encoding: "utf8", mode: 0o600 });
+    if (loadout.systemPromptMode === "replace") {
+      args.push("--system-prompt", identityFile);
+    } else {
+      // --append-system-prompt replaces Pi's APPEND_SYSTEM.md discovery, so pass that file along.
+      const discovered = loadout.cwd && loadout.agentDir ? discoveredAppendFile(loadout.cwd, loadout.agentDir) : undefined;
+      if (discovered) args.push("--append-system-prompt", discovered);
+      args.push("--append-system-prompt", identityFile);
+    }
   }
 
   if (loadout.toolAllowlist) {
@@ -589,6 +587,10 @@ async function integrationArgs(agentDir: string): Promise<string[]> {
   return ["-e", existsSync(own) ? own : integration];
 }
 
+function isValidRunName(name: string): boolean {
+  return name.length > 0 && name.length <= 64 && name.trim() === name && !/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(name);
+}
+
 /**
  * Return `base`, or `base-2`, `base-3`, … so the result is unique within this
  * spawner session: among running subagents and every name in the spawner's
@@ -600,33 +602,22 @@ function uniqueRunningName(base: string, registryNames?: Set<string>): string {
   const taken = new Set(Array.from(runningSubagents.values()).map((r) => r.name));
   if (registryNames) for (const n of registryNames) taken.add(n);
   if (!taken.has(base)) return base;
-  let n = 2;
-  while (taken.has(`${base}-${n}`)) n++;
-  return `${base}-${n}`;
+  for (let n = 2; ; n++) {
+    const suffix = `-${n}`;
+    const name = base.slice(0, 64 - suffix.length) + suffix;
+    if (!taken.has(name)) return name;
+  }
 }
 
-/** Steer a message into a running subagent's live pane. */
-async function steerSubagent(
-  running: RunningSubagent,
-  message: string,
-  send: (target: string, message: string) => void | Promise<void> = launchDeps.steer,
-) {
-  try {
-    // The herdr agent name follows the agent when its pane moves; a pane id does not.
-    await send(running.herdrName, message);
-  } catch (error: any) {
-    const result = fail(
-      `Failed to deliver message to subagent "${running.name}" via herdr: ${error?.message ?? String(error)}`,
-    );
-    return { ...result, details: { ...result.details, id: running.id, name: running.name, code: error?.code as string | undefined } };
-  }
-
+/** A message submitted to the child's Pi. */
+function steeredResult(running: RunningSubagent) {
   return {
     content: [{
       type: "text" as const,
       text:
-        `Message delivered to running subagent "${running.name}". It picks this up at its next ` +
-        `turn boundary. If it exits, its result still arrives as a steer message.`,
+        `Message delivered to running subagent "${running.name}". ` +
+        "It picks this up at its next turn boundary. " +
+        "If it exits, its result still arrives as a steer message.",
     }],
     details: { id: running.id, name: running.name, status: "steered" },
   };
@@ -635,48 +626,39 @@ async function steerSubagent(
 /**
  * Steer a tracked subagent. One that is finishing — before, or while, the message was sent —
  * cannot take it: it is reported by its watcher first, and null then says: resume it instead.
- * The message goes in a delivery envelope, whose id the child's receipt names when it takes it.
+ * A deleted inbox file means the child submitted the message to Pi.
  */
 async function steerLive(running: RunningSubagent, message: string, signal?: AbortSignal) {
-  // Settles once its watcher has reported it; Escape stops the waiting, never the supervision.
-  let watched: Promise<void> | undefined;
-  const reported = () => (watched ??= new Promise<void>((resolve, reject) => {
-    if (signal?.aborted) return reject(signal.reason);
-    signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
-    void running.watching?.then(() => resolve());
-  }));
+  // Escape stops the waiting, never the supervision or an already-published message.
+  signal?.throwIfAborted();
+  let reported = false;
+  void running.watching?.then(() => { reported = true; });
   const finishing = () => !runningSubagents.has(running.id) ||
     [".exit", ".exiting"].some((marker) => existsSync(running.sessionFile + marker));
   if (finishing()) {
-    await reported();
+    while (!reported) await delay(100, undefined, { signal });
     return null;
   }
-  const deliveryId = randomUUID();
-  const received = () => {
-    try { return readFileSync(`${running.sessionFile}.inputs`, "utf8").includes(`${deliveryId}\n`); } catch { return false; }
-  };
-  const steered = await steerSubagent(running, `[subagent-delivery:${deliveryId}]\n${message}`);
-  // Gone from herdr, or no longer pi in its pane: it finished without the message.
-  if (steered.details.code === "agent_not_found" || steered.details.code === "agent_not_ready") {
-    await reported();
-    return null;
+  let file: string;
+  try { file = publishInboxMessage(running.sessionFile, message); }
+  catch (error: any) { return fail(`Failed to deliver message to subagent "${running.name}": ${error?.message ?? String(error)}`); }
+  while (existsSync(file)) {
+    if (reported) {
+      rmSync(file, { force: true });
+      return null;
+    }
+    await delay(100, undefined, { signal });
   }
-  if (steered.details.status !== "steered") return steered;
-  // herdr only wrote the message; the child has it once its receipt names it. One that
-  // finishes first never read it, and is resumed with it instead. Never run it twice.
-  const deadline = Date.now() + RECEIPT_TIMEOUT;
-  while (!received() && Date.now() < deadline) {
-    const finished = await Promise.race([reported().then(() => true), delay(100).then(() => false)]);
-    if (finished) return received() ? steered : null;
-  }
-  return steered;
+  return steeredResult(running);
 }
 
 /** How long notices wait for the run of a prompt being prepared before they are sent regardless. */
 const PREPARE_GRACE = 30_000;
 
-/** How long a delivered message may wait for its receipt; Pi records input as it is submitted. */
-const RECEIPT_TIMEOUT = 30_000;
+/** Clear the previous run's markers and inbox. */
+function clearStaleMarkers(sessionFile: string): void {
+  for (const marker of [".exit", ".exiting", ".paused", ".ask", ".inbox"]) rmSync(sessionFile + marker, { recursive: true, force: true });
+}
 
 /** A session file's entries, parsed leniently as Pi does; none when it cannot be read. */
 function readSession(sessionFile: string): SessionEntry[] {
@@ -687,11 +669,10 @@ export const __test__ = {
   loadAgentDefaults,
   discoverAgentDefinitions,
   buildSubagentToolAllowlist,
-  applySandboxToArgs,
+  applyLoadoutToArgs,
   uniqueRunningName,
   startingSessions,
   launchDeps,
-  steerSubagent,
   steerLive,
   deliverPendingQuestion,
   notify,
@@ -718,13 +699,14 @@ export const __test__ = {
 async function launchSubagent(
   params: Static<typeof SubagentParams>,
   def: AgentDefinition,
-  ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string; getBranch(): SessionEntry[] }; cwd: string },
+  ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string; getBranch(): SessionEntry[] }; cwd: string; model?: { provider: string; id: string } },
   artifactDir: string,
-  opts: { signal?: AbortSignal; toolCallId?: string } = {},
+  opts: { signal?: AbortSignal; toolCallId?: string; thinking?: string } = {},
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
   const id = randomUUID().slice(0, 8);
-  const effectiveModel = params.model ?? def.model;
+  const effectiveModel = params.model ?? def.model ?? (ctx.model && `${ctx.model.provider}/${ctx.model.id}`);
+  const thinking = def.thinking ?? opts.thinking;
   const interactive = def.interactive ?? !def.autoExit;
   const cwd = params.cwd ? resolve(ctx.cwd, params.cwd) : def.cwd ? resolve(getAgentDir(), def.cwd) : ctx.cwd;
   // cwd changes the start directory, not the parent's config/extensions directory.
@@ -777,7 +759,7 @@ async function launchSubagent(
     const args = ["--session", subagentSessionFile, "-e", join(SUBAGENTS_DIR, "subagent-done.ts")];
     // Only the first launch picks them: the session keeps them, including a later switch.
     if (effectiveModel) args.push("--model", effectiveModel);
-    if (def.thinking) args.push("--thinking", def.thinking);
+    if (thinking) args.push("--thinking", thinking);
     // Snapshot the loadout so resume preserves identity and tool restrictions.
     const loadout: SubagentLoadout = {
       agent: params.agent,
@@ -791,12 +773,13 @@ async function launchSubagent(
       agentDir,
     };
     writeSubagentLoadout(subagentSessionFile, loadout);
-    applySandboxToArgs(args, loadout);
+    applyLoadoutToArgs(args, loadout, subagentSessionFile);
     args.push(...await integrationArgs(agentDir));
     const env = subagentEnv(loadout, { name: params.name, sessionFile: subagentSessionFile, autoExit: !!def.autoExit });
     // The child's helper loads them all with the task: one run, none started on a skill alone.
     if (def.skills) env.PI_SUBAGENT_SKILLS = def.skills;
-    ({ surface, agent: herdrName } = await startTracked({ name: params.name, args, prompt: fullTask, env, cwd }, opts.signal));
+    clearStaleMarkers(subagentSessionFile);
+    ({ surface, agent: herdrName } = await startTracked({ name: params.name, args, env, cwd }, fullTask, opts.signal));
   } finally {
     startingSessions.delete(sessionKey);
   }
@@ -832,17 +815,20 @@ function track<T>(work: Promise<T>): Promise<T> {
 }
 
 /**
- * Start an agent. A shutdown meanwhile, or the calling tool's cancellation (Escape), abandons
- * the start, or closes the agent again rather than leave it untracked.
+ * Start an agent, then publish its task. A failed publication, shutdown or cancellation
+ * closes the pane rather than leave it untracked.
  */
-function startTracked(launch: AgentLaunch, cancel?: AbortSignal): Promise<{ surface: string; agent: string }> {
+function startTracked(launch: AgentLaunch, message: string, cancel?: AbortSignal): Promise<{ surface: string; agent: string }> {
   return track((async () => {
     const signal = cancel ? AbortSignal.any([getModuleAbortSignal(), cancel]) : getModuleAbortSignal();
     signal.throwIfAborted();
     const started = await launchDeps.startAgent(launch, signal);
-    if (signal.aborted) {
-      await closePane(started.surface).catch(() => { leftOpen.push(`${launch.name} (herdr pane ${started.surface})`); });
+    try {
       signal.throwIfAborted();
+      publishInboxMessage(launch.env.PI_SUBAGENT_SESSION, message);
+    } catch (error) {
+      await closePane(started.surface).catch(() => { leftOpen.push(`${launch.name} (herdr pane ${started.surface})`); });
+      throw error;
     }
     return started;
   })());
@@ -875,7 +861,7 @@ function deliverPendingQuestion(running: RunningSubagent): void {
   const question = questions.join("\n\n");
   const sessionId = getSessionId(running.sessionFile);
   const elapsed = Math.floor((Date.now() - running.startTime) / 1000);
-  const replyHint = `\n\nReply with subagent_message({ name: "${name}", message: "…" }) — the same name works whether it is still running or has since exited. It stays open until you reply.`;
+  const replyHint = `\n\nReply with subagent_message({ name: ${JSON.stringify(name)}, message: "…" }) — the same name works whether it is still running or has since exited. It stays open until you reply.`;
   const delivered = !question || (latestPi !== null && sendTracked(latestPi, `${running.id}:question:${randomUUID()}`, {
     customType: "subagent_question",
     content: `Sub-agent "${name}" asks (${formatElapsed(elapsed)}):\n\n${question}${replyHint}`,
@@ -936,7 +922,7 @@ function reportPaused(running: RunningSubagent): void {
   deliverOnce(file, {
     customType: "subagent_status",
     content: `Sub-agent "${running.name}" had its turn interrupted in herdr pane ${running.surface} and is waiting for input. ` +
-      `subagent_message({ name: "${running.name}", message: "…" }) continues it.`,
+      `subagent_message({ name: ${JSON.stringify(running.name)}, message: "…" }) continues it.`,
     display: true,
     details: { line: `${running.name}: interrupted, waiting in pane ${running.surface}` },
   });
@@ -966,7 +952,6 @@ async function watchSubagent(
   deps: { wait?: typeof waitForExit; close?: (surface: string) => void | Promise<void> } = {},
 ): Promise<SubagentResult> {
   const { startTime, sessionFile } = running;
-  const close = () => closePane(running.surface, deps.close);
 
   try {
     const result = await (deps.wait ?? waitForExit)(running.herdrName, AbortSignal.any([signal, getModuleAbortSignal()]), {
@@ -1002,7 +987,7 @@ async function watchSubagent(
 
     // pi has exited, leaving its pane at a shell prompt; close it.
     try {
-      await close();
+      await closePane(running.surface, deps.close);
     } catch (error) {
       console.warn(`Could not close completed subagent pane ${running.surface}: ${error}`);
       leftOpen.push(`${running.name} (herdr pane ${running.surface})`);
@@ -1023,7 +1008,9 @@ async function watchSubagent(
     };
   } catch (err: any) {
     if (!running.handedOff) {
-      try { await close(); } catch { leftOpen.push(`${running.name} (herdr pane ${running.surface})`); }
+      try { await closePane(running.surface, deps.close); } catch {
+        leftOpen.push(`${running.name} (herdr pane ${running.surface})`);
+      }
     }
     runningSubagents.delete(running.id);
 
@@ -1145,14 +1132,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagent",
       label: "Subagent",
       description:
-        "Spawn a sub-agent in a dedicated herdr pane. " +
-        "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
-        "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
-        "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
-        "DO NOT fabricate, assume, or summarize results after calling this tool. " +
-        "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
+        "Spawn a subagent in its own pane. Fire-and-forget: returns an acknowledgement; " +
+        "completion is automatically steered back later and starts a new turn.",
       promptSnippet:
-        "Spawn a sub-agent in its own herdr pane; its result arrives later as a steer message.",
+        "After spawning, end your turn or do independent work. Do not wait, poll tools or logs, or invent results.",
       parameters: SubagentParams,
 
       async execute(toolCallId, params, signal, _onUpdate, ctx) {
@@ -1203,9 +1186,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Default the name to the agent name, then suffix it against running subagents and
         // every name in the registry, so names stay unique across the whole session.
         const registryNames = new Set(Object.keys(readNameRegistry(parentArtifactDir)));
-        params.name = uniqueRunningName(params.name?.trim() || params.agent, registryNames);
+        const baseName = params.name?.trim() || params.agent;
+        if (!isValidRunName(baseName)) return fail("Subagent name must be a single line of 1–64 characters without control characters.");
+        params.name = uniqueRunningName(baseName, registryNames);
         // No await before launchSubagent registers the name, so parallel spawns see it.
-        const running = await launchSubagent(params, def, ctx, parentArtifactDir, { signal, toolCallId });
+        const running = await launchSubagent(params, def, ctx, parentArtifactDir, { signal, toolCallId, thinking: pi.getThinkingLevel() });
         watchAndDeliver(running);
 
         // Return immediately
@@ -1299,22 +1284,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagents_list",
       label: "List Subagents",
       description:
-        "List all available subagent definitions. " +
-        "Scans project-local .pi/agents/, global ~/.pi/agent/agents/ and package-bundled agents. " +
-        "Priority: project > global > package.",
+        "List available agent profiles (project > global > bundled).",
       promptSnippet:
-        "List available project, global and package-bundled agents.",
+        "Use when unsure which agent fits; never to poll for completion.",
       parameters: Type.Object({}),
 
       async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
         const list = discoverAgentDefinitions(ctx.cwd).filter((agent) => !agent.disableModelInvocation);
-
-        if (list.length === 0) {
-          return {
-            content: [{ type: "text", text: "No subagent definitions found." }],
-            details: { agents: [] },
-          };
-        }
 
         const lines = list.map((a) => {
           const badge = a.source === "project" ? " (project)" : "";
@@ -1324,7 +1300,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         });
 
         return {
-          content: [{ type: "text", text: lines.join("\n") }],
+          content: [{ type: "text", text: lines.length ? lines.join("\n") : "No subagent definitions found." }],
           details: { agents: list },
         };
       },
@@ -1332,9 +1308,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       renderResult(result, _opts, theme) {
         const details = result.details as any;
         const agents = details?.agents ?? [];
-        if (agents.length === 0) {
-          return new Text(theme.fg("dim", "No subagent definitions found."), 0, 0);
-        }
+        if (agents.length === 0) return new Text(theme.fg("dim", "No subagent definitions found."), 0, 0);
         const lines = agents.map((a: any) => {
           const badge = a.source === "project" ? theme.fg("accent", " (project)") : "";
           const desc = a.description ? theme.fg("dim", ` — ${a.description}`) : "";
@@ -1352,26 +1326,18 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagent_message",
       label: "Message Subagent",
       description:
-        "Send a message to a subagent by name. Names are unique within your session and persist after a subagent finishes, " +
-        "so the SAME name works whether the subagent is running or finished: if it is still running, your message steers its live session; " +
-        "if it has finished, your message resumes that session and continues it. " +
-        "`name` and `message` are both required. " +
-        "Steering a running subagent returns immediately with a local acknowledgement and does NOT, by itself, emit a new result. " +
-        "Resuming is a fire-and-forget async call: when the resumed sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up. " +
-        "DO NOT poll, sleep, tail logs, or read session files to detect completion — the harness handles delivery. " +
-        "DO NOT fabricate or assume results. After calling, either end your turn or work on other independent tasks.",
+        "Message a subagent: steer it if running, resume its session if finished. " +
+        "Steering waits for submission; resuming returns before completion, with the result steered back later.",
       promptSnippet:
-        "Message a subagent by name: steers it if running, resumes it if finished (same name either way). " +
-        "`name` and `message` are required. Steering returns immediately; resuming delivers its result later as a steer message. " +
-        "Do not poll or fabricate results.",
+        "After resuming, end your turn or do independent work. Do not wait, poll, or invent results.",
       parameters: Type.Object({
         name: Type.String({
           description:
-            "Exact display name of the subagent. Steers it if it is still running; resumes its session if it has finished.",
+            "Exact name returned by subagent; the same handle works after completion.",
         }),
         message: Type.String({
           description:
-            "The message to deliver: a follow-up instruction for a running subagent, or the next task for a resumed session.",
+            "Message text.",
         }),
       }),
 
@@ -1475,7 +1441,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         if (!loadout) {
           const err =
             `Cannot safely resume "${requestedName}": no loadout snapshot found for this session ` +
-            `(it predates sandboxed resume, or its .loadout.json sidecar was removed). ` +
+            `(it predates loadout snapshots, or its .loadout.json sidecar was removed). ` +
             `Resuming would drop its system prompt and tool restrictions, so this is refused. ` +
             `Re-run the task as a fresh subagent instead.`;
           return fail(err);
@@ -1509,17 +1475,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           if (steeredLive) return steeredLive;
           // Replay identity, tool allowlist and delegation; the session restores the model.
           const args = ["--session", sessionPath, "-e", join(SUBAGENTS_DIR, "subagent-done.ts")];
-          applySandboxToArgs(args, loadout);
+          applyLoadoutToArgs(args, loadout, sessionPath);
           args.push(...await integrationArgs(loadout.agentDir ?? getAgentDir()));
           // This run is autonomous: a parent that restarts and takes it back must see that.
           writeSubagentLoadout(sessionPath, { ...loadout, interactive: false });
+          clearStaleMarkers(sessionPath);
           const started = await startTracked({
             name,
             args,
-            prompt: message,
             env: subagentEnv(loadout, { name, sessionFile: sessionPath, autoExit: true }),
             cwd: loadout.cwd ?? ctx.cwd,
-          }, signal);
+          }, message, signal);
           running = watchRun(started.surface, started.agent);
         } finally {
           startingSessions.delete(sessionKey);
@@ -1564,7 +1530,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
       const taskText = task || `You are the ${agentName} agent. Wait for instructions.`;
       const displayName = agentName[0].toUpperCase() + agentName.slice(1);
-      const toolCall = `Use subagent with agent: "${agentName}", name: "${displayName}", task: ${JSON.stringify(taskText)}`;
+      const toolCall = `Use subagent with agent: ${JSON.stringify(agentName)}, name: ${JSON.stringify(displayName)}, task: ${JSON.stringify(taskText)}`;
       pi.sendUserMessage(toolCall);
     },
   });
@@ -1639,7 +1605,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               contentLines.push(
                 theme.fg(
                   "dim",
-                  `Follow up:  subagent_message({ name: "${details.name}", message: "…" })`,
+                  `Follow up:  subagent_message({ name: ${JSON.stringify(details.name)}, message: "…" })`,
                 ),
               );
             }
@@ -1697,7 +1663,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     ));
     if (options.expanded) {
       box.addChild(new Text(
-        `\n${details.question ?? ""}\n\n${theme.fg("dim", `Reply: subagent_message({ name: "${name}", message: "…" })`)}`,
+        `\n${details.question ?? ""}\n\n${theme.fg("dim", `Reply: subagent_message({ name: ${JSON.stringify(name)}, message: "…" })`)}`,
         0, 0,
       ));
     } else {

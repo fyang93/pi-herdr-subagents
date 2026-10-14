@@ -4,12 +4,14 @@
 import assert from "node:assert/strict";
 import { execFile, execFileSync, spawn } from "node:child_process";
 import { promisify } from "node:util";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
-import { closeSurface, startAgent, steer, waitForExit } from "../pi-extension/subagents/herdr.ts";
+import { closeSurface, startAgent, waitForExit } from "../pi-extension/subagents/herdr.ts";
+
+import { pendingInboxMessages, publishInboxMessage } from "../pi-extension/subagents/session.ts";
 
 assert.notEqual(process.platform, "win32", "This private PTY fixture needs a POSIX shell.");
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -86,15 +88,15 @@ function watch(agent: string, file: string) {
   return { result, ticks };
 }
 // The extensible options also allow future error/start-failure cases without changing production interfaces.
-async function launch(name: string, options: { autoExit?: boolean; prompt?: string; args?: string[] } = {}) {
-  const file = join(project, `${name}.jsonl`);
+async function launch(name: string, options: { autoExit?: boolean; prompt?: string; args?: string[]; sessionFile?: string } = {}) {
+  const file = options.sessionFile ?? join(project, `${name}.jsonl`);
   const started = await startAgent({
     name, cwd: project,
     env: { HERDR_BIN_PATH: join(binDir, "herdr-private"), PI_SUBAGENT_SESSION: file, PI_SUBAGENT_NAME: name, PI_SUBAGENT_AGENT: "session-e2e", PI_SUBAGENT_AUTO_EXIT: options.autoExit === false ? "0" : "1" },
-    args: ["--session", file, "--offline", "--no-extensions", "--no-mcp", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--no-approve",
+    args: ["--session", file, "--offline", "--no-mcp", "--no-themes", "--no-approve",
       "-e", integration, "-e", fixture, "-e", done, "--model", "session-e2e/scripted", "--thinking", "off", "--tools", "session_e2e_gate", ...(options.args ?? [])],
-    prompt: options.prompt,
   });
+  if (options.prompt) publishInboxMessage(file, options.prompt);
   return { ...started, file };
 }
 async function moved(pane: string, label: string) {
@@ -147,6 +149,10 @@ import {setTimeout as sleep} from "node:timers/promises";
 import {execFileSync} from "node:child_process";
 export default function(pi:any) {
  if (process.env.PI_SESSION_E2E !== ${JSON.stringify(server)}) throw new Error("Not an owned session-e2e server");
+ // Simulate Pi refusing submission so delivery tests can inspect an unread file.
+ const send=pi.sendUserMessage;
+ pi.sendUserMessage=(...args:any[])=>{if(existsSync(process.env.PI_SUBAGENT_SESSION+".test-refuse-input"))throw new Error("Test submission failure");return send(...args);};
+ pi.on("input",(event:any,ctx:any)=>appendFileSync(${JSON.stringify(join(base, "inputs.jsonl"))},JSON.stringify({session:process.env.PI_SUBAGENT_SESSION,text:event.text,idle:ctx.isIdle()})+"\\n"));
  const faux=fauxProvider({provider:"session-e2e",models:[{id:"scripted",contextWindow:1000000}]});
  const respond=(ctx:any)=>{
   // Replay system messages in order, as a provider does, for the effective prompt and tools.
@@ -208,11 +214,15 @@ export default function(pi:any) {
   await wait(() => normalWatch.ticks.some(t => t.status === "working"), "normal child working");
   const normalPane = await moved(normal.surface, "normal-moved");
   await wait(() => normalWatch.ticks.some(t => t.pane === normalPane && t.status === "working"), "watcher follows the moved pane by name");
-  await steer(normal.agent, plan("steered-after-move")); // Queue while its private gate is running.
+  const busyMessage = publishInboxMessage(normal.file, `${plan("steered-after-move")}\nA second line after moving the pane.`);
+  await wait(() => entries(join(base, "inputs.jsonl")).some(e => e.session === normal.file && e.text.includes("steered-after-move") && !e.idle), "child submitted multi-line busy steer");
+  assert.equal(existsSync(busyMessage), false, "submitted steer is now owned by Pi's queue");
   writeFileSync(join(project, "normal-release"), "released");
   await wait(() => received(normal.file, "steered-after-move"), "steering by name reached the moved agent");
   assert.deepEqual(await normalWatch.result, { reason: "done", exitCode: 0, summary: "RESULT:steered-after-move" });
   assert.ok(answered(normal.file, "RESULT:steered-after-move"));
+  assert.equal(existsSync(busyMessage), false);
+  assert.ok(received(normal.file, "A second line after moving the pane."));
   // pi exited and left its pane at a shell prompt; the parent closes the last observed pane.
   await closeSurface(normalWatch.ticks.at(-1)!.pane!);
   await gone(normalPane);
@@ -233,24 +243,45 @@ export default function(pi:any) {
 
   mkdirSync(join(agentDir, "agents"), { recursive: true });
   writeFileSync(join(agentDir, "agents", "e2e-scout.md"), [
-    "---", "name: e2e-scout", "description: e2e read-only scout", "model: session-e2e/scripted", "thinking: off",
+    "---", "name: e2e-scout", "description: e2e read-only scout",
     "tools: -edit,-write,+session_e2e_gate", "system-prompt: append", "auto-exit: true", "---",
-    "E2E_IDENTITY_MARKER: you are a read-only scout.", "",
+    // A multi-line body, like every bundled agent's: herdr refuses arguments with line breaks.
+    "E2E_IDENTITY_MARKER: you are a read-only scout.", "", "## Rules", "- Read files; never modify them.", "",
   ].join("\n"));
   const parentSession = join(project, "parent.jsonl");
   writeFileSync(parentSession, JSON.stringify({ type: "session", id: "parent-e2e", version: 3, cwd: project, timestamp: new Date().toISOString() }) + "\n");
   const ext = await import("../pi-extension/subagents/index.ts");
+  // herdr names become reusable once Pi exits; the replacement is not this run.
+  const original = await launch("identity-reuse", { prompt: plan("identity-original") });
+  await watch(original.agent, original.file).result;
+  await wait(async () => !(await live()).some(a => a.name === original.agent), "original name released");
+  const replacement = await launch("identity-reuse", { autoExit: false, sessionFile: join(project, "identity-replacement.jsonl") });
+  assert.equal(replacement.agent, original.agent, "the private server reused the name");
+  const staleWatch = watch(original.agent, original.file);
+  assert.equal((await staleWatch.result).reason, "done");
+  assert.deepEqual(staleWatch.ticks, [], "replacement state/pane was never reported");
+  const stale: any = { id: "stale-identity", name: "stale", task: "old task", herdrName: original.agent,
+    surface: original.surface, sessionFile: original.file, startTime: Date.now(), interactive: false };
+  await ext.__test__.watchSubagent(stale, new AbortController().signal);
+  assert.ok((await live()).some(a => a.name === replacement.agent && a.pane_id === replacement.surface), "completion did not close the replacement");
+  await gone(original.surface);
+  await closeSurface(replacement.surface);
+  console.log("PASS: reused herdr name with another session is never adopted, reported or closed");
+
   const tools: any[] = [], delivered: any[] = [];
   ext.default({
     on() {}, registerTool(tool: any) { tools.push(tool); }, registerCommand() {}, registerMessageRenderer() {}, registerShortcut() {},
-    sendUserMessage() {}, sendMessage(message: any) { delivered.push(message); }, getAllTools() { return []; },
+    sendUserMessage() {}, sendMessage(message: any) { delivered.push(message); }, getAllTools() { return []; }, getThinkingLevel() { return "off"; },
   } as any);
   const tool = (name: string) => tools.find(t => t.name === name);
-  const ctx = { cwd: project, sessionManager: { getSessionFile: () => parentSession, getSessionDir: () => join(project, "parent-sessions"), getSessionId: () => "parent-e2e" } };
+  const ctx = { cwd: project, model: { provider: "session-e2e", id: "scripted" }, sessionManager: { getSessionFile: () => parentSession, getSessionDir: () => join(project, "parent-sessions"), getSessionId: () => "parent-e2e" } };
   const finished = (tag: string) => wait(() => delivered.find(m => JSON.stringify(m).includes(`RESULT:${tag}`)), `result ${tag} delivered`, 60_000);
   const requestsFor = (file: string) => entries(join(base, "requests.jsonl")).filter(r => resolve(r.session) === resolve(file));
   const spawned = await tool("subagent").execute("call-1", { name: "resumable", agent: "e2e-scout", task: plan("first-run") }, undefined, undefined, ctx);
   assert.equal(spawned.details?.error, undefined, JSON.stringify(spawned));
+  const launchCall = audit().find(call => call.args[0] === "agent" && call.args[1] === "start" && call.args.includes(spawned.details.sessionFile));
+  assert.equal(launchCall.args[launchCall.args.indexOf("--model") + 1], "session-e2e/scripted", "launch inherits the current parent model");
+  assert.equal(launchCall.args[launchCall.args.indexOf("--thinking") + 1], "off");
   await finished("first-run");
   const childFile = ext.__test__.runningSubagents.size === 0
     ? JSON.parse(readFileSync(join(project, "parent-sessions", "artifacts", "parent-e2e", "subagent-registry.json"), "utf8")).resumable.sessionFile
@@ -270,14 +301,74 @@ export default function(pi:any) {
   assert.ok(afterResume.every(r => r.identity), "identity survives resume: " + JSON.stringify(afterResume));
   assert.deepEqual(afterResume.at(-1).tools, first.at(-1).tools, "tool restriction survives resume");
 
+  // A child exits before it reads the inbox: the waiting tool resumes with it once.
+  const unread = await tool("subagent").execute("unread-start", { name: "unread", agent: "e2e-scout", task: plan("unread-first", "unread-release") }, undefined, undefined, ctx);
+  const unreadFile = unread.details.sessionFile;
+  await wait(() => entries(join(base, "tools.jsonl")).some(e => e.session === unreadFile && e.gate === "unread-release"), "unread child busy");
+  writeFileSync(unreadFile + ".test-refuse-input", "{}");
+  const unreadWaiting = tool("subagent_message").execute("unread-message", { name: "unread", message: `${plan("unread-resume")}\nCarry this line through resume.` }, undefined, undefined, ctx);
+  await wait(() => pendingInboxMessages(unreadFile).length === 1, "message published but unread");
+  assert.equal(received(unreadFile, "unread-resume"), false);
+  await closeSurface(unread.details.pane);
+  rmSync(unreadFile + ".test-refuse-input");
+  assert.equal((await unreadWaiting).details.status, "started", "unread message resumed after watcher completion");
+  await finished("unread-resume");
+  assert.equal(entries(unreadFile).filter(e => e.type === "message" && e.message.role === "user" && JSON.stringify(e.message.content).includes("unread-resume")).length, 1);
+  assert.deepEqual(pendingInboxMessages(unreadFile), []);
+  assert.ok(received(unreadFile, "Carry this line through resume."));
+  console.log("PASS: child exits with an unread steer; waiting tool resumes with it exactly once");
+
+  // Escape cancels the parent's waiting tool, not the child watcher or its queued message.
+  const escapable = await tool("subagent").execute("escape-start", { name: "escape-wait", agent: "e2e-scout", task: plan("escape-first", "escape-release") }, undefined, undefined, ctx);
+  const escapeFile = escapable.details.sessionFile;
+  await wait(() => entries(join(base, "tools.jsonl")).some(e => e.session === escapeFile && e.gate === "escape-release"), "Escape child busy");
+  writeFileSync(escapeFile + ".test-refuse-input", "{}");
+  const escape = new AbortController();
+  const escapeWaiting = tool("subagent_message").execute("escape-message", { name: "escape-wait", message: plan("after-escape") }, escape.signal, undefined, ctx);
+  await wait(() => pendingInboxMessages(escapeFile).length === 1, "Escape message published");
+  escape.abort();
+  await assert.rejects(escapeWaiting, /abort/i);
+  assert.equal(pendingInboxMessages(escapeFile).length, 1);
+  assert.ok([...ext.__test__.runningSubagents.values()].some(child => child.sessionFile === escapeFile));
+  rmSync(escapeFile + ".test-refuse-input");
+  await wait(() => entries(join(base, "inputs.jsonl")).some(e => e.session === escapeFile && e.text.includes("after-escape") && !e.idle), "published message submitted after Escape");
+  writeFileSync(join(project, "escape-release"), "released");
+  await finished("after-escape");
+  assert.deepEqual(pendingInboxMessages(escapeFile), []);
+  console.log("PASS: Escape stops the waiting tool; supervision and queued delivery continue");
+
+  // A follow-up waits until the first task, including its private tool, has finished.
+  const followFirst = await tool("subagent_message").execute("follow-start", { name: "resumable", message: plan("follow-first", "follow-release") }, undefined, undefined, ctx);
+  await wait(() => entries(join(base, "tools.jsonl")).some(e => e.session === childFile && e.gate === "follow-release"), "follow-up child busy");
+  await wait(() => [...ext.__test__.runningSubagents.values()].some(child => child.name === "resumable" && child.status === "working"), "follow-up state reported");
+  const listed = await tool("subagents_list").execute("list-runs", {}, undefined, undefined, ctx);
+  assert.ok(listed.details.agents.some((agent: any) => agent.name === "scout"));
+  assert.equal(listed.details.running, undefined);
+  writeFileSync(childFile + ".test-refuse-input", "{}");
+  const followWaiting = tool("subagent_message").execute("follow-message", { name: "resumable", message: plan("follow-next") }, undefined, undefined, ctx);
+  const followFile = await wait(() => pendingInboxMessages(childFile)[0], "follow-up file published");
+  for (const file of [followFile, childFile + ".loadout.json", childFile + ".identity.md"]) assert.equal(statSync(file).mode & 0o777, 0o600);
+  assert.equal(statSync(childFile + ".inbox").mode & 0o777, 0o700);
+  rmSync(childFile + ".test-refuse-input");
+  await wait(() => entries(join(base, "inputs.jsonl")).some(e => e.session === childFile && e.text.includes("follow-next") && !e.idle), "follow-up queued while busy");
+  writeFileSync(join(project, "follow-release"), "released");
+  assert.equal((await followWaiting).details.status, "steered");
+  await finished("follow-next");
+  const followEntries = entries(childFile);
+  const nextInput = followEntries.findIndex(e => e.type === "message" && e.message.role === "user" && JSON.stringify(e.message.content).includes("follow-next"));
+  assert.ok(nextInput >= 0, "plain steer reaches the current conversation");
+  assert.equal(followFirst.details.sessionFile, childFile);
+  console.log("PASS: busy subagent_message uses a plain steer; private sidecars");
+
   // Control: a bare resume really loses both, so the checks above have teeth.
   const bare = await startAgent({
     name: "bare-resume", cwd: project,
     env: { PI_SUBAGENT_SESSION: childFile, PI_SUBAGENT_NAME: "bare-resume", PI_SUBAGENT_AUTO_EXIT: "1" },
-    args: ["--session", childFile, "-e", done], prompt: plan("bare-resume"),
+    args: ["--session", childFile, "-e", done],
   });
+  publishInboxMessage(childFile, plan("bare-resume"));
   await watch(bare.agent, childFile).result;
-  const bareRequests = requestsFor(childFile).slice(first.length + afterResume.length);
+  const bareRequests = requestsFor(childFile).filter(request => !request.identity);
   assert.ok(bareRequests.length > 0);
   assert.equal(bareRequests.at(-1).identity, false, "bare resume drops the identity");
   assert.ok(bareRequests.at(-1).tools.includes("write"), "bare resume restores default tools");
@@ -294,6 +385,7 @@ export default function(pi:any) {
     await gone(failed.surface);
     console.log("PASS: provider error sidecar");
   }
+  assert.equal(audit().some(call => call.args[0] === "agent" && call.args[1] === "prompt"), false, "all messaging bypasses the terminal");
   console.log(`PASS: isolated session e2e (${server})`);
 } catch (error) {
   if (ownsServer) {
