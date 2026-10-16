@@ -1,7 +1,7 @@
 ---
 name: scout
 description: Fast codebase recon — explores files, finds patterns, maps architecture
-tools: -bash,-edit,-write,+grep,+find,+ls,+codemode
+tools: read,grep,find,ls,codemode
 model: openai-codex/gpt-5.6-luna
 thinking: low
 system-prompt: append

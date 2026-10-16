@@ -738,11 +738,11 @@ describe("subagent discovery", () => {
     });
   });
 
-  it("gives scout default tools minus bash/edit/write, plus grep/find/ls and codemode", async () => {
+  it("gives scout an explicit read-only tool allowlist plus codemode", async () => {
     await withIsolatedAgentEnv(() => {
       const scout = testApi.loadAgentDefaults("scout");
-      assert.equal(scout?.tools, "-bash,-edit,-write,+grep,+find,+ls,+codemode");
-      assert.equal(testApi.buildSubagentToolAllowlist(scout?.tools), "-bash,-edit,-write,+grep,+find,+ls,+codemode,+ask_question");
+      assert.equal(scout?.tools, "read,grep,find,ls,codemode");
+      assert.equal(testApi.buildSubagentToolAllowlist(scout?.tools), "read,grep,find,ls,codemode,ask_question");
     });
   });
 

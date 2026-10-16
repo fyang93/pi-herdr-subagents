@@ -80,7 +80,7 @@ You are a specialized agent that does X...
 | `description` | string | Shown in `subagents_list` |
 | `model` | string | Launch default; omitted inherits the parent's current model |
 | `thinking` | string | Pi level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Applies with or without `model`; omitted inherits the parent's level on launch |
-| `tools` | string or string[] | Plain names (`read,bash,codemode`) replace defaults; `+name`/`-name` selectors (`"+codemode -bash"` or `[+codemode, -bash]`) modify defaults in order. Mixing forms (`read,-bash`) is rejected at spawn. Empty/omitted uses defaults. `ask_question` and permitted spawning tools are added automatically |
+| `tools` | string or string[] | Plain names (`read,bash,codemode`) are a strict allowlist; `+name`/`-name` selectors (`"+codemode -bash"` or `[+codemode, -bash]`) modify defaults in order and retain extension tools. Mixing forms (`read,-bash`) is rejected at spawn. Empty/omitted uses defaults. `ask_question` and permitted spawning tools are added automatically |
 | `subagent_agents` | string | Comma-separated profiles the child may spawn. A non-empty list grants `subagent`, `subagent_message`, `subagents_list` and restricts targets; empty/omitted denies spawning. An agent cannot spawn its own profile, even if listed |
 | `skills` | string | Comma-separated skill names (also `skill:`); all load with the first task, in one run |
 | `session-mode` | string | `standalone` (default): fresh, unlinked session. `lineage-only`: fresh with `parentSession` linkage for discovery/fork UX, no copied turns. `fork`: copy the caller's active branch up to the assistant message making the spawn call, not an abandoned `/tree` branch |
@@ -100,7 +100,7 @@ Submitted human or orchestrator input is more work and can finish normally. Esca
 
 | Agent | Model | Tools | Role |
 | --- | --- | --- | --- |
-| **scout** | `openai-codex/gpt-5.6-luna` | Defaults − `bash`, `edit`, `write` + `grep`, `find`, `ls`, `codemode` | Fast read-only codebase recon |
+| **scout** | `openai-codex/gpt-5.6-luna` | `read,grep,find,ls,codemode` | Fast read-only codebase recon |
 | **researcher** | `openai-codex/gpt-5.6-luna` | Defaults − `edit`, `write` + `codemode` | Web research, synthesized into a sourced brief |
 | **worker** | parent's current model | Defaults + `codemode` + spawning | General implementer; may spawn `scout` and `researcher` |
 
@@ -122,7 +122,7 @@ Tool restrictions are optional and **not a security sandbox**. `tools` becomes o
 
 Every spawn, at every depth, must name a known profile. Top-level sessions may spawn any discoverable profile; children are limited to `subagent_agents` (enforced through `PI_SUBAGENT_ALLOWED`). Omitting `agent` cannot bypass this. Saved tool selection survives resume, but controls declarations, not extension initialization, hooks, background tasks or all indirect MCP access. Enable only extensions suitable for child processes.
 
-Install tool packages normally, e.g. `pi install npm:pi-web-access`, then select their tools in `tools`. Replace older sessions whose saved allowlist uses `web_fetch` with new sessions using `fetch_content`. The removed `registerToolExtension(name, path)` hook is replaced by enabling extensions in Pi settings.
+Install tool packages normally, e.g. `pi install npm:pi-web-access`. Prefer modifiers for roles that should retain extension tools: `tools: -edit,-write,+codemode` keeps web tools available without listing each one; pi-web-access may expose `web_enable` first to activate them on demand. Use a plain allowlist when intentionally restricting tool declarations, as Scout does with `tools: read,grep,find,ls,codemode`. Do not list `ask_question`; this extension adds it automatically. Replace older sessions whose saved allowlist uses `web_fetch` with new sessions using `fetch_content`. The removed `registerToolExtension(name, path)` hook is replaced by enabling extensions in Pi settings.
 
 Scout can discover native MCP tools with `tool_search` or codemode's `searchTools()` / `describeNamespace()`, then call directly or via codemode (including batches). Configure servers in `~/.pi/agent/mcp.json` or trusted project `.pi/mcp.json`; children connect according to that configuration and tool exposure (`direct`, `deferred`, `codemode`). No `mcp`/`mcpScript` adapter is needed. Read-only profile instructions do not enforce MCP permissions; restrict server operations separately.
 
