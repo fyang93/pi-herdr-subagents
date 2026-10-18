@@ -100,8 +100,8 @@ Submitted human or orchestrator input is more work and can finish normally. Esca
 
 | Agent | Model | Tools | Role |
 | --- | --- | --- | --- |
-| **scout** | `openai-codex/gpt-5.6-luna` | `read,grep,find,ls,codemode` | Fast read-only codebase recon |
-| **researcher** | `openai-codex/gpt-5.6-luna` | Defaults − `edit`, `write` + `codemode` | Web research, synthesized into a sourced brief |
+| **scout** | `openai/gpt-5.6-luna` | `read,grep,find,ls,codemode` | Fast read-only codebase recon |
+| **researcher** | `openai/gpt-5.6-luna` | Defaults − `edit`, `write` + `codemode` | Web research, synthesized into a sourced brief |
 | **worker** | parent's current model | Defaults + `codemode` + spawning | General implementer; may spawn `scout` and `researcher` |
 
 All three use `auto-exit: true` and `system-prompt: append`.
