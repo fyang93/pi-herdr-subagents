@@ -110,8 +110,8 @@ async function openPane(launch: AgentLaunch, signal?: AbortSignal): Promise<stri
   // Ask herdr for the caller's pane: HERDR_PANE_ID is only a launch-time alias after a move.
   const { pane: current } = await herdrAsync(["pane", "current", "--current"], { signal });
   const parent = current.pane_id;
-  const minColumns = positiveInteger(process.env.PI_SUBAGENT_MIN_COLUMNS, 50);
-  const minRows = positiveInteger(process.env.PI_SUBAGENT_MIN_ROWS, 15);
+  const minColumns = positiveInteger(process.env.PI_SUBAGENT_MIN_COLUMNS, 80);
+  const minRows = positiveInteger(process.env.PI_SUBAGENT_MIN_ROWS, 24);
   const { layout } = await herdrAsync(["pane", "layout", "--pane", parent], { signal });
   // Split only the parent's own pane, never another pane the user may be working in;
   // a background tab when it is too small or zoomed. Never unzoom or rearrange the layout.

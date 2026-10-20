@@ -130,7 +130,7 @@ New sidecars (loadout, identity, registry, questions, inbox and markers) use `06
 
 ## How it works
 
-- **Panes:** split the caller's current pane without focus, or use a background tab if either half would be under **50 columns × 15 rows** (`PI_SUBAGENT_MIN_COLUMNS`, `PI_SUBAGENT_MIN_ROWS`) or the tab is zoomed. Other panes are never rearranged. Herdr names derive from display names (`Scout: auth` → `scout-auth`) and get suffixes when taken.
+- **Panes:** split the caller's current pane without focus, or use a background tab if either half would be under **80 columns × 24 rows** (readability-first default) (`PI_SUBAGENT_MIN_COLUMNS`, `PI_SUBAGENT_MIN_ROWS`) or the tab is zoomed. Other panes are never rearranged. Herdr names derive from display names (`Scout: auth` → `scout-auth`) and get suffixes when taken.
 - **Delivery:** publish tasks only after Pi is ready. Children take inbox messages in order and delete files when Pi accepts them. Resume clears stale markers and inbox files; a waiting messaging tool reclaims its unread message before resuming.
 - **Status:** the theme-aware widget shows elapsed time, profile, state and last tool (parallel calls may still have another tool running). Herdr's sidebar shows working, idle, blocked or done. Tracking follows pane moves; a replacement with a different reported session is never adopted, reported or closed. A missing session report alone is not a mismatch.
 - **Attention:** autonomous children notify the parent once when blocked at a dialog or interrupted by Escape; their panes stay open. Use `subagent_message` to continue an interrupted child. Interactive children suppress blocked notices by default.

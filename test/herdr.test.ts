@@ -58,6 +58,26 @@ it("starts a named agent in an unfocused split of the parent's own pane, else a 
   }
 });
 
+it("defaults to readable 80-column by 24-row panes, otherwise opens a tab", async () => {
+  for (const [width, height, direction] of [
+    [220, 60, "right"],
+    [110, 60, "down"],
+    [160, 24, "right"],
+    [80, 48, "down"],
+    [159, 24, null],
+    [80, 47, null],
+    [110, 30, null],
+    [55, 30, null],
+  ] as const) {
+    writeFileSync(log, "");
+    writeFileSync(join(dir, "start"), "");
+    layout([["w1:p1", width, height]]);
+    const { surface } = await herdr.startAgent(launch);
+    assert.equal(surface, direction ? "w1:p9" : "w1:p8", `${width}×${height}`);
+    if (direction) assert.equal(calls()[2][4], direction);
+  }
+});
+
 it("abandons a start on abort and closes the pane it opened", async () => {
   layout([["w1:p1", 200, 50]]);
   writeFileSync(join(dir, "start_hang"), "");
