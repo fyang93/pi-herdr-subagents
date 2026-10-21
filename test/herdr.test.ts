@@ -269,6 +269,24 @@ it("treats a reused name with a different session as exited, without adopting or
   }
 });
 
+it("preserves the pane and original result when a completed session is replaced, even with no exit grace", async () => {
+  const session = join(dir, "completed-original.jsonl");
+  writeFileSync(session + ".exit", JSON.stringify({ type: "done", summary: "Original answer" }));
+  reply("agent", { result: { agent: { pane_id: "w1:p9", agent_status: "working", agent_session: { kind: "path", value: join(dir, "replacement.jsonl") } } } });
+  try {
+    for (const exitGrace of [0, 30_000]) {
+      const ticks: unknown[] = [];
+      const result = await herdr.waitForExit("scout", new AbortController().signal, {
+        interval: 1, sessionFile: session, exitGrace, onTick: (...args) => ticks.push(args),
+      });
+      assert.deepEqual(result, { reason: "done", exitCode: 0, summary: "Original answer", preservePane: true });
+      assert.deepEqual(ticks, [], "never adopt the replacement");
+    }
+  } finally {
+    rmSync(session + ".exit");
+  }
+});
+
 async function fakeEvents(t: TestContext) {
   const path = join(dir, "events.sock");
   const requests: any[] = [];
@@ -396,7 +414,7 @@ it("a close event confirms interruption twice, but a late marker still wins", { 
   assert.equal(calls().length, 1);
   writeFileSync(`${session}.exit`, JSON.stringify({ type: "quit" }));
   assert.deepEqual(await done, { reason: "quit", exitCode: 1 });
-  assert.equal(calls().length, 1, "the marker wins before a second CLI check");
+  assert.equal(calls().length, 2, "the late marker wins after rechecking session ownership");
   assert.equal((await herdr.waitForExit("scout", controller.signal, { interval: 20 })).reason, "interrupted");
 });
 

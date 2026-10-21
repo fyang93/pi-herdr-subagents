@@ -672,12 +672,21 @@ describe("subagent discovery", () => {
     });
   });
 
-  // Bundled profiles are checked without the caller's own agents, which may override them.
-  it("bundled scout/researcher/worker all resolve as non-interactive (auto-exit)", async () => {
+  it("does not discover example roles until explicitly installed", async () => {
     await withIsolatedAgentEnv(() => {
+      assert.deepEqual(testApi.discoverAgentDefinitions(), []);
+      for (const name of ["scout", "researcher", "worker"]) {
+        assert.equal(testApi.loadAgentDefaults(name), null);
+      }
+    });
+  });
+
+  it("example scout/researcher/worker all resolve as non-interactive (auto-exit)", async () => {
+    await withIsolatedAgentEnv(({ projectAgentsDir }) => {
+      cpSync(fileURLToPath(new URL("../examples/agents/", import.meta.url)), projectAgentsDir, { recursive: true });
       for (const name of ["scout", "researcher", "worker"]) {
         const defs = testApi.loadAgentDefaults(name);
-        assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
+        assert.ok(defs, `expected installed example ${name} to be discoverable`);
         assert.equal(
           defs.interactive ?? !defs.autoExit,
           false,
@@ -688,9 +697,10 @@ describe("subagent discovery", () => {
   });
 
   it("worker is granted the spawning toolset restricted to scout and researcher", async () => {
-    await withIsolatedAgentEnv(() => {
+    await withIsolatedAgentEnv(({ projectAgentsDir }) => {
+      cpSync(fileURLToPath(new URL("../examples/agents/", import.meta.url)), projectAgentsDir, { recursive: true });
       const worker = testApi.loadAgentDefaults("worker");
-      assert.ok(worker, "expected bundled worker to be discoverable");
+      assert.ok(worker, "expected installed example worker to be discoverable");
       assert.deepEqual(worker.subagentAgents, ["scout", "researcher"]);
 
       const allowlist = testApi.buildSubagentToolAllowlist(worker.tools, { grantSpawning: true });
@@ -704,27 +714,31 @@ describe("subagent discovery", () => {
   });
 
   it("scout and researcher are not granted spawning tools", async () => {
-    await withIsolatedAgentEnv(() => {
+    await withIsolatedAgentEnv(({ projectAgentsDir }) => {
+      cpSync(fileURLToPath(new URL("../examples/agents/", import.meta.url)), projectAgentsDir, { recursive: true });
       for (const name of ["scout", "researcher"]) {
         const defs = testApi.loadAgentDefaults(name);
-        assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
+        assert.ok(defs, `expected installed example ${name} to be discoverable`);
         assert.equal(defs.subagentAgents, undefined, `${name} should not declare subagent_agents`);
       }
     });
   });
 
-  it("keeps delegation denied without subagent_agents even when extensions load normally", () => {
-    const moduleUrl = new URL("../pi-extension/subagents/index.ts", import.meta.url).href;
-    for (const allowed of [undefined, "", "scout"]) {
-      const env: NodeJS.ProcessEnv = { ...process.env, PI_SUBAGENT_AGENT: "worker" };
-      delete env.PI_SUBAGENT_ALLOWED;
-      if (allowed !== undefined) env.PI_SUBAGENT_ALLOWED = allowed;
-      const output = execFileSync(process.execPath, ["--input-type=module", "-e",
-        `import { __test__ } from ${JSON.stringify(moduleUrl)};
-         console.log(JSON.stringify(__test__.discoverAgentDefinitions().map(a => a.name)));`,
-      ], { env, encoding: "utf8" });
-      assert.deepEqual(JSON.parse(output), allowed ? ["scout"] : []);
-    }
+  it("keeps delegation denied without subagent_agents even when extensions load normally", async () => {
+    await withIsolatedAgentEnv(({ projectAgentsDir }) => {
+      cpSync(fileURLToPath(new URL("../examples/agents/", import.meta.url)), projectAgentsDir, { recursive: true });
+      const moduleUrl = new URL("../pi-extension/subagents/index.ts", import.meta.url).href;
+      for (const allowed of [undefined, "", "scout"]) {
+        const env: NodeJS.ProcessEnv = { ...process.env, PI_SUBAGENT_AGENT: "worker" };
+        delete env.PI_SUBAGENT_ALLOWED;
+        if (allowed !== undefined) env.PI_SUBAGENT_ALLOWED = allowed;
+        const output = execFileSync(process.execPath, ["--input-type=module", "-e",
+          `import { __test__ } from ${JSON.stringify(moduleUrl)};
+           console.log(JSON.stringify(__test__.discoverAgentDefinitions().map(a => a.name)));`,
+        ], { env, encoding: "utf8" });
+        assert.deepEqual(JSON.parse(output), allowed ? ["scout"] : []);
+      }
+    });
   });
 
   it("treats empty tools frontmatter as unrestricted without swallowing the next field", async () => {
@@ -739,7 +753,8 @@ describe("subagent discovery", () => {
   });
 
   it("gives scout an explicit read-only tool allowlist plus codemode", async () => {
-    await withIsolatedAgentEnv(() => {
+    await withIsolatedAgentEnv(({ projectAgentsDir }) => {
+      cpSync(fileURLToPath(new URL("../examples/agents/", import.meta.url)), projectAgentsDir, { recursive: true });
       const scout = testApi.loadAgentDefaults("scout");
       assert.equal(scout?.tools, "read,grep,find,ls,codemode");
       assert.equal(testApi.buildSubagentToolAllowlist(scout?.tools), "read,grep,find,ls,codemode,ask_question");
@@ -976,7 +991,7 @@ describe("subagent-done.ts", () => {
     let active = ["read", "ask_question"];
     api.getActiveTools = () => active;
     subagentDoneExtension(api);
-    const ctx = { ui: { setWidget(_key: string, factory: any) { widget = factory; } }, sessionManager: { getLeafId: () => null } };
+    const ctx = { ui: { setWidget(_key: string, factory: any) { widget = factory; } }, sessionManager: { getEntries: () => [] } };
     const theme = { bg: (_color: string, text: string) => text, fg: (_color: string, text: string) => text, bold: (text: string) => text };
     start({}, ctx);
     const shown = widget({}, theme);
@@ -1170,7 +1185,7 @@ describe("subagent-done.ts", () => {
       const branch: any[] = []; // the child's active branch, as its session manager reports it
       const ctx = {
         ui: { setWidget() {} },
-        sessionManager: { getLeafId: () => branch.at(-1)?.id ?? null, getBranch: () => branch },
+        sessionManager: { getEntries: () => branch, getLeafId: () => branch.at(-1)?.id ?? null, getBranch: () => branch },
         isIdle: () => true,
         model: { provider: "test", id: "model" } as any,
         modelRegistry: { hasConfiguredAuth: () => true, getApiKeyAndHeaders: async () => ({ ok: true }) } as any,
@@ -1267,6 +1282,26 @@ describe("subagent-done.ts", () => {
           if (finishFirst) await h.settle([{ role: "assistant", stopReason: "stop" }]);
           h.emit("session_shutdown", { reason: "quit" }, h.ctx);
           assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")), { type: finishFirst ? "done" : "quit", summary: "Done it." });
+        } finally {
+          h.restore();
+          rmSync(dir, { recursive: true, force: true });
+        }
+      }
+    });
+
+    it("preserves ordinary results on a pre-upgrade child's reload, but never falls back to an unrelated branch", () => {
+      for (const baseline of [null, "old", "missing"] as const) {
+        const dir = createTestDir(), sessionFile = join(dir, "legacy.jsonl");
+        const h = setupCapturingExtension(sessionFile);
+        try {
+          const state = (globalThis as any)[Symbol.for("pi-subagents/child-state")];
+          delete state.existingEntryIds;
+          state.baseline = baseline;
+          if (baseline !== null) h.branch.push({ ...ASSISTANT_MSG, id: "old" });
+          if (baseline !== "missing") h.branch.push({ type: "message", id: "new", message: { role: "assistant", content: [{ type: "text", text: "Fresh answer" }] } });
+          h.reload();
+          h.emit("session_shutdown", { reason: "quit" }, h.ctx);
+          assert.equal(JSON.parse(readFileSync(sessionFile + ".exit", "utf8")).summary, baseline === "missing" ? null : "Fresh answer");
         } finally {
           h.restore();
           rmSync(dir, { recursive: true, force: true });
@@ -1543,7 +1578,7 @@ describe("subagent-done.ts", () => {
         sent.push({ text, options });
       };
       try {
-        Object.assign(h.ctx, { isIdle: () => false });
+        Object.assign(h.ctx, { isIdle: () => false, signal: new AbortController().signal });
         const first = publishInboxMessage(session, "line one\nline two"), second = publishInboxMessage(session, "next");
         writeFileSync(first, JSON.stringify({ message: "line one\nline two", followUp: true })); // legacy field is ignored
         writeFileSync(join(session + ".inbox", "000-malformed.json"), "{");
@@ -1578,7 +1613,7 @@ describe("subagent-done.ts", () => {
         assert.deepEqual(pendingInboxMessages(session), [second]);
         assert.deepEqual(sent[0].options, { deliverAs: "steer" });
         h.emit("agent_start");
-        Object.assign(h.ctx, { isIdle: () => false });
+        Object.assign(h.ctx, { isIdle: () => false, signal: new AbortController().signal });
         t.mock.timers.tick(250);
         assert.equal(sent.length, 2);
         assert.deepEqual(sent[1].options, { deliverAs: "steer" });
@@ -1713,21 +1748,18 @@ describe("subagent-done.ts", () => {
 });
 
 describe("commands", () => {
-  it("/subagent emits a spawn tool call for a known agent", () => {
-    const { api, registeredCommands, sentUserMessages } = createMockExtensionApi();
-
-    (subagentsModule as any).default(api);
-
-    const subagent = registeredCommands.find((command) => command.name === "subagent");
-    assert.ok(subagent, "expected /subagent to be registered");
-
-    subagent.handler("scout map the auth code", {
-      ui: { notify() {} },
+  it("/subagent emits a spawn tool call for a known agent", async () => {
+    await withIsolatedAgentEnv(({ projectAgentsDir }) => {
+      writeAgentFile(projectAgentsDir, "scout", "name: scout");
+      const { api, registeredCommands, sentUserMessages } = createMockExtensionApi();
+      subagentsModule.default(api);
+      const subagent = registeredCommands.find((command) => command.name === "subagent");
+      assert.ok(subagent, "expected /subagent to be registered");
+      subagent.handler("scout map the auth code", { ui: { notify() {} } });
+      assert.equal(sentUserMessages.length, 1);
+      assert.match(sentUserMessages[0], /agent: "scout"/);
+      assert.match(sentUserMessages[0], /map the auth code/);
     });
-
-    assert.equal(sentUserMessages.length, 1);
-    assert.match(sentUserMessages[0], /agent: "scout"/);
-    assert.match(sentUserMessages[0], /map the auth code/);
   });
 
   it("does not register the removed /iterate or /plan commands", () => {
@@ -2386,6 +2418,7 @@ describe("adopted profile and lifecycle designs", () => {
     const { api, registeredTools } = createMockExtensionApi();
     subagentsModule.default(api);
     try {
+      writeAgentFile(join(dir, ".pi", "agents"), "scout", "name: scout");
       const listed = await registeredTools.find(tool => tool.name === "subagents_list").execute("list", {}, undefined, undefined, { cwd: dir });
       assert.match(listed.content[0].text, /• scout/);
       assert.equal(listed.details.running, undefined);
@@ -2816,6 +2849,51 @@ describe("watchSubagent", () => {
     assert.match(result.summary, /without output/);
   });
 
+  it("delivers a completed result without closing a pane whose session was replaced", async () => {
+    const root = createTestDir();
+    const sessionFile = join(root, "replaced.jsonl");
+    writeFileSync(sessionFile + ".exit", JSON.stringify({ type: "done", summary: "Original answer" }));
+    const child = { ...running, sessionFile };
+    testApi.runningSubagents.set(child.id, child);
+    try {
+      const result = await testApi.watchSubagent(child, new AbortController().signal, {
+        wait: async () => ({ reason: "done", exitCode: 0, summary: "Original answer", preservePane: true }),
+        close: () => assert.fail("must not close a reused pane"),
+      });
+      assert.equal(result.summary, "Original answer");
+      assert.equal(result.exitCode, 0);
+      assert.equal(testApi.runningSubagents.has(child.id), false);
+      assert.equal(existsSync(sessionFile + ".exit"), false);
+    } finally {
+      testApi.runningSubagents.delete(child.id);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps completed results and pane ownership when removing a marker fails", async (t) => {
+    const warnings: string[] = [];
+    t.mock.method(console, "warn", (message: string) => warnings.push(message));
+    for (const preservePane of [false, true]) {
+      const root = createTestDir(), sessionFile = join(root, "cleanup.jsonl");
+      // rmSync without recursive fails on a directory, even when tests run as root.
+      mkdirSync(sessionFile + ".exiting");
+      const closed: string[] = [];
+      try {
+        const result = await testApi.watchSubagent({ ...running, sessionFile }, new AbortController().signal, {
+          wait: async () => ({ reason: "done", exitCode: 0, summary: "Original answer", preservePane }),
+          close: (pane: string) => { closed.push(pane); },
+        });
+        assert.equal(result.summary, "Original answer");
+        assert.equal(result.exitCode, 0);
+        assert.deepEqual(closed, preservePane ? [] : [running.surface]);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    }
+    assert.equal(warnings.length, 2);
+    assert.ok(warnings.every(message => message.includes("Could not remove subagent marker")));
+  });
+
   it("closes and untracks tasks on caller abort and module abort", async () => {
     const closed: string[] = [];
     const close = (surface: string) => { closed.push(surface); };
@@ -2991,6 +3069,61 @@ describe("session shutdown", () => {
       testApi.runningSubagents.clear();
       (globalThis as any)[moduleKey].abort();
       (globalThis as any)[moduleKey] = originalModule;
+    }
+  });
+
+  it("hands held questions and completed results to the new API once, retaining pending-result counts", async () => {
+    const testApi = subagentsModule.__test__;
+    const root = createTestDir();
+    const sessionFile = join(root, "held.jsonl");
+    const originalWatch = testApi.launchDeps.watchSubagent;
+    const moduleKey = Symbol.for("pi-subagents/poll-abort-controller");
+    const originalModule = (globalThis as any)[moduleKey];
+    (globalThis as any)[moduleKey] = new AbortController();
+    const childCount = (globalThis as any)[Symbol.for("pi-subagents/running-children-count")];
+    const handlers = new Map<string, (...args: any[]) => any>();
+    const { api } = createMockExtensionApi();
+    const oldSent: any[] = [], newSent: any[] = [];
+    api.on = (event: string, handler: any) => { handlers.set(event, handler); };
+    api.sendMessage = (message: any) => oldSent.push(message);
+    const ctx = { isIdle: () => true, hasUI: false };
+    testApi.undelivered.clear(); testApi.unconsumed.clear(); testApi.queued.clear();
+    testApi.launchDeps.watchSubagent = async (child: any) => {
+      testApi.runningSubagents.delete(child.id);
+      return { summary: "Held result", exitCode: 0, elapsed: 1 };
+    };
+    try {
+      subagentsModule.default(api);
+      handlers.get("session_start")!({ reason: "startup" }, ctx);
+      handlers.get("input")!({ text: "handled by another extension" }, ctx);
+      const child: any = { id: "held-child", name: "held-child", task: "task", surface: "w1:p9", herdrName: "held-child", sessionFile, startTime: Date.now(), interactive: false };
+      publishQuestion(sessionFile, "Held question?");
+      testApi.deliverPendingQuestion(child);
+      testApi.runningSubagents.set(child.id, child);
+      testApi.watchAndDeliver(child);
+      await delay(0);
+      assert.deepEqual(oldSent, []);
+      assert.equal(pendingQuestions(sessionFile).files.length, 0);
+      assert.equal(testApi.undelivered.size, 2);
+      assert.equal(testApi.runningSubagents.size, 0, "completed child cannot be recovered from running watchers");
+      await handlers.get("session_shutdown")!({ reason: "reload" }, ctx);
+      api.sendMessage = () => assert.fail("old API must not be used after reload");
+      subagentsModule.default({ ...api, sendMessage: (message: any) => newSent.push(message) });
+      handlers.get("session_start")!({ reason: "reload" }, ctx);
+      assert.deepEqual(newSent.map(m => m.customType), ["subagent_question", "subagent_result"]);
+      assert.equal(childCount(), 1, "the result must enter the conversation before a nested parent may exit");
+      for (const message of newSent) handlers.get("message_start")!({ message: { role: "custom", ...message } });
+      assert.equal(childCount(), 0);
+      assert.equal(testApi.undelivered.size, 0);
+      handlers.get("session_start")!({ reason: "reload" }, ctx);
+      handlers.get("agent_start")!({});
+      assert.equal(newSent.length, 2, "handoff and old held queue are consumed once");
+    } finally {
+      await handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
+      testApi.launchDeps.watchSubagent = originalWatch;
+      testApi.runningSubagents.clear(); testApi.undelivered.clear(); testApi.unconsumed.clear(); testApi.queued.clear();
+      (globalThis as any)[moduleKey] = originalModule;
+      rmSync(root, { recursive: true, force: true });
     }
   });
 

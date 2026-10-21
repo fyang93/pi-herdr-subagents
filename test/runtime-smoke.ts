@@ -238,6 +238,126 @@ test("RPC asks a question without auto-exit; answer permits settled completion",
   assert.equal(requests.length, 3); assert.match(JSON.stringify(requests[2].messages), /CHOOSE A/); assert.equal(lastAssistant(h).stopReason, "stop"); assert.deepEqual(h.sidecar(".exit"), { type: "done", summary: "SIMULATED_OK" });
 });
 
+test("manual compaction retains inbox replies and delivers them once, in order, afterward", async () => {
+  const keepOpen = join(root, "compaction-keep-open.ts");
+  writeFileSync(keepOpen, 'export default () => { process.env.PI_SUBAGENT_AUTO_EXIT = "0"; };');
+  const h = start({
+    beforeExtensions: [keepOpen],
+    configure(_dir, config) {
+      writeFileSync(join(config, "settings.json"), JSON.stringify({ retry: { enabled: false }, compaction: { enabled: false, keepRecentTokens: 100, reserveTokens: 1000 } }));
+    },
+  });
+  await h.command("get_state");
+  replies.push({ text: "FIRST ANSWER " + "context to compact. ".repeat(100) });
+  prompt(h, "FIRST TASK " + "background information. ".repeat(100));
+  await waitFor(() => h.records.filter(r => r.type === "agent_settled").length === 1, h.diagnostic);
+  replies.push({ text: "SECOND ANSWER " + "more context. ".repeat(100) });
+  prompt(h, "SECOND TASK");
+  await waitFor(() => h.records.filter(r => r.type === "agent_settled").length === 2, h.diagnostic);
+  const before = requests.length;
+  replies.push({ text: "COMPACTED SUMMARY", delay: 1500 });
+  const compactId = h.send("compact");
+  await waitFor(() => requests.length > before, h.diagnostic);
+  const texts = ["FIRST_REPLY_DURING_COMPACTION", "SECOND_REPLY_DURING_COMPACTION"];
+  const files = texts.map(text => publishInboxMessage(h.session, text));
+  await delay(400); // allow the inbox poll to run while the real compaction request is pending
+  assert.equal(h.records.some(r => r.type === "response" && r.id === compactId), false);
+  assert.deepEqual(pendingInboxMessages(h.session), files, "compaction must not consume either reply");
+  const receipt = await waitFor(() => h.records.find(r => r.type === "response" && r.id === compactId), h.diagnostic);
+  assert.equal(receipt.success, true, h.diagnostic());
+  await waitFor(() => pendingInboxMessages(h.session).length === 0 && texts.every(text => JSON.stringify(requests.at(-1).messages).includes(text)), h.diagnostic);
+  assert.deepEqual(pendingInboxMessages(h.session), []);
+  const users = userTexts(sessionEntries(h).filter(e => e.type === "message").map(e => e.message));
+  assert.deepEqual(users.filter(text => texts.includes(text)), texts, "both replies are persisted exactly once, in order");
+  for (const text of texts) assert.ok(JSON.stringify(requests.at(-1).messages).includes(text), "both replies reached the model");
+  assert.equal(h.records.some(r => JSON.stringify(r).includes("Cannot submit a prompt while compaction is in progress")), false);
+  await h.stop();
+});
+
+test("tree navigation after resume excludes old answers and sibling errors but keeps fresh answers across reload", async () => {
+  const navigate = join(root, "navigate-tree.ts");
+  writeFileSync(navigate, `export default (pi:any) => {
+    process.env.PI_SUBAGENT_AUTO_EXIT = "0";
+    pi.registerCommand("smoke-tree", {handler: async (id:string, ctx:any) => { await ctx.navigateTree(id.trim(), {summarize:false}); }});
+    pi.registerCommand("smoke-reload", {handler: async (_args:string, ctx:any) => { await ctx.reload(); }});
+  };`);
+  const h = start({ beforeExtensions: [navigate] });
+  await h.command("get_state");
+  replies.push({ text: "OLD FIRST ANSWER" });
+  prompt(h, "OLD FIRST TASK");
+  await waitFor(() => h.records.filter(r => r.type === "agent_settled").length === 1, h.diagnostic);
+  const assistantId = () => sessionEntries(h).filter(e => e.type === "message" && e.message.role === "assistant").at(-1).id;
+  const firstEntry = assistantId();
+  replies.push({ status: 400, message: "OLD SIBLING ERROR" });
+  prompt(h, "OLD FAILED TASK");
+  await waitFor(() => h.records.filter(r => r.type === "agent_settled").length === 2, h.diagnostic);
+  const errorEntry = assistantId();
+  assert.equal(lastAssistant(h).stopReason, "error");
+  assert.equal((await h.command("prompt", { message: `/smoke-tree ${firstEntry}` })).success, true, h.diagnostic());
+  replies.push({ text: "OLD SECOND ANSWER" });
+  prompt(h, "OLD SECOND TASK");
+  await waitFor(() => h.records.filter(r => r.type === "agent_settled").length === 3, h.diagnostic);
+  const secondEntry = assistantId();
+  await h.stop();
+
+  for (const target of [firstEntry, errorEntry, secondEntry]) {
+    rmSync(h.session + ".exit", { force: true });
+    const resumed = start({ beforeExtensions: [navigate], session: h.session });
+    await resumed.command("get_state");
+    assert.equal((await resumed.command("prompt", { message: `/smoke-tree ${target}` })).success, true, resumed.diagnostic());
+    await resumed.stop();
+    assert.equal(requests.length, 0);
+    assert.deepEqual(resumed.sidecar(".exit"), { type: "done", summary: null }, "old entries, including sibling branches, are not this run's result");
+  }
+
+  rmSync(h.session + ".exit", { force: true });
+  const resumed = start({ beforeExtensions: [navigate], session: h.session });
+  await resumed.command("get_state");
+  assert.equal((await resumed.command("prompt", { message: `/smoke-tree ${firstEntry}` })).success, true, resumed.diagnostic());
+  replies.push({ text: "FRESH SWITCHED-BRANCH ANSWER" });
+  prompt(resumed, "NEW TASK ON OLD BRANCH");
+  await waitFor(() => resumed.records.some(r => r.type === "agent_settled"), resumed.diagnostic);
+  assert.equal((await resumed.command("prompt", { message: "/smoke-reload" })).success, true, resumed.diagnostic());
+  await resumed.stop();
+  assert.equal(requests.length, 1);
+  assert.deepEqual(resumed.sidecar(".exit"), { type: "done", summary: "FRESH SWITCHED-BRANCH ANSWER" });
+});
+
+test("parent reload delivers held questions and results once through the new runtime", async () => {
+  const wrapper = join(root, "reload-parent.ts"), stateFile = join(root, "reload-state.json");
+  writeFileSync(wrapper, `
+import parent, { __test__ as t } from ${JSON.stringify(resolve("pi-extension/subagents/index.ts"))};
+import { publishQuestion, pendingQuestions } from ${JSON.stringify(resolve("pi-extension/subagents/session.ts"))};
+import { writeFileSync } from "node:fs";
+export default function (pi:any) {
+  process.env.PI_SUBAGENT_AUTO_EXIT = "0";
+  parent(pi);
+  pi.on("input", (event:any) => event.text === "HANDLED_INPUT" ? {action:"handled"} : undefined);
+  pi.registerCommand("smoke-stage", {handler: async () => {
+    const file = ${JSON.stringify(join(root, "reload-question.jsonl"))};
+    publishQuestion(file, "HELD_QUESTION");
+    t.deliverPendingQuestion({id:"held-child", name:"held-child", sessionFile:file, startTime:Date.now()} as any);
+    t.notify({customType:"subagent_result", content:"HELD_RESULT", display:true});
+    writeFileSync(${JSON.stringify(stateFile)}, JSON.stringify({pending:t.undelivered.size, files:pendingQuestions(file).files.length}));
+  }});
+  pi.registerCommand("smoke-reload", {handler: async (_args:any, ctx:any) => { await ctx.reload(); }});
+}`);
+  const h = start({ beforeExtensions: [wrapper] });
+  await h.command("get_state");
+  assert.equal((await h.command("prompt", { message: "HANDLED_INPUT" })).success, true);
+  assert.equal((await h.command("prompt", { message: "/smoke-stage" })).success, true);
+  assert.deepEqual(JSON.parse(readFileSync(stateFile, "utf8")), { pending: 2, files: 0 });
+  assert.equal(requests.length, 0, "both notices are held, not sent to the old runtime");
+  assert.equal((await h.command("prompt", { message: "/smoke-reload" })).success, true);
+  const notices = () => sessionEntries(h).filter(e => e.type === "custom_message" && ["subagent_question", "subagent_result"].includes(e.customType));
+  await waitFor(() => existsSync(h.session) && notices().length === 2 && h.records.some(r => r.type === "agent_settled"), h.diagnostic);
+  assert.match(JSON.stringify(notices()), /HELD_QUESTION/);
+  assert.match(JSON.stringify(notices()), /HELD_RESULT/);
+  assert.equal((await h.command("prompt", { message: "/smoke-reload" })).success, true);
+  await h.stop();
+  assert.equal(notices().length, 2, "a second reload does not duplicate delivered notices");
+});
+
 test("busy Pi takes an inbox message as a steer before settled auto-exit", async () => {
   const h = start(); await h.command("get_state"); replies = [{ delay: 1000 }, { text: "STEER_DONE" }]; prompt(h);
   await waitFor(() => requests.length === 1, h.diagnostic);

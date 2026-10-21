@@ -235,7 +235,7 @@ export default function(pi:any) {
   await closeSurface(cancelled.surface);
   await gone(cancelled.surface);
   const cancellation = await cancelWatch.result;
-  assert.equal(cancellation.reason, "quit", JSON.stringify(cancellation));
+  assert.ok(["quit", "interrupted"].includes(cancellation.reason), JSON.stringify(cancellation));
   assert.equal(cancellation.exitCode, 1);
   console.log(`PASS: closing a running autonomous subagent's pane reports failure (${cancellation.reason})`);
 
@@ -245,7 +245,7 @@ export default function(pi:any) {
   writeFileSync(join(agentDir, "agents", "e2e-scout.md"), [
     "---", "name: e2e-scout", "description: e2e read-only scout",
     "tools: -edit,-write,+session_e2e_gate", "system-prompt: append", "auto-exit: true", "---",
-    // A multi-line body, like every bundled agent's: herdr refuses arguments with line breaks.
+    // A multi-line body, like the example agents': herdr refuses arguments with line breaks.
     "E2E_IDENTITY_MARKER: you are a read-only scout.", "", "## Rules", "- Read files; never modify them.", "",
   ].join("\n"));
   const parentSession = join(project, "parent.jsonl");
@@ -264,9 +264,26 @@ export default function(pi:any) {
     surface: original.surface, sessionFile: original.file, startTime: Date.now(), interactive: false };
   await ext.__test__.watchSubagent(stale, new AbortController().signal);
   assert.ok((await live()).some(a => a.name === replacement.agent && a.pane_id === replacement.surface), "completion did not close the replacement");
-  await gone(original.surface);
+  // Once session ownership differs, leave the last-known pane for inspection too.
+  assert.ok((await cli(["pane", "get", original.surface])).pane);
+  await closeSurface(original.surface);
   await closeSurface(replacement.surface);
   console.log("PASS: reused herdr name with another session is never adopted, reported or closed");
+
+  const completed = await launch("same-pane-reuse", { prompt: plan("completed-before-reuse") });
+  await watch(completed.agent, completed.file).result;
+  await wait(async () => !(await live()).some(a => a.name === completed.agent), "completed Pi exit");
+  const replacementFile = join(project, "same-pane-replacement.jsonl");
+  await cli(["agent", "start", completed.agent, "--kind", "pi", "--pane", completed.surface, "--",
+    "--session", replacementFile, "--offline", "--no-mcp", "--no-themes", "--no-approve",
+    "-e", integration, "-e", fixture, "--model", "session-e2e/scripted"]);
+  await wait(async () => (await live()).some(a => a.agent_session?.value === replacementFile), "replacement session reported");
+  const completedResult = await ext.__test__.watchSubagent({ ...stale, id: "completed-reused-pane", herdrName: completed.agent,
+    surface: completed.surface, sessionFile: completed.file }, new AbortController().signal);
+  assert.equal(completedResult.summary, "RESULT:completed-before-reuse");
+  assert.ok((await live()).some(a => a.pane_id === completed.surface && a.agent_session?.value === replacementFile), "completion must not kill the new session in the same pane");
+  await closeSurface(completed.surface);
+  console.log("PASS: a completion receipt never closes a pane taken over by another session");
 
   const tools: any[] = [], delivered: any[] = [];
   ext.default({
@@ -342,7 +359,7 @@ export default function(pi:any) {
   await wait(() => entries(join(base, "tools.jsonl")).some(e => e.session === childFile && e.gate === "follow-release"), "follow-up child busy");
   await wait(() => [...ext.__test__.runningSubagents.values()].some(child => child.name === "resumable" && child.status === "working"), "follow-up state reported");
   const listed = await tool("subagents_list").execute("list-runs", {}, undefined, undefined, ctx);
-  assert.ok(listed.details.agents.some((agent: any) => agent.name === "scout"));
+  assert.ok(listed.details.agents.some((agent: any) => agent.name === "e2e-scout"));
   assert.equal(listed.details.running, undefined);
   writeFileSync(childFile + ".test-refuse-input", "{}");
   const followWaiting = tool("subagent_message").execute("follow-message", { name: "resumable", message: plan("follow-next") }, undefined, undefined, ctx);

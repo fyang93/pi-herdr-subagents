@@ -83,8 +83,10 @@ interface ChildState {
   awaitingAnswer: boolean;
   /** Skills to load with the first task, so one run has them all; Pi's `/skill:` expands one per prompt. */
   skills: string[];
-  /** Leaf when this run's session started; the run's answer comes after it. */
-  baseline: string | null;
+  /** Entries on every branch before this run; /tree must not turn an old answer into its result. */
+  existingEntryIds?: Set<string>;
+  /** Present only in a child started before the entry-ID snapshot was introduced. */
+  baseline?: string | null;
   /** When a task that has started no run is taken as refused; kept across /reload. */
   runDeadline: number | null;
 }
@@ -104,10 +106,10 @@ function skillBlock(pi: ExtensionAPI, name: string): string {
 /** A task whose prompt starts no run in this long was refused by Pi; it starts one in ms, or s for an OAuth refresh. */
 export const RUN_START_TIMEOUT = 30_000;
 
-const newChildState = (baseline: string | null): ChildState => ({
+const newChildState = (entries: SessionEntry[]): ChildState => ({
   awaitingAnswer: false,
   skills: (process.env.PI_SUBAGENT_SKILLS ?? "").split(",").map((name) => name.trim()).filter(Boolean),
-  baseline,
+  existingEntryIds: new Set(entries.map((entry) => entry.id)),
   runDeadline: null,
 });
 
@@ -150,14 +152,15 @@ export default function (pi: ExtensionAPI) {
   let exitAfterCompaction = false;
   let exitAfterInbox = false;
   // Kept process-wide so a /reload, which re-runs this factory, does not forget it.
-  const state = ((globalThis as any)[CHILD_STATE_KEY] ??= newChildState(null)) as ChildState;
+  const state = ((globalThis as any)[CHILD_STATE_KEY] ??= newChildState([])) as ChildState;
   // Why a task never started a run: Pi refuses a prompt without a model or credentials before any.
   let startError: SubagentErrorInfo | null = null;
   let runPending: ReturnType<typeof setTimeout> | undefined;
   let inboxTimer: ReturnType<typeof setInterval> | undefined;
 
   function processInbox(ctx: ExtensionContext) {
-    if (!sessionFile || finished) return;
+    // Manual compaction rejects sendUserMessage asynchronously, so leave the inbox untouched.
+    if (!sessionFile || finished || (!ctx.isIdle() && !ctx.signal)) return;
     for (const file of pendingInboxMessages(sessionFile)) {
       if (finished) return;
       let message: unknown;
@@ -197,7 +200,11 @@ export default function (pi: ExtensionAPI) {
   /** This run's entries, on the active branch: after /tree that is not the file's last branch. */
   function runEntries(ctx: ExtensionContext): SessionEntry[] {
     const branch = ctx.sessionManager.getBranch() as SessionEntry[];
-    return branch.slice(branch.findIndex((entry) => entry.id === state.baseline) + 1);
+    const existing = state.existingEntryIds;
+    if (existing) return branch.filter((entry) => !existing.has(entry.id));
+    // shortcut: pre-upgrade children only saved a leaf, start a new child for full branch-history isolation.
+    const baseline = branch.findIndex((entry) => entry.id === state.baseline);
+    return state.baseline === null ? branch : baseline < 0 ? [] : branch.slice(baseline + 1);
   }
 
   /**
@@ -222,7 +229,7 @@ export default function (pi: ExtensionAPI) {
     finished = false;
     exitAfterInbox = false;
     if (event.reason !== "reload") {
-      Object.assign(state, newChildState(ctx.sessionManager.getLeafId()));
+      Object.assign(state, newChildState(ctx.sessionManager.getEntries()));
       delete process.env.PI_SUBAGENT_SKILLS;
     }
     if (autoExit) watchRunStart(ctx); // a deadline set before a /reload, with this session's ctx

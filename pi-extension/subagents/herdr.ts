@@ -282,6 +282,8 @@ export interface ExitResult {
   errorMessage?: string;
   /** The run's final answer, as the child read it from its active branch. */
   summary?: string;
+  /** The original session lost ownership; never close its last-known pane. */
+  preservePane?: boolean;
 }
 
 /**
@@ -335,11 +337,18 @@ export async function waitForExit(
     for (;;) {
       if (signal.aborted) throw aborted();
       const marker = readExitSidecar(options.sessionFile);
-      if (marker && Date.now() - (markerSince ??= Date.now()) >= (options.exitGrace ?? 30_000)) return marker;
+      if (marker) markerSince ??= Date.now();
       if (check || !live || exitedBefore || marker || Date.now() - lastCheck >= 15_000) {
         check = false;
         found = await agentStatus(agent, signal);
-        if (found && found !== "exited" && options.sessionFile && found.session && resolve(found.session) !== resolve(options.sessionFile)) found = "exited";
+        if (found && found !== "exited" && options.sessionFile && found.session && resolve(found.session) !== resolve(options.sessionFile)) {
+          return {
+            ...(marker ?? readExitSidecar(options.sessionFile) ?? {
+              reason: "interrupted" as const, exitCode: 1, errorMessage: `Agent ${agent} now reports a different session.`,
+            }),
+            preservePane: true,
+          };
+        }
         lastCheck = Date.now();
         if (found && found !== "exited" && found.pane !== pane) {
           pane = found.pane;
@@ -348,6 +357,8 @@ export async function waitForExit(
         }
       }
       if (signal.aborted) throw aborted();
+      // Even after the grace period, check session ownership before allowing pane cleanup.
+      if (marker && Date.now() - markerSince! >= (options.exitGrace ?? 30_000)) return marker;
       if (found === "exited") {
         // pi writes its marker just before exiting; look once more before calling it an interruption.
         const late = marker ?? readExitSidecar(options.sessionFile);

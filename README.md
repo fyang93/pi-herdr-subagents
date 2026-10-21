@@ -23,6 +23,8 @@ The `/subagent <agent> <task>` shortcut asks the parent model to make a `subagen
 
 ### Spawning
 
+Define your own profiles first, or explicitly install the [example agents](#example-agents). The following calls assume those profiles are installed.
+
 ```typescript
 subagent({ agent: "scout", task: "Analyze the auth module" });
 subagent({ agent: "worker", name: "dark-mode", task: "Implement the dark mode toggle" });
@@ -56,7 +58,7 @@ Name mappings live in `artifacts/<sessionId>/subagent-registry.json`; each neste
 
 ## Agent profiles
 
-Place `.md` files in project `.pi/agents/` or global `~/.pi/agent/agents/`. Discovery priority is **project > global > package-bundled**; matching names override lower-priority profiles.
+Place `.md` files in project `.pi/agents/` or global `~/.pi/agent/agents/`. Discovery priority is **project > global**; matching names override global profiles. The extension ships examples, not automatically loaded roles.
 
 ```markdown
 ---
@@ -96,7 +98,18 @@ With `auto-exit: true`, write a final answer and stop; there is no done tool. Ex
 
 Submitted human or orchestrator input is more work and can finish normally. Escape/abort, an unsent editor draft, an unanswered `ask_question`, or unfinished child sub-agents keep the session open. A later submitted task can complete normally. Terminal provider errors exit only after settlement, not during transient retries.
 
-## Bundled agents
+## Example agents
+
+Optional profiles live in [`examples/agents/`](examples/agents/). They are not discovered automatically. Review their models, tools and instructions before copying the profiles you want into project `.pi/agents/` or global `~/.pi/agent/agents/` (or `$PI_CODING_AGENT_DIR/agents/`). The worker example delegates to scout and researcher, so install those too if you retain its delegation policy.
+
+From a checkout of this repository, to install all three into a project without overwriting existing profiles:
+
+```sh
+mkdir -p /path/to/project/.pi/agents
+cp -n examples/agents/*.md /path/to/project/.pi/agents/
+```
+
+**Migration:** previously bundled roles are no longer automatically available for new tasks. Copy the desired examples into one of the directories above. Existing child sessions resume using their saved loadouts and do not require the original profile files.
 
 | Agent | Model | Tools | Role |
 | --- | --- | --- | --- |
@@ -131,12 +144,14 @@ New sidecars (loadout, identity, registry, questions, inbox and markers) use `06
 ## How it works
 
 - **Panes:** split the caller's current pane without focus, or use a background tab if either half would be under **80 columns × 24 rows** (readability-first default) (`PI_SUBAGENT_MIN_COLUMNS`, `PI_SUBAGENT_MIN_ROWS`) or the tab is zoomed. Other panes are never rearranged. Herdr names derive from display names (`Scout: auth` → `scout-auth`) and get suffixes when taken.
-- **Delivery:** publish tasks only after Pi is ready. Children take inbox messages in order and delete files when Pi accepts them. Resume clears stale markers and inbox files; a waiting messaging tool reclaims its unread message before resuming.
-- **Status:** the theme-aware widget shows elapsed time, profile, state and last tool (parallel calls may still have another tool running). Herdr's sidebar shows working, idle, blocked or done. Tracking follows pane moves; a replacement with a different reported session is never adopted, reported or closed. A missing session report alone is not a mismatch.
+- **Delivery:** publish tasks only after Pi is ready. Children take inbox messages in order, leave them unread during manual compaction, and delete files when submitted to Pi. Resume clears stale markers and inbox files; a waiting messaging tool reclaims its unread message before resuming.
+- **Status:** the theme-aware widget shows elapsed time, profile, state and last tool (parallel calls may still have another tool running). Herdr's sidebar shows working, idle, blocked or done. Tracking follows pane moves; a replacement with a different reported session is never adopted, reported or closed; the last-known pane is retained for inspection when session identity differs. A missing session report alone is not a mismatch.
 - **Attention:** autonomous children notify the parent once when blocked at a dialog or interrupted by Escape; their panes stay open. Use `subagent_message` to continue an interrupted child. Interactive children suppress blocked notices by default.
 - **Completion:** `<session>.exit` reports `done` after final work or a human's interactive exit, early `quit` for an autonomous child, or `error`, with the active-branch answer. Provider failures and output-limit truncation report an error with any partial answer. Usage comes from the session. Allow Pi's shutdown up to 30 seconds, close the pane, then deliver the result. Missing completion markers mean interruption; leave the pane open for inspection. Notices wait for a parent prompt being prepared and survive cleared queues: after Escape they are appended without starting a turn, otherwise steered again.
 - **Failures:** startup errors include recent pane output before cleanup. Answer startup dialogs (such as folder trust) by running pi there once. An autonomous task that starts no run within 30 seconds (such as missing model/credentials) fails instead of hanging; prompt preparation cancels that deadline and extension dialogs pause it. Failed pane closes are retried and unresolved panes reported. A concurrent name collision is retried once; only layout inspection and pane creation are serialized.
-- **Shutdown:** parent exit or `/new`, `/resume`, `/fork` closes tracked panes, including starts in progress. `/reload` instead keeps children running and hands their results to the reloaded extension, including completions during reload.
+- **Shutdown:** parent exit or `/new`, `/resume`, `/fork` closes tracked panes, including starts in progress. `/reload` instead keeps children running and hands their results to the reloaded extension, including completions during reload and notifications held while the parent prepares input.
+
+For the updated branch-result isolation, finish existing child processes before upgrading, then resume them or start new children. A child already running the old code can retain ordinary results through `/reload`, but its old state lacks a complete snapshot of pre-existing branches.
 
 Child tools widgets toggle with `Ctrl+Alt+O`; completion messages expand with `Ctrl+O`.
 

@@ -107,7 +107,7 @@ interface AgentDefaults {
   disableModelInvocation?: boolean;
 }
 
-type AgentSource = "package" | "global" | "project";
+type AgentSource = "global" | "project";
 
 interface AgentDefinition extends AgentDefaults {
   name: string;
@@ -140,10 +140,6 @@ const SUBAGENT_ALLOWLIST: Set<string> | null = (() => {
   if (raw === undefined) return process.env.PI_SUBAGENT_AGENT ? new Set<string>() : null;
   return new Set(raw.split(",").map((s) => s.trim()).filter(Boolean));
 })();
-
-function getBundledAgentsDir(): string {
-  return join(SUBAGENTS_DIR, "../../agents");
-}
 
 function parseOptionalBoolean(value: unknown): boolean | undefined {
   return typeof value === "boolean" ? value : undefined;
@@ -195,7 +191,6 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
 function discoverAgentDefinitions(cwd = process.cwd()): ListedAgentDefinition[] {
   const agents = new Map<string, ListedAgentDefinition>();
   const dirs: Array<{ path: string; source: AgentSource }> = [
-    { path: getBundledAgentsDir(), source: "package" },
     { path: join(getAgentDir(), "agents"), source: "global" },
     { path: join(cwd, ".pi", "agents"), source: "project" },
   ];
@@ -390,6 +385,11 @@ interface RunningSubagent {
   watching?: Promise<unknown>;
   /** Handed to the reloaded extension: leave the pane open and report nothing. */
   handedOff?: boolean;
+}
+
+interface ReloadHandoff {
+  running: RunningSubagent[];
+  held: Array<[string, Parameters<ExtensionAPI["sendMessage"]>[0]]>;
 }
 
 /** All currently running subagents, keyed by id. */
@@ -877,7 +877,7 @@ function sendTracked(pi: ExtensionAPI, deliveryId: string, message: Parameters<E
   undelivered.set(deliveryId, tracked);
   // While a submitted prompt is prepared Pi still reports idle, and a run started now would
   // make it reject that prompt: hold the notice for the run the prompt starts.
-  if (preparing) return held.push(() => transmit(pi, deliveryId, tracked)), true;
+  if (preparing) return held.push([deliveryId, tracked]), true;
   return transmit(pi, deliveryId, tracked);
 }
 
@@ -896,13 +896,13 @@ function transmit(pi: ExtensionAPI, deliveryId: string, tracked: Parameters<Exte
 
 /** Set while a prompt submitted to an idle parent is prepared, until its run starts or a grace period ends. */
 let preparing: ReturnType<typeof setTimeout> | undefined;
-/** Notices held meanwhile, sent into the run once it starts. */
-const held: Array<() => void> = [];
+/** Plain message data survives reload without retaining the old extension API. */
+const held: ReloadHandoff["held"] = [];
 
 function releaseHeld(): void {
   clearTimeout(preparing);
   preparing = undefined;
-  for (const send of held.splice(0)) send();
+  for (const [id, message] of held.splice(0)) if (latestPi) transmit(latestPi, id, message);
 }
 
 /** Steer a status notice into the parent, kept like a result until it is in; false when its pi is gone or stale. */
@@ -952,6 +952,7 @@ async function watchSubagent(
   deps: { wait?: typeof waitForExit; close?: (surface: string) => void | Promise<void> } = {},
 ): Promise<SubagentResult> {
   const { startTime, sessionFile } = running;
+  let preservePane = false;
 
   try {
     const result = await (deps.wait ?? waitForExit)(running.herdrName, AbortSignal.any([signal, getModuleAbortSignal()]), {
@@ -966,6 +967,7 @@ async function watchSubagent(
       },
     });
 
+    preservePane = result.preservePane === true;
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
 
     if (result.reason === "interrupted") {
@@ -985,15 +987,18 @@ async function watchSubagent(
     try { if (stats?.provider && stats.model) stats.contextWindow = latestCtx?.modelRegistry.find(stats.provider, stats.model)?.contextWindow; } catch {}
     const subagentSessionId = getSessionId(sessionFile);
 
-    // pi has exited, leaving its pane at a shell prompt; close it.
+    // A completion receipt does not grant ownership of a pane now hosting another session.
     try {
-      await closePane(running.surface, deps.close);
+      if (!preservePane) await closePane(running.surface, deps.close);
     } catch (error) {
       console.warn(`Could not close completed subagent pane ${running.surface}: ${error}`);
       leftOpen.push(`${running.name} (herdr pane ${running.surface})`);
     }
     // Consumed only now, and not once handed off: the reloaded watcher still needs it.
-    if (!running.handedOff) for (const marker of [".exit", ".exiting"]) rmSync(sessionFile + marker, { force: true });
+    if (!running.handedOff) for (const marker of [".exit", ".exiting"]) {
+      try { rmSync(sessionFile + marker, { force: true }); }
+      catch (error) { console.warn(`Could not remove subagent marker ${sessionFile + marker}: ${error}`); }
+    }
     runningSubagents.delete(running.id);
 
     return {
@@ -1007,7 +1012,7 @@ async function watchSubagent(
       ...(stats ? { stats } : {}),
     };
   } catch (err: any) {
-    if (!running.handedOff) {
+    if (!running.handedOff && !preservePane) {
       try { await closePane(running.surface, deps.close); } catch {
         leftOpen.push(`${running.name} (herdr pane ${running.surface})`);
       }
@@ -1041,13 +1046,18 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     }
     // Keep watching what the previous load handed over; a child that finished
     // meanwhile is found by its exit marker on the first check.
-    const handoff = (globalThis as any)[RELOAD_HANDOFF_KEY] as RunningSubagent[] | undefined;
+    const handoff = (globalThis as any)[RELOAD_HANDOFF_KEY] as ReloadHandoff | RunningSubagent[] | undefined;
     delete (globalThis as any)[RELOAD_HANDOFF_KEY];
     if (event.reason === "reload") {
-      for (const previous of handoff ?? []) {
+      // Accept the old array shape on the first reload after upgrading this extension.
+      for (const previous of (Array.isArray(handoff) ? handoff : handoff?.running) ?? []) {
         const running: RunningSubagent = { ...previous, handedOff: false };
         runningSubagents.set(running.id, running);
         watchAndDeliver(running);
+      }
+      for (const [id, message] of (Array.isArray(handoff) ? [] : handoff?.held) ?? []) {
+        if (message.customType === "subagent_result") unconsumed.add(id);
+        sendTracked(pi, id, message);
       }
     }
   });
@@ -1102,7 +1112,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     const moduleAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
     // /reload re-imports this module in the same process: hand running subagents
     // to the new load instead of closing their panes.
-    if (event.reason === "reload") (globalThis as any)[RELOAD_HANDOFF_KEY] = [...runningSubagents.values()];
+    if (event.reason === "reload") (globalThis as any)[RELOAD_HANDOFF_KEY] = {
+      running: [...runningSubagents.values()], held: held.slice(),
+    } satisfies ReloadHandoff;
     for (const agent of runningSubagents.values()) {
       if (event.reason === "reload") agent.handedOff = true;
       agent.abortController?.abort();
@@ -1284,7 +1296,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagents_list",
       label: "List Subagents",
       description:
-        "List available agent profiles (project > global > bundled).",
+        "List available agent profiles (project > global).",
       promptSnippet:
         "Use when unsure which agent fits; never to poll for completion.",
       parameters: Type.Object({}),
@@ -1300,7 +1312,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         });
 
         return {
-          content: [{ type: "text", text: lines.length ? lines.join("\n") : "No subagent definitions found." }],
+          content: [{ type: "text", text: lines.length ? lines.join("\n") : "No subagent definitions found. Add profiles to .pi/agents/ or your Pi config's agents/ directory; see examples/agents/ in this package." }],
           details: { agents: list },
         };
       },
@@ -1308,7 +1320,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       renderResult(result, _opts, theme) {
         const details = result.details as any;
         const agents = details?.agents ?? [];
-        if (agents.length === 0) return new Text(theme.fg("dim", "No subagent definitions found."), 0, 0);
+        if (agents.length === 0) return new Text(theme.fg("dim", "No subagent definitions found. Add profiles to .pi/agents/ or your Pi config's agents/ directory; see examples/agents/ in this package."), 0, 0);
         const lines = agents.map((a: any) => {
           const badge = a.source === "project" ? theme.fg("accent", " (project)") : "";
           const desc = a.description ? theme.fg("dim", ` — ${a.description}`) : "";
@@ -1522,7 +1534,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       const defs = loadAgentDefaults(agentName, ctx.cwd);
       if (!defs) {
         ctx.ui.notify(
-          `Agent "${agentName}" not found among permitted project, global or package-bundled agents.`,
+          `Agent "${agentName}" not found among permitted project or global agents.`,
           "error",
         );
         return;
