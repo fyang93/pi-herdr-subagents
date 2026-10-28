@@ -1083,6 +1083,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   latestPi = pi;
   pi.on("session_start", (event, ctx) => {
     latestCtx = ctx;
+    const envFile = resolve(ctx.cwd ?? process.cwd(), ".env");
+    if (existsSync(envFile)) process.loadEnvFile(envFile);
     // Subagents are new pi processes, so they load herdr's state integration once installed.
     if (isHerdrAvailable()) {
       integrationReady = ensurePiIntegration().then(
