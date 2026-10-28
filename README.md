@@ -46,11 +46,11 @@ subagent_message({ name: "scout", message: "Also check the auth middleware" });
 
 Address children **by their exact returned name**, not session id. Names persist after completion and across parent restarts. Child sessions appear as `subagent <name>` in Pi's `/resume` list.
 
-- **Running:** multi-line messages reach the child regardless of pane moves, as a steer when busy or a new prompt when idle. The tool waits until Pi takes the message. If the child is exiting or leaves it unread, the tool waits for its result, then resumes with that message. Escape cancels the wait, not supervision or an already-published message; completion still arrives later.
+- **Running:** multi-line messages reach the child regardless of pane moves, as a steer when busy or a new prompt when idle. The tool waits until Pi takes the message. If the child is exiting or leaves it unread, the tool waits for its result, then resumes with that message. Concurrent messages to the same child are processed in order; different children remain independent. Escape cancels a queued message before publication, or stops waiting for an already-published one; it never cancels supervision.
 - **Finished:** resume is fire-and-forget, always autonomous, with the original name and a later result. Conversation, model and thinking come from Pi's saved session. The saved loadout restores identity, tool selection, spawn whitelist, cwd and config directory; the original profile file is not needed. A plain tool allowlist stays fixed; relative selectors or defaults use Pi's current defaults. Extensions come from current configuration.
 - **Refused:** unknown name (the error lists known names), missing session, missing loadout snapshot, or a child still starting. A live child lost during a parent restart is adopted and steered, never started twice on the same transcript.
 
-Name mappings live in `artifacts/<sessionId>/subagent-registry.json`; each nested spawner has its own registry. Loadouts live in `<session>.loadout.json`.
+Name mappings live in `artifacts/<sessionId>/subagent-registry.json`; each nested spawner has its own registry. Unreadable or malformed registries are reported, never replaced with an empty one. Loadouts live in `<session>.loadout.json`; atomic replacement keeps the previous snapshot intact if a write fails.
 
 ### Questions
 
@@ -64,7 +64,7 @@ Place `.md` files in project `.pi/agents/` or global `~/.pi/agent/agents/`. Disc
 ---
 name: my-agent
 description: Does something specific
-model: openrouter/z-ai/glm-5.3
+model: ${SCOUT_MODEL}
 thinking: medium
 tools: "+codemode"
 session-mode: lineage-only
@@ -80,7 +80,7 @@ You are a specialized agent that does X...
 | --- | --- | --- |
 | `name` | string | Profile name used by `agent` |
 | `description` | string | Shown in `subagents_list` |
-| `model` | string | Launch default; omitted inherits the parent's current model |
+| `model` | string | Launch default; omitted inherits the parent's current model. `${NAME}` expands an environment variable; missing or empty variables fail the launch |
 | `thinking` | string | Pi level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Applies with or without `model`; omitted inherits the parent's level on launch |
 | `tools` | string or string[] | Plain names (`read,bash,codemode`) are a strict allowlist; `+name`/`-name` selectors (`"+codemode -bash"` or `[+codemode, -bash]`) modify defaults in order and retain extension tools. Mixing forms (`read,-bash`) is rejected at spawn. Empty/omitted uses defaults. `ask_question` and permitted spawning tools are added automatically |
 | `subagent_agents` | string | Comma-separated profiles the child may spawn. A non-empty list grants `subagent`, `subagent_message`, `subagents_list` and restricts targets; empty/omitted denies spawning. An agent cannot spawn its own profile, even if listed |
@@ -144,10 +144,10 @@ New sidecars (loadout, identity, registry, questions, inbox and markers) use `06
 ## How it works
 
 - **Panes:** split the caller's current pane without focus, or use a background tab if either half would be under **80 columns × 24 rows** (readability-first default) (`PI_SUBAGENT_MIN_COLUMNS`, `PI_SUBAGENT_MIN_ROWS`) or the tab is zoomed. Other panes are never rearranged. Herdr names derive from display names (`Scout: auth` → `scout-auth`) and get suffixes when taken.
-- **Delivery:** publish tasks only after Pi is ready. Children take inbox messages in order, leave them unread during manual compaction, and delete files when submitted to Pi. Resume clears stale markers and inbox files; a waiting messaging tool reclaims its unread message before resuming.
+- **Delivery:** publish tasks only after Pi is ready. Children take inbox messages in order, leave them unread during manual compaction, and delete files when submitted to Pi. Failed cleanup is retried without submitting messages or questions twice, including across `/reload`; an inbox receipt that cannot be removed keeps the child open until cleanup succeeds. Resume clears stale markers and inbox files; a waiting messaging tool reclaims its unread message before resuming.
 - **Status:** the theme-aware widget shows elapsed time, profile, state and last tool (parallel calls may still have another tool running). Herdr's sidebar shows working, idle, blocked or done. Tracking follows pane moves; a replacement with a different reported session is never adopted, reported or closed; the last-known pane is retained for inspection when session identity differs. A missing session report alone is not a mismatch.
 - **Attention:** autonomous children notify the parent once when blocked at a dialog or interrupted by Escape; their panes stay open. Use `subagent_message` to continue an interrupted child. Interactive children suppress blocked notices by default.
-- **Completion:** `<session>.exit` reports `done` after final work or a human's interactive exit, early `quit` for an autonomous child, or `error`, with the active-branch answer. Provider failures and output-limit truncation report an error with any partial answer. Usage comes from the session. Allow Pi's shutdown up to 30 seconds, close the pane, then deliver the result. Missing completion markers mean interruption; leave the pane open for inspection. Notices wait for a parent prompt being prepared and survive cleared queues: after Escape they are appended without starting a turn, otherwise steered again.
+- **Completion:** `<session>.exit` reports `done` after final work or a human's interactive exit, early `quit` for an autonomous child, or `error`, with the active-branch answer. Provider failures and output-limit truncation report an error with any partial answer. Usage comes from the session. Allow Pi's shutdown up to 30 seconds, close the pane, then deliver the result. Missing or invalid completion markers mean interruption once the agent exits; leave the pane open for inspection. Notices wait for a parent prompt being prepared and survive cleared queues: after Escape they are appended without starting a turn, otherwise steered again.
 - **Failures:** startup errors include recent pane output before cleanup. Answer startup dialogs (such as folder trust) by running pi there once. An autonomous task that starts no run within 30 seconds (such as missing model/credentials) fails instead of hanging; prompt preparation cancels that deadline and extension dialogs pause it. Failed pane closes are retried and unresolved panes reported. A concurrent name collision is retried once; only layout inspection and pane creation are serialized.
 - **Shutdown:** parent exit or `/new`, `/resume`, `/fork` closes tracked panes, including starts in progress. `/reload` instead keeps children running and hands their results to the reloaded extension, including completions during reload and notifications held while the parent prepares input.
 

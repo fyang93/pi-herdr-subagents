@@ -457,6 +457,28 @@ it("uses the original polling when the socket cannot connect", async t => {
   assert.equal(ticks, 2);
 });
 
+it("ignores invalid exit markers while live, and reports interruption once the agent exits", async () => {
+  const session = join(dir, "invalid-exit.jsonl");
+  const controller = new AbortController();
+  writeFileSync(session + ".exit", '{"type":"unknown"}');
+  reply("agent", { result: { agent: { pane_id: "w1:p9", agent_status: "working" } } });
+  try {
+    await assert.rejects(herdr.waitForExit("scout", controller.signal, {
+      interval: 1, sessionFile: session, exitGrace: 0,
+      onTick() { controller.abort(); },
+    }), /Aborted/);
+    reply("agent", { error: { code: "agent_not_found", message: "gone" } });
+    const result = await herdr.waitForExit("scout", new AbortController().signal, {
+      interval: 1, sessionFile: session, exitGrace: 0,
+    });
+    assert.equal(result.reason, "interrupted");
+    assert.equal(result.exitCode, 1);
+  } finally {
+    controller.abort();
+    rmSync(session + ".exit");
+  }
+});
+
 it("finds where herdr installed the pi integration, so children elsewhere can load it", async () => {
   const installed = join(dir, "pi-config", "extensions", "herdr-agent-state.ts");
   mkdirSync(dirname(installed), { recursive: true });

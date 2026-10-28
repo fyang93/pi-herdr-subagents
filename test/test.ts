@@ -1,6 +1,8 @@
 import "./isolate.ts";
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync, chmodSync, cpSync, symlinkSync, statSync } from "node:fs";
 import { join } from "node:path";
@@ -302,13 +304,13 @@ describe("session.ts", () => {
       assert.equal(registryEntry(readNameRegistry(adir), "scout")!.sessionFile, "/s/scout-new.jsonl");
     });
 
-    it("returns null for unknown names and {} for a missing/corrupt registry", () => {
+    it("returns null for unknown names and {} only for a missing registry", () => {
       const adir = join(dir, "art-3");
       assert.equal(registryEntry(readNameRegistry(adir), "nope"), null);
       assert.deepEqual(readNameRegistry(adir), {});
       mkdirSync(adir, { recursive: true });
       writeFileSync(nameRegistryPath(adir), "not json{", "utf8");
-      assert.deepEqual(readNameRegistry(adir), {});
+      assert.throws(() => readNameRegistry(adir), /Cannot read subagent registry/);
     });
 
     it("keeps any name as its own entry, and reports a registry it cannot write", () => {
@@ -1598,6 +1600,43 @@ describe("subagent-done.ts", () => {
       } finally { h.restore(); rmSync(dir, { recursive: true, force: true }); }
     });
 
+    it("waits for an asynchronous prompt submission before consuming the next inbox file", async (t) => {
+      t.mock.timers.enable({ apis: ["setInterval"] });
+      const dir = createTestDir(), session = join(dir, "s.jsonl");
+      const h = setupCapturingExtension(session), sent: string[] = [];
+      let release!: () => void;
+      const submitted = new Promise<void>(resolve => { release = resolve; });
+      h.api.sendUserMessage = async (text: string) => { sent.push(text); await submitted; };
+      try {
+        const first = publishInboxMessage(session, "first"), second = publishInboxMessage(session, "second");
+        t.mock.timers.tick(250);
+        assert.deepEqual(sent, ["first"]);
+        assert.deepEqual(pendingInboxMessages(session), [first, second]);
+        release();
+        await delay(0);
+        t.mock.timers.tick(250);
+        assert.deepEqual(sent, ["first", "second"]);
+      } finally { h.restore(); rmSync(dir, { recursive: true, force: true }); }
+    });
+
+    it("does not hide an inbox read error or exit while it is unreadable", async (t) => {
+      t.mock.timers.enable({ apis: ["setInterval"] });
+      const dir = createTestDir(), session = join(dir, "s.jsonl");
+      const h = setupCapturingExtension(session), file = publishInboxMessage(session, "keep");
+      const original = fs.readdirSync;
+      const mocked = t.mock.method(fs, "readdirSync", (path, ...args) => {
+        if (path === `${session}.inbox`) throw Object.assign(new Error("read denied"), { code: "EACCES" });
+        return original(path, ...args);
+      });
+      syncBuiltinESMExports();
+      try {
+        t.mock.timers.tick(250);
+        assert.equal(existsSync(file), true);
+        await h.settle();
+        assert.equal(h.shutdownCalls, 0);
+      } finally { mocked.mock.restore(); syncBuiltinESMExports(); h.restore(); rmSync(dir, { recursive: true, force: true }); }
+    });
+
     it("submits only one idle prompt per tick, then steers into its run", async (t) => {
       t.mock.timers.enable({ apis: ["setInterval"] });
       const dir = createTestDir(), session = join(dir, "s.jsonl");
@@ -1643,6 +1682,42 @@ describe("subagent-done.ts", () => {
         assert.deepEqual(pendingInboxMessages(session), [unread]);
         assert.equal(sent.length, 1);
       } finally { h.restore(); rmSync(dir, { recursive: true, force: true }); }
+    });
+
+    it("retries inbox cleanup without resubmitting or crashing, retaining deferred exit across reload", async (t) => {
+      t.mock.timers.enable({ apis: ["setInterval"] });
+      const dir = createTestDir(), session = join(dir, "s.jsonl");
+      const h = setupCapturingExtension(session), sent: string[] = [], warnings: string[] = [];
+      h.api.sendUserMessage = (text: string) => sent.push(text);
+      const file = publishInboxMessage(session, "ONCE");
+      const remove = fs.rmSync;
+      let failing = true;
+      const mocked = t.mock.method(fs, "rmSync", (path, options) => {
+        if (path === file && failing) throw Object.assign(new Error("simulated cleanup failure"), { code: "EACCES" });
+        return remove(path, options);
+      });
+      syncBuiltinESMExports();
+      t.mock.method(console, "warn", (message: string) => warnings.push(message));
+      try {
+        t.mock.timers.tick(250);
+        assert.deepEqual(sent, ["ONCE"]);
+        await h.settle();
+        assert.equal(h.shutdownCalls, 0, "wait for the receipt to be removed");
+        t.mock.timers.tick(250);
+        h.reload();
+        t.mock.timers.tick(250);
+        assert.deepEqual(sent, ["ONCE"], "failed deletion is not a new message");
+        assert.equal(warnings.length, 1);
+        failing = false;
+        t.mock.timers.tick(250);
+        assert.deepEqual(pendingInboxMessages(session), []);
+        assert.equal(h.shutdownCalls, 1, "the deferred completion survives reload");
+      } finally {
+        mocked.mock.restore();
+        syncBuiltinESMExports();
+        h.restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
     });
 
     it("loads every configured skill with the first task, so one run has them all", async () => {

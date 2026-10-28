@@ -17,7 +17,7 @@ import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
-import { findLastAssistantMessage, pendingInboxMessages, publishQuestion, type SessionEntry } from "./session.ts";
+import { findLastAssistantMessage, pendingInboxMessages, publishQuestion, removeConsumedFile, type SessionEntry } from "./session.ts";
 
 /**
  * Number of child subagents this session itself still has in flight.
@@ -89,6 +89,9 @@ interface ChildState {
   baseline?: string | null;
   /** When a task that has started no run is taken as refused; kept across /reload. */
   runDeadline: number | null;
+  /** Submitted files whose deletion failed must never be submitted again, including after reload. */
+  inboxCleanup?: Set<string>;
+  exitAfterInbox?: boolean;
 }
 
 /** A loaded skill as Pi's `/skill:name` expansion renders it, or "" when no such skill is loaded. */
@@ -111,6 +114,8 @@ const newChildState = (entries: SessionEntry[]): ChildState => ({
   skills: (process.env.PI_SUBAGENT_SKILLS ?? "").split(",").map((name) => name.trim()).filter(Boolean),
   existingEntryIds: new Set(entries.map((entry) => entry.id)),
   runDeadline: null,
+  inboxCleanup: new Set(),
+  exitAfterInbox: false,
 });
 
 export default function (pi: ExtensionAPI) {
@@ -150,35 +155,54 @@ export default function (pi: ExtensionAPI) {
   let finished = false;
   // A done task found Pi still busy (a manual /compact): it exits when that ends.
   let exitAfterCompaction = false;
-  let exitAfterInbox = false;
   // Kept process-wide so a /reload, which re-runs this factory, does not forget it.
   const state = ((globalThis as any)[CHILD_STATE_KEY] ??= newChildState([])) as ChildState;
   // Why a task never started a run: Pi refuses a prompt without a model or credentials before any.
   let startError: SubagentErrorInfo | null = null;
   let runPending: ReturnType<typeof setTimeout> | undefined;
   let inboxTimer: ReturnType<typeof setInterval> | undefined;
+  let inboxProcessing: Promise<void> | undefined;
 
-  function processInbox(ctx: ExtensionContext) {
+  function processInbox(ctx: ExtensionContext): void {
     // Manual compaction rejects sendUserMessage asynchronously, so leave the inbox untouched.
-    if (!sessionFile || finished || (!ctx.isIdle() && !ctx.signal)) return;
-    for (const file of pendingInboxMessages(sessionFile)) {
-      if (finished) return;
-      let message: unknown;
-      try { ({ message } = JSON.parse(readFileSync(file, "utf8"))); } catch {}
-      if (typeof message !== "string") {
-        rmSync(file, { force: true });
-        continue;
-      }
-      const idle = ctx.isIdle();
-      try {
-        pi.sendUserMessage(message, { deliverAs: "steer" });
-      } catch {
-        return; // keep it, and retry in order next tick
-      }
-      rmSync(file, { force: true });
-      if (idle) return; // let the prompt start before submitting the next file
+    if (inboxProcessing || !sessionFile || finished || (!ctx.isIdle() && !ctx.signal)) return;
+    const cleanup = state.inboxCleanup ??= new Set<string>();
+    for (const file of cleanup) if (!removeConsumedFile(file, cleanup)) return;
+    let files: string[];
+    try { files = pendingInboxMessages(sessionFile); }
+    catch (error) { console.warn(`Could not read subagent inbox for ${sessionFile}: ${error}`); return; }
+    const file = files[0];
+    if (!file) {
+      if (state.exitAfterInbox) exitIfDone(ctx);
+      return;
     }
-    if (exitAfterInbox && pendingInboxMessages(sessionFile).length === 0) exitIfDone(ctx);
+    let message: unknown;
+    try { message = JSON.parse(readFileSync(file, "utf8"))?.message; }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      if (!(error instanceof SyntaxError)) {
+        console.warn(`Could not read subagent inbox file ${file}: ${error}`);
+        return;
+      }
+    }
+    if (typeof message !== "string") {
+      removeConsumedFile(file, cleanup);
+      processInbox(ctx);
+      return;
+    }
+    const idle = ctx.isIdle();
+    let submitted: Promise<unknown> | undefined;
+    try { submitted = pi.sendUserMessage(message, { deliverAs: "steer" }); }
+    catch { return; } // keep it, and retry in order next tick
+    const finish = () => {
+      if (!removeConsumedFile(file, cleanup)) return;
+      if (!idle) processInbox(ctx);
+    };
+    if (submitted?.then) {
+      inboxProcessing = Promise.resolve(submitted).then(finish, () => {}).finally(() => { inboxProcessing = undefined; });
+    } else {
+      finish();
+    }
   }
 
   /** End an autonomous subagent whose task has started no run by its deadline. */
@@ -227,7 +251,6 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", (event, ctx) => {
     messages = undefined;
     finished = false;
-    exitAfterInbox = false;
     if (event.reason !== "reload") {
       Object.assign(state, newChildState(ctx.sessionManager.getEntries()));
       delete process.env.PI_SUBAGENT_SKILLS;
@@ -283,7 +306,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_start", () => {
     runStarting();
     exitAfterCompaction = false;
-    exitAfterInbox = false;
+    state.exitAfterInbox = false;
   });
 
   // Low-level runs can still be followed by retries, compaction or queued work.
@@ -318,12 +341,20 @@ export default function (pi: ExtensionAPI) {
   /** End an autonomous subagent whose task is done, once nothing keeps it open. */
   function exitIfDone(ctx: ExtensionContext) {
     exitAfterCompaction = false;
-    exitAfterInbox = false;
+    state.exitAfterInbox = false;
     // A pending answer, unfinished child or unsent draft keeps the session open for the next turn.
     if (finished || state.awaitingAnswer || runningChildrenCount() > 0) return;
-    if (sessionFile && pendingInboxMessages(sessionFile).length) {
-      exitAfterInbox = true;
-      return;
+    if (sessionFile) {
+      try {
+        if (pendingInboxMessages(sessionFile).length) {
+          state.exitAfterInbox = true;
+          return;
+        }
+      } catch (error) {
+        console.warn(`Could not read subagent inbox for ${sessionFile}: ${error}`);
+        state.exitAfterInbox = true;
+        return;
+      }
     }
     if (ctx.hasUI && ctx.ui.getEditorText().trim()) return;
     if (!ctx.isIdle()) {

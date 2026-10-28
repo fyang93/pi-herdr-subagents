@@ -1,4 +1,5 @@
 import {
+  chmodSync,
   closeSync,
   fstatSync,
   mkdirSync,
@@ -7,6 +8,8 @@ import {
   readFileSync,
   readSync,
   renameSync,
+  rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { randomUUID } from "node:crypto";
@@ -104,9 +107,24 @@ export function loadoutSidecarPath(sessionFile: string): string {
   return `${sessionFile}.loadout.json`;
 }
 
+/** Replace a sidecar only after the complete write succeeds, preserving existing permissions. */
+function writeAtomicFile(file: string, content: string): void {
+  const mode = statSync(file, { throwIfNoEntry: false })?.mode;
+  const tmp = `${file}.${randomUUID()}.tmp`;
+  try {
+    writeFileSync(tmp, content, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    if (mode !== undefined) chmodSync(tmp, mode & 0o777);
+    renameSync(tmp, file);
+  } catch (error) {
+    try { rmSync(tmp, { force: true }); }
+    catch (cleanupError) { console.warn(`Could not remove temporary sidecar ${tmp}: ${cleanupError}`); }
+    throw error;
+  }
+}
+
 /** Persist a subagent's resolved loadout beside its session file; a failure fails the launch. */
 export function writeSubagentLoadout(sessionFile: string, loadout: SubagentLoadout): void {
-  writeFileSync(loadoutSidecarPath(sessionFile), JSON.stringify(loadout), { encoding: "utf8", mode: 0o600 });
+  writeAtomicFile(loadoutSidecarPath(sessionFile), JSON.stringify(loadout));
 }
 
 const isNullableString = (value: unknown) => value === null || typeof value === "string";
@@ -133,10 +151,8 @@ export function readSubagentLoadout(sessionFile: string): SubagentLoadout | null
 /** Publish privately by rename, with monotonic filenames preserving send order. */
 function publishJson(directory: string, value: unknown): string {
   mkdirSync(directory, { recursive: true, mode: 0o700 });
-  const tmp = `${directory}-${randomUUID()}.tmp`; // outside the directory: never read half-written
-  writeFileSync(tmp, JSON.stringify(value), { mode: 0o600 });
   const file = join(directory, `${String(process.hrtime.bigint()).padStart(20, "0")}-${randomUUID()}.json`);
-  renameSync(tmp, file);
+  writeAtomicFile(file, JSON.stringify(value));
   return file;
 }
 
@@ -148,7 +164,25 @@ export function publishInboxMessage(sessionFile: string, message: string): strin
 /** Pending message files in send order, including malformed ones. */
 export function pendingInboxMessages(sessionFile: string): string[] {
   const dir = `${sessionFile}.inbox`;
-  try { return readdirSync(dir).filter((name) => name.endsWith(".json")).sort().map((name) => join(dir, name)); } catch { return []; }
+  try { return readdirSync(dir).filter((name) => name.endsWith(".json")).sort().map((name) => join(dir, name)); }
+  catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return [];
+    throw error;
+  }
+}
+
+/** Failed cleanup is retried without re-delivery; warn once per file, not on every poll. */
+export function removeConsumedFile(file: string, pendingCleanup: Set<string>): boolean {
+  try {
+    rmSync(file, { force: true });
+    pendingCleanup.delete(file);
+    return true;
+  } catch (error) {
+    if (!pendingCleanup.has(file)) console.warn(`Could not remove consumed subagent file ${file}: ${error}`);
+    pendingCleanup.add(file);
+    return false;
+  }
 }
 
 // ── Questions ────────────────────────────────────────────────────────────────
@@ -162,16 +196,18 @@ export function publishQuestion(sessionFile: string, question: string): void {
 }
 
 /** Questions waiting for delivery, in the order asked, and the files holding them (malformed ones included). */
-export function pendingQuestions(sessionFile: string): { files: string[]; questions: string[] } {
+export function pendingQuestions(sessionFile: string, consumed?: ReadonlySet<string>): { files: string[]; questions: string[] } {
   const dir = `${sessionFile}.ask`;
   let names: string[] = [];
-  try { names = readdirSync(dir).filter((name) => name.endsWith(".json")).sort(); } catch {} // none asked
-  const files = names.map((name) => join(dir, name));
+  try { names = readdirSync(dir).filter((name) => name.endsWith(".json")).sort(); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  const files = names.map((name) => join(dir, name)).filter((file) => !consumed?.has(file));
   const questions = files.flatMap((file) => {
     try {
-      const { question } = JSON.parse(readFileSync(file, "utf8"));
+      const question = JSON.parse(readFileSync(file, "utf8"))?.question;
       return typeof question === "string" && question.trim() ? [question] : [];
-    } catch {
+    } catch (error) {
+      if (!(error instanceof SyntaxError) && (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       return [];
     }
   });
@@ -199,14 +235,19 @@ export function nameRegistryPath(artifactDir: string): string {
   return join(artifactDir, "subagent-registry.json");
 }
 
-/** Read a spawner session's name registry, or {} if absent/corrupt. */
+/** Only a missing registry is empty; damaged or unreadable registries must never be overwritten. */
 export function readNameRegistry(artifactDir: string): NameRegistry {
+  const file = nameRegistryPath(artifactDir);
   try {
-    const parsed = JSON.parse(readFileSync(nameRegistryPath(artifactDir), "utf8"));
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    const parsed = JSON.parse(readFileSync(file, "utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) ||
+        Object.values(parsed).some((entry: any) => !entry || typeof entry.sessionFile !== "string" || !entry.sessionFile.trim())) {
+      throw new Error("Invalid name registry");
+    }
     return parsed as NameRegistry;
-  } catch {
-    return {};
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
+    throw new Error(`Cannot read subagent registry ${file}: ${error}`, { cause: error });
   }
 }
 
@@ -223,10 +264,7 @@ export function registerName(
   mkdirSync(artifactDir, { recursive: true, mode: 0o700 });
   // A computed key defines an own property for any name, `__proto__` included.
   const registry = { ...readNameRegistry(artifactDir), [name]: entry };
-  const p = nameRegistryPath(artifactDir);
-  const tmp = `${p}.tmp-${process.pid}-${randomUUID()}`;
-  writeFileSync(tmp, JSON.stringify(registry, null, 2), { encoding: "utf8", mode: 0o600 });
-  renameSync(tmp, p);
+  writeAtomicFile(nameRegistryPath(artifactDir), JSON.stringify(registry, null, 2));
 }
 
 /** A name's entry in a registry, or null: only its own entries are names, `__proto__` included. */

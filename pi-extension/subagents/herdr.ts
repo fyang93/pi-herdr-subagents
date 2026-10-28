@@ -291,15 +291,18 @@ export interface ExitResult {
  * `error` when the last turn failed, or `quit` when someone ended it early. ask_question keeps the session open and
  * signals through `.ask/` instead.
  */
-export function interpretExitSidecar(data: any): ExitResult {
-  const summary = typeof data?.summary === "string" && data.summary ? { summary: data.summary } : {};
-  if (data?.type === "error") {
-    const errorMessage = typeof data.errorMessage === "string" && data.errorMessage.trim() !== ""
-      ? data.errorMessage
+export function interpretExitSidecar(data: unknown): ExitResult | undefined {
+  if (!data || typeof data !== "object" || Array.isArray(data)) return undefined;
+  const marker = data as Record<string, unknown>;
+  if (marker.type !== "done" && marker.type !== "quit" && marker.type !== "error") return undefined;
+  const summary = typeof marker.summary === "string" && marker.summary ? { summary: marker.summary } : {};
+  if (marker.type === "error") {
+    const errorMessage = typeof marker.errorMessage === "string" && marker.errorMessage.trim() !== ""
+      ? marker.errorMessage
       : "Subagent exited with stopReason=error (no errorMessage in sidecar).";
     return { reason: "error", exitCode: 1, errorMessage, ...summary };
   }
-  if (data?.type === "quit") return { reason: "quit", exitCode: 1, ...summary };
+  if (marker.type === "quit") return { reason: "quit", exitCode: 1, ...summary };
   return { reason: "done", exitCode: 0, ...summary };
 }
 

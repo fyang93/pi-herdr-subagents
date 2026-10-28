@@ -32,6 +32,7 @@ import {
   getSessionId,
   readNameRegistry,
   pendingQuestions,
+  removeConsumedFile,
   publishInboxMessage,
   readSubagentLoadout,
   registerName,
@@ -155,6 +156,14 @@ function parseCommaList(value: string | undefined): string[] | undefined {
 /** `value` when it is one of `allowed`, else undefined. */
 function oneOf<T extends string>(value: string | undefined, allowed: readonly T[]): T | undefined {
   return allowed.includes(value as T) ? (value as T) : undefined;
+}
+
+function resolveModelEnv(model: string | undefined): string | undefined {
+  return model?.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_match, name: string) => {
+    const value = process.env[name];
+    if (value == null || !value.trim()) throw new Error(`Subagent model references unset environment variable: ${name}`);
+    return value.trim();
+  });
 }
 
 function parseAgentDefinition(content: string, fallbackName: string): AgentDefinition | null {
@@ -385,6 +394,9 @@ interface RunningSubagent {
   watching?: Promise<unknown>;
   /** Handed to the reloaded extension: leave the pane open and report nothing. */
   handedOff?: boolean;
+  /** Delivered question files whose deletion failed; retained across reload without sending twice. */
+  questionCleanup?: Set<string>;
+  noticeCleanup?: Set<string>;
 }
 
 interface ReloadHandoff {
@@ -652,6 +664,36 @@ async function steerLive(running: RunningSubagent, message: string, signal?: Abo
   return steeredResult(running);
 }
 
+// Serialize delivery and resume per transcript, so resume cannot delete another sender's receipt.
+const messageQueues = new Map<string, Promise<void>>();
+
+async function messageInOrder<T>(sessionKey: string, signal: AbortSignal, send: () => Promise<T>): Promise<T> {
+  const previous = messageQueues.get(sessionKey);
+  const pending = track((async () => {
+    if (previous) {
+      let onAbort!: () => void;
+      try {
+        await Promise.race([previous, new Promise<never>((_resolve, reject) => {
+          onAbort = () => reject(signal.reason);
+          signal.addEventListener("abort", onAbort, { once: true });
+          if (signal.aborted) onAbort();
+        })]);
+      } finally {
+        signal.removeEventListener("abort", onAbort);
+      }
+    }
+    signal.throwIfAborted();
+    return send();
+  })());
+  // A cancelled waiter must not let its successor overtake an earlier active sender.
+  const settled = Promise.allSettled([previous, pending]).then(() => {});
+  messageQueues.set(sessionKey, settled);
+  void settled.then(() => {
+    if (messageQueues.get(sessionKey) === settled) messageQueues.delete(sessionKey);
+  });
+  return pending;
+}
+
 /** How long notices wait for the run of a prompt being prepared before they are sent regardless. */
 const PREPARE_GRACE = 30_000;
 
@@ -668,6 +710,7 @@ function readSession(sessionFile: string): SessionEntry[] {
 export const __test__ = {
   loadAgentDefaults,
   discoverAgentDefinitions,
+  resolveModelEnv,
   buildSubagentToolAllowlist,
   applyLoadoutToArgs,
   uniqueRunningName,
@@ -705,7 +748,7 @@ async function launchSubagent(
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
   const id = randomUUID().slice(0, 8);
-  const effectiveModel = params.model ?? def.model ?? (ctx.model && `${ctx.model.provider}/${ctx.model.id}`);
+  const effectiveModel = params.model ?? resolveModelEnv(def.model) ?? (ctx.model && `${ctx.model.provider}/${ctx.model.id}`);
   const thinking = def.thinking ?? opts.thinking;
   const interactive = def.interactive ?? !def.autoExit;
   const cwd = params.cwd ? resolve(ctx.cwd, params.cwd) : def.cwd ? resolve(getAgentDir(), def.cwd) : ctx.cwd;
@@ -855,7 +898,9 @@ function subagentEnv(loadout: SubagentLoadout, opts: { name: string; sessionFile
  * together; each is removed once delivered, and one asked meanwhile waits for the next tick.
  */
 function deliverPendingQuestion(running: RunningSubagent): void {
-  const { files, questions } = pendingQuestions(running.sessionFile);
+  const cleanup = running.questionCleanup ??= new Set<string>();
+  for (const file of cleanup) removeConsumedFile(file, cleanup);
+  const { files, questions } = pendingQuestions(running.sessionFile, cleanup);
   if (files.length === 0) return;
   const name = running.name; // unique per session (deduped at spawn) — targets the reply
   const question = questions.join("\n\n");
@@ -868,7 +913,7 @@ function deliverPendingQuestion(running: RunningSubagent): void {
     display: true,
     details: { name, agent: running.agent, question, ...(sessionId ? { sessionId } : {}) },
   }));
-  if (delivered) for (const file of files) rmSync(file, { force: true }); // malformed ones too
+  if (delivered) for (const file of files) removeConsumedFile(file, cleanup); // malformed ones too
 }
 
 /** Steer a notice into the parent, keeping it until it enters the conversation; false when that pi is stale. */
@@ -911,21 +956,29 @@ function notify(message: Parameters<ExtensionAPI["sendMessage"]>[0]): boolean {
 }
 
 /** Steer the notice for a signal file, consuming the file once it is queued; a failed send retries next tick. */
-function deliverOnce(file: string, message: Parameters<ExtensionAPI["sendMessage"]>[0]): void {
-  if (notify(message)) try { unlinkSync(file); } catch {}
+function deliverOnce(file: string, message: Parameters<ExtensionAPI["sendMessage"]>[0], pendingCleanup?: Set<string>): void {
+  if (pendingCleanup?.has(file)) {
+    try { unlinkSync(file); } catch { if (!existsSync(file)) pendingCleanup.delete(file); }
+    if (!existsSync(file)) pendingCleanup.delete(file);
+    return;
+  }
+  if (!notify(message)) return;
+  try { unlinkSync(file); }
+  catch { pendingCleanup?.add(file); }
 }
 
 /** Wake the parent once when a subagent turn is interrupted in its own pane. */
 function reportPaused(running: RunningSubagent): void {
   const file = `${running.sessionFile}.paused`;
-  if (!existsSync(file)) return;
+  const pendingCleanup = running.noticeCleanup ??= new Set<string>();
+  if (!existsSync(file) && !pendingCleanup.has(file)) return;
   deliverOnce(file, {
     customType: "subagent_status",
     content: `Sub-agent "${running.name}" had its turn interrupted in herdr pane ${running.surface} and is waiting for input. ` +
       `subagent_message({ name: ${JSON.stringify(running.name)}, message: "…" }) continues it.`,
     display: true,
     details: { line: `${running.name}: interrupted, waiting in pane ${running.surface}` },
-  });
+  }, pendingCleanup);
 }
 
 /**
@@ -960,7 +1013,8 @@ async function watchSubagent(
       sessionFile,
       onTick(status, pane) {
         if (pane) running.surface = pane;  // the pane may have moved
-        deliverPendingQuestion(running);
+        try { deliverPendingQuestion(running); }
+        catch (error) { console.warn(`Could not read subagent questions for ${running.name}: ${error}`); }
         reportPaused(running);
         // An unanswered poll is not a state change; it must not re-arm the blocked notice.
         reportBlocked(running, status);
@@ -1405,115 +1459,88 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           return herdrUnavailableResult();
         }
 
-        // ── Steer a running subagent ──
-        // A name that matches a currently-running subagent always steers it.
-        const runningMatch = Array.from(runningSubagents.values()).find((r) => r.name === requestedName);
-        const steeredByName = runningMatch && await steerLive(runningMatch, message, signal);
-        if (steeredByName) return steeredByName;
-
-        // ── Resume a finished session by name ──
-        const name = requestedName; // identity preservation: the resumed run reclaims its name
-
-        // Resolve the name to its session file via this session's registry.
-        const parentArtifactDir = getArtifactDir(
-          ctx.sessionManager.getSessionDir(),
-          ctx.sessionManager.getSessionId(),
-        );
-        const registry = readNameRegistry(parentArtifactDir);
-        const entry = registryEntry(registry, requestedName);
-        if (!entry) {
-          const known = Object.keys(registry);
-          const err =
-            `No subagent named "${requestedName}" in this session. ` +
-            (known.length > 0
+        const name = requestedName;
+        const runningMatch = [...runningSubagents.values()].find((r) => r.name === name);
+        let sessionPath = runningMatch?.sessionFile;
+        if (!sessionPath) {
+          const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), ctx.sessionManager.getSessionId());
+          const registry = readNameRegistry(artifactDir);
+          sessionPath = registryEntry(registry, name)?.sessionFile;
+          if (!sessionPath) {
+            const known = Object.keys(registry);
+            return fail(`No subagent named "${name}" in this session. ` + (known.length
               ? `Known subagents: ${known.join(", ")}.`
-              : "No subagents have been spawned in this session yet.");
-          return fail(err);
+              : "No subagents have been spawned in this session yet."));
+          }
         }
-
-        const sessionPath = entry.sessionFile;
-        if (startingSessions.has(resolve(sessionPath))) {
-          return fail(`Subagent "${requestedName}" is still starting; message it once it has started.`);
-        }
-        if (!sessionPath || !existsSync(sessionPath)) {
-          const err =
-            `Subagent "${requestedName}" is registered but its session file is gone ` +
-            `(${sessionPath}). It cannot be resumed. Spawn a fresh subagent instead.`;
-          return fail(err);
-        }
-
-        // Guard: never resume a session that is still running — two processes
-        // mutating the same .jsonl corrupts it. Steer it instead.
-        const runningSession = [...runningSubagents.values()].find((r) => resolve(r.sessionFile) === resolve(sessionPath));
-        const steeredBySession = runningSession && await steerLive(runningSession, message, signal);
-        if (steeredBySession) return steeredBySession;
-
-        // Restore the saved identity and tool restrictions; refuse rather than lose them.
-        const loadout = readSubagentLoadout(sessionPath);
-        if (!loadout) {
-          const err =
-            `Cannot safely resume "${requestedName}": no loadout snapshot found for this session ` +
-            `(it predates loadout snapshots, or its .loadout.json sidecar was removed). ` +
-            `Resuming would drop its system prompt and tool restrictions, so this is refused. ` +
-            `Re-run the task as a fresh subagent instead.`;
-          return fail(err);
-        }
-
-        const resumedSessionId = getSessionId(sessionPath) ?? requestedName;
-
         const sessionKey = resolve(sessionPath);
         if (startingSessions.has(sessionKey)) {
-          return fail(`Subagent "${requestedName}" is still starting; message it once it has started.`);
+          return fail(`Subagent "${name}" is still starting; message it once it has started.`);
         }
-        startingSessions.add(sessionKey);
-        // A resumed run is autonomous; a live child taken back keeps how it was launched.
-        const watchRun = (surface: string, herdrName: string, interactive = false): RunningSubagent => {
-          const running: RunningSubagent = {
-            id: randomUUID().slice(0, 8), name, task: message, agent: loadout.agent ?? undefined,
-            surface, herdrName, startTime: Date.now(), sessionFile: sessionPath, interactive,
-          };
-          runningSubagents.set(running.id, running);
-          watchAndDeliver(running);
-          return running;
-        };
-        let running: RunningSubagent;
-        try {
-          // A subagent this parent lost track of (it restarted meanwhile) may still be running:
-          // take it back and steer it rather than start a second pi on the same transcript.
-          const live = await launchDeps.findSessionAgent(sessionKey);
-          signal?.throwIfAborted(); // Escape, or a shutdown, during the lookup
-          getModuleAbortSignal().throwIfAborted();
-          const steeredLive = live && await steerLive(watchRun(live.pane, live.agent, loadout.interactive), message, signal);
-          if (steeredLive) return steeredLive;
-          // Replay identity, tool allowlist and delegation; the session restores the model.
-          const args = ["--session", sessionPath, "-e", join(SUBAGENTS_DIR, "subagent-done.ts")];
-          applyLoadoutToArgs(args, loadout, sessionPath);
-          args.push(...await integrationArgs(loadout.agentDir ?? getAgentDir()));
-          // This run is autonomous: a parent that restarts and takes it back must see that.
-          writeSubagentLoadout(sessionPath, { ...loadout, interactive: false });
-          clearStaleMarkers(sessionPath);
-          const started = await startTracked({
-            name,
-            args,
-            env: subagentEnv(loadout, { name, sessionFile: sessionPath, autoExit: true }),
-            cwd: loadout.cwd ?? ctx.cwd,
-          }, message, signal);
-          running = watchRun(started.surface, started.agent);
-        } finally {
-          startingSessions.delete(sessionKey);
-        }
+        // Capture this lifecycle before queueing: a session switch must not send into the next session.
+        const deliverySignal = signal ? AbortSignal.any([signal, getModuleAbortSignal()]) : getModuleAbortSignal();
+        return messageInOrder(sessionKey, deliverySignal, async () => {
+          // Look up again after the preceding delivery: it may have resumed the child.
+          const runningSession = [...runningSubagents.values()].find((r) => resolve(r.sessionFile) === sessionKey);
+          const steered = runningSession && await steerLive(runningSession, message, deliverySignal);
+          if (steered) return steered;
 
-        return {
-          content: [{ type: "text", text: `Session "${name}" resumed.` }],
-          details: {
-            id: running.id,
-            name,
-            sessionId: resumedSessionId,
-            sessionFile: sessionPath,
-            pane: running.surface,
-            status: "started",
-          },
-        };
+          if (!existsSync(sessionPath)) {
+            return fail(`Subagent "${name}" is registered but its session file is gone ` +
+              `(${sessionPath}). It cannot be resumed. Spawn a fresh subagent instead.`);
+          }
+          // Restore the saved identity and tool restrictions; refuse rather than lose them.
+          const loadout = readSubagentLoadout(sessionPath);
+          if (!loadout) {
+            return fail(`Cannot safely resume "${name}": no loadout snapshot found for this session ` +
+              `(it predates loadout snapshots, or its .loadout.json sidecar was removed). ` +
+              `Resuming would drop its system prompt and tool restrictions, so this is refused. ` +
+              `Re-run the task as a fresh subagent instead.`);
+          }
+          const resumedSessionId = getSessionId(sessionPath) ?? name;
+          startingSessions.add(sessionKey);
+          // A resumed run is autonomous; a live child taken back keeps how it was launched.
+          const watchRun = (surface: string, herdrName: string, interactive = false): RunningSubagent => {
+            const running: RunningSubagent = {
+              id: randomUUID().slice(0, 8), name, task: message, agent: loadout.agent ?? undefined,
+              surface, herdrName, startTime: Date.now(), sessionFile: sessionPath, interactive,
+            };
+            runningSubagents.set(running.id, running);
+            watchAndDeliver(running);
+            return running;
+          };
+          let running: RunningSubagent;
+          try {
+            // Adopt a live child lost during a parent restart instead of opening its transcript twice.
+            const live = await launchDeps.findSessionAgent(sessionKey);
+            deliverySignal.throwIfAborted();
+            const steeredLive = live && await steerLive(watchRun(live.pane, live.agent, loadout.interactive), message, deliverySignal);
+            if (steeredLive) return steeredLive;
+            const args = ["--session", sessionPath, "-e", join(SUBAGENTS_DIR, "subagent-done.ts")];
+            applyLoadoutToArgs(args, loadout, sessionPath);
+            args.push(...await integrationArgs(loadout.agentDir ?? getAgentDir()));
+            deliverySignal.throwIfAborted();
+            // This run is autonomous: a parent that restarts and takes it back must see that.
+            writeSubagentLoadout(sessionPath, { ...loadout, interactive: false });
+            clearStaleMarkers(sessionPath);
+            const started = await startTracked({
+              name,
+              args,
+              env: subagentEnv(loadout, { name, sessionFile: sessionPath, autoExit: true }),
+              cwd: loadout.cwd ?? ctx.cwd,
+            }, message, deliverySignal);
+            running = watchRun(started.surface, started.agent);
+          } finally {
+            startingSessions.delete(sessionKey);
+          }
+          return {
+            content: [{ type: "text", text: `Session "${name}" resumed.` }],
+            details: {
+              id: running.id, name, sessionId: resumedSessionId, sessionFile: sessionPath,
+              pane: running.surface, status: "started",
+            },
+          };
+        });
       },
     });
 
