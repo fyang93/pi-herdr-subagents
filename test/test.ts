@@ -1182,6 +1182,7 @@ describe("subagent-done.ts", () => {
         ui: { setWidget() {} },
         sessionManager: { getEntries: () => branch, getLeafId: () => branch.at(-1)?.id ?? null, getBranch: () => branch },
         isIdle: () => true,
+        hasPendingMessages: () => false,
         model: { provider: "test", id: "model" } as any,
         modelRegistry: { hasConfiguredAuth: () => true, getApiKeyAndHeaders: async () => ({ ok: true }) } as any,
         shutdown() { shutdownCalls++; },
@@ -1551,6 +1552,7 @@ describe("subagent-done.ts", () => {
       h.api.sendUserMessage = (text: string, options: any) => {
         if (throws) throw new Error("stale API");
         sent.push({ text, options });
+        h.emit("message_start", { message: { role: "user" } });
       };
       try {
         Object.assign(h.ctx, { isIdle: () => false, signal: new AbortController().signal });
@@ -1562,6 +1564,7 @@ describe("subagent-done.ts", () => {
         assert.deepEqual(pendingInboxMessages(session), [first, second]);
         throws = false;
         t.mock.timers.tick(250);
+        t.mock.timers.tick(250); // one at a time, each once Pi has taken the previous
         assert.deepEqual(sent, [
           { text: "line one\nline two", options: { deliverAs: "steer" } },
           { text: "next", options: { deliverAs: "steer" } },
@@ -1598,6 +1601,7 @@ describe("subagent-done.ts", () => {
       h.api.sendUserMessage = (text: string, options: any) => {
         h.emit("input", { text, streamingBehavior: options?.deliverAs });
         sent.push({ text, options });
+        h.emit("message_start", { message: { role: "user" } });
       };
       try {
         const first = publishInboxMessage(session, "first"), second = publishInboxMessage(session, "second");
@@ -1616,11 +1620,54 @@ describe("subagent-done.ts", () => {
       } finally { h.restore(); rmSync(dir, { recursive: true, force: true }); }
     });
 
+    it("keeps an inbox message Pi is still preparing, so a run settling meanwhile does not end the session", async (t) => {
+      t.mock.timers.enable({ apis: ["setInterval"] });
+      const dir = createTestDir(), session = join(dir, "s.jsonl");
+      const h = setupCapturingExtension(session), sent: string[] = [];
+      h.api.sendUserMessage = (text: string) => sent.push(text); // its input handlers are still running
+      try {
+        Object.assign(h.ctx, { isIdle: () => false, signal: new AbortController().signal });
+        const file = publishInboxMessage(session, "B");
+        t.mock.timers.tick(250);
+        assert.deepEqual(sent, ["B"]);
+        Object.assign(h.ctx, { isIdle: () => true, signal: undefined });
+        await h.settle(); // run A ends before Pi has queued B
+        t.mock.timers.tick(250);
+        assert.equal(h.shutdownCalls, 0);
+        assert.equal(existsSync(file), true, "the parent's receipt waits for Pi to take it");
+        h.emit("agent_start"); // B starts its own run
+        h.emit("message_start", { message: { role: "user" } });
+        assert.equal(existsSync(file), false);
+        await h.settle();
+        assert.equal(h.shutdownCalls, 1);
+        assert.deepEqual(sent, ["B"]);
+      } finally { h.restore(); rmSync(dir, { recursive: true, force: true }); }
+    });
+
+    it("takes an inbox message as delivered once Pi has queued it", async (t) => {
+      t.mock.timers.enable({ apis: ["setInterval"] });
+      const dir = createTestDir(), session = join(dir, "s.jsonl");
+      const h = setupCapturingExtension(session), sent: string[] = [];
+      let queued = false;
+      h.api.sendUserMessage = (text: string) => sent.push(text);
+      try {
+        Object.assign(h.ctx, { isIdle: () => false, signal: new AbortController().signal, hasPendingMessages: () => queued });
+        const file = publishInboxMessage(session, "B");
+        t.mock.timers.tick(250);
+        t.mock.timers.tick(250);
+        assert.equal(existsSync(file), true);
+        queued = true;
+        t.mock.timers.tick(250);
+        assert.equal(existsSync(file), false);
+        assert.deepEqual(sent, ["B"]);
+      } finally { h.restore(); rmSync(dir, { recursive: true, force: true }); }
+    });
+
     it("leaves files arriving after .exiting unread", async (t) => {
       t.mock.timers.enable({ apis: ["setInterval"] });
       const dir = createTestDir(), session = join(dir, "s.jsonl");
       const h = setupCapturingExtension(session), sent: string[] = [];
-      h.api.sendUserMessage = (text: string) => sent.push(text);
+      h.api.sendUserMessage = (text: string) => { sent.push(text); h.emit("message_start", { message: { role: "user" } }); };
       const file = publishInboxMessage(session, "task");
       try {
         t.mock.timers.tick(250);
@@ -1642,7 +1689,7 @@ describe("subagent-done.ts", () => {
       t.mock.timers.enable({ apis: ["setInterval"] });
       const dir = createTestDir(), session = join(dir, "s.jsonl");
       const h = setupCapturingExtension(session), sent: string[] = [], warnings: string[] = [];
-      h.api.sendUserMessage = (text: string) => sent.push(text);
+      h.api.sendUserMessage = (text: string) => { sent.push(text); h.emit("message_start", { message: { role: "user" } }); };
       const file = publishInboxMessage(session, "ONCE");
       const remove = fs.rmSync;
       let failing = true;
@@ -2964,6 +3011,20 @@ describe("watchSubagent", () => {
     assert.equal(closed.length, 0);
     assert.equal((await testApi.watchSubagent({ ...running }, aborted.signal, { wait, close: (pane: string) => { closed.push(pane); } })).summary, "Subagent cancelled.");
     assert.deepEqual(closed, ["w1:p9"]);
+  });
+
+  it("on cancellation, closes the pane the agent moved to, and never one now hosting another session", async () => {
+    const wait = () => Promise.reject(new Error("aborted"));
+    const aborted = new AbortController();
+    aborted.abort();
+    const cancel = async (session: string) => {
+      const closed: string[] = [];
+      const status = async () => ({ status: "working" as const, pane: "w2:p1", session });
+      await testApi.watchSubagent({ ...running }, aborted.signal, { wait, status, close: (pane: string) => { closed.push(pane); } });
+      return closed;
+    };
+    assert.deepEqual(await cancel(running.sessionFile), ["w2:p1"], "moved before the watcher saw it");
+    assert.deepEqual(await cancel("/another-session.jsonl"), [], "the pane now runs another session");
   });
 
   it("keeps the exit marker when /reload hands the subagent over while its pane closes", async () => {

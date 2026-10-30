@@ -91,6 +91,11 @@ interface ChildState {
   runDeadline: number | null;
   /** Submitted files whose deletion failed must never be submitted again, including after reload. */
   inboxCleanup: Set<string>;
+  /**
+   * The inbox file handed to Pi but not yet queued or started: Pi runs input handlers first, and a
+   * run settling meanwhile must not end the session. Kept until then, or until its deadline.
+   */
+  inboxSubmitted: { file: string; deadline: number } | null;
   exitAfterInbox: boolean;
 }
 
@@ -115,6 +120,7 @@ const newChildState = (entries: SessionEntry[]): ChildState => ({
   existingEntryIds: new Set(entries.map((entry) => entry.id)),
   runDeadline: null,
   inboxCleanup: new Set(),
+  inboxSubmitted: null,
   exitAfterInbox: false,
 });
 
@@ -167,6 +173,9 @@ export default function (pi: ExtensionAPI) {
     if (!sessionFile || finished || (!ctx.isIdle() && !ctx.signal)) return;
     const cleanup = state.inboxCleanup;
     for (const file of cleanup) if (!removeConsumedFile(file, cleanup)) return;
+    // Queued, it runs before the session settles; never queued by the deadline, an input handler took it.
+    if (state.inboxSubmitted && !ctx.hasPendingMessages() && Date.now() < state.inboxSubmitted.deadline) return;
+    inboxTaken();
     let files: string[];
     try { files = pendingInboxMessages(sessionFile); }
     catch (error) { console.warn(`Could not read subagent inbox for ${sessionFile}: ${error}`); return; }
@@ -189,10 +198,16 @@ export default function (pi: ExtensionAPI) {
       processInbox(ctx);
       return;
     }
-    const idle = ctx.isIdle();
+    state.inboxSubmitted = { file, deadline: Date.now() + RUN_START_TIMEOUT };
     try { pi.sendUserMessage(message, { deliverAs: "steer" }); }
-    catch { return; } // keep it, and retry in order next tick
-    if (removeConsumedFile(file, cleanup) && !idle) processInbox(ctx);
+    catch { state.inboxSubmitted = null; } // keep it, and retry in order next tick
+  }
+
+  /** Pi has taken the submitted inbox message: its file is the parent's receipt. */
+  function inboxTaken() {
+    const submitted = state.inboxSubmitted;
+    state.inboxSubmitted = null;
+    if (submitted) removeConsumedFile(submitted.file, state.inboxCleanup);
   }
 
   /** End an autonomous subagent whose task has started no run by its deadline. */
@@ -286,6 +301,7 @@ export default function (pi: ExtensionAPI) {
     state.runDeadline = Date.now() + RUN_START_TIMEOUT;
     watchRunStart(ctx);
   });
+  pi.on("message_start", (event) => { if (event.message.role === "user") inboxTaken(); });
   pi.on("agent_start", () => {
     runStarting();
     exitAfterCompaction = false;

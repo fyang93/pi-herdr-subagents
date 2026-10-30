@@ -24,6 +24,7 @@ import {
   findSessionAgent,
   type AgentLaunch,
   waitForExit,
+  agentStatus,
   closePane,
 } from "./herdr.ts";
 import {
@@ -764,7 +765,7 @@ function reportBlocked(running: RunningSubagent, status: string | null): void {
 async function watchSubagent(
   running: RunningSubagent,
   signal: AbortSignal,
-  deps: { wait?: typeof waitForExit; close?: (surface: string) => void | Promise<void> } = {},
+  deps: { wait?: typeof waitForExit; status?: typeof agentStatus; close?: (surface: string) => void | Promise<void> } = {},
 ): Promise<SubagentResult> {
   const { startTime, sessionFile } = running;
   let preservePane = false;
@@ -823,7 +824,15 @@ async function watchSubagent(
       ...(stats ? { stats } : {}),
     };
   } catch (err: any) {
-    if (!running.handedOff && !preservePane) await closeOrReport(running.name, running.surface, deps.close);
+    if (!running.handedOff && !preservePane) {
+      // Cancelled before the watcher saw a move or another session in the pane: look again, to close
+      // the pane where the agent is now, and never one now hosting another session.
+      const found = await (deps.status ?? agentStatus)(running.herdrName);
+      const live = found !== null && found !== "exited";
+      if (!live || !found.session || resolve(found.session) === resolve(sessionFile)) {
+        await closeOrReport(running.name, live ? found.pane : running.surface, deps.close);
+      }
+    }
     runningSubagents.delete(running.id);
 
     const elapsed = Math.floor((Date.now() - startTime) / 1000);

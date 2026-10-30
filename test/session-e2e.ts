@@ -219,7 +219,7 @@ export default function(pi:any) {
   await wait(() => normalWatch.ticks.some(t => t.pane === normalPane && t.status === "working"), "watcher follows the moved pane by name");
   const busyMessage = publishInboxMessage(normal.file, `${plan("steered-after-move")}\nA second line after moving the pane.`);
   await wait(() => entries(join(base, "inputs.jsonl")).some(e => e.session === normal.file && e.text.includes("steered-after-move") && !e.idle), "child submitted multi-line busy steer");
-  assert.equal(existsSync(busyMessage), false, "submitted steer is now owned by Pi's queue");
+  await wait(() => !existsSync(busyMessage), "the receipt goes once Pi has queued or started the busy steer");
   writeFileSync(join(project, "normal-release"), "released");
   await wait(() => received(normal.file, "steered-after-move"), "steering by name reached the moved agent");
   assert.deepEqual(await normalWatch.result, { reason: "done", exitCode: 0, summary: "RESULT:steered-after-move" });
