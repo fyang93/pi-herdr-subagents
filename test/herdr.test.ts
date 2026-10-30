@@ -16,8 +16,9 @@ const reply = (name: string, body: unknown) => writeFileSync(join(dir, name), JS
 writeFileSync(fake, `#!/usr/bin/env bash
 printf '%s\\0' "$@" >> ${JSON.stringify(log)}; printf '\\036' >> ${JSON.stringify(log)}
 case "$1 $2" in
-  "pane current") echo '{"result":{"pane":{"pane_id":"w1:p1","workspace_id":"w1"}}}' ;;
-  "pane layout") cat ${JSON.stringify(join(dir, "layout"))} ;;
+  "pane current") echo '{"result":{"pane":{"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1"}}}' ;;
+  "pane list") cat ${JSON.stringify(join(dir, "panes"))} 2>/dev/null || echo '{"result":{"panes":[{"pane_id":"w1:p1","tab_id":"w1:t1"}]}}' ;;
+  "pane layout") file=${JSON.stringify(join(dir, "layout"))}; [ -e "$file-$4" ] && file="$file-$4"; cat "$file" ;;
   "pane split") [ -e ${JSON.stringify(join(dir, "split_slow"))} ] && sleep 0.3; echo '{"result":{"pane":{"pane_id":"w1:p9"}}}' ;;
   "tab create") echo '{"result":{"root_pane":{"pane_id":"w1:p8"},"tab":{}}}' ;;
   "agent list") [ -e ${JSON.stringify(join(dir, "list_fail"))} ] && { echo '{"error":{"code":"server_error","message":"down"}}' >&2; exit 1; }; cat ${JSON.stringify(join(dir, "list"))} 2>/dev/null || echo '{"result":{"agents":[{"name":"scout"}]}}' ;;
@@ -37,6 +38,8 @@ const calls = () => readFileSync(log, "utf8").split("\x1e").filter(Boolean).map(
 const layout = (panes: [string, number, number][], zoomed = false) => reply("layout", {
   result: { layout: { zoomed, panes: panes.map(([pane_id, width, height]) => ({ pane_id, rect: { width, height } })) } },
 });
+// The pane split or tab created for the last start.
+const opening = () => calls().find(c => c.slice(0, 2).join(" ") === "pane split" || c.slice(0, 2).join(" ") === "tab create")!;
 const launch = { name: "Scout", args: ["--session", "/s s.jsonl"], env: { PI_SUBAGENT_NAME: "Scout" }, cwd: "/repo" };
 
 it("starts a named agent in an unfocused split of the parent's own pane, else a background tab", async () => {
@@ -46,7 +49,7 @@ it("starts a named agent in an unfocused split of the parent's own pane, else a 
   assert.deepEqual(await herdr.startAgent(launch), { surface: "w1:p9", agent: "scout-2" });
   const made = calls();
   assert.deepEqual(made[0], ["pane", "current", "--current"]);  // the caller's pane as herdr sees it now
-  assert.deepEqual(made[2], ["pane", "split", "w1:p1", "--direction", "down", "--no-focus", "--cwd", "/repo", "--env", "PI_SUBAGENT_NAME=Scout"]);
+  assert.deepEqual(opening(), ["pane", "split", "w1:p1", "--direction", "down", "--no-focus", "--cwd", "/repo", "--env", "PI_SUBAGENT_NAME=Scout"]);
   assert.deepEqual(made.at(-1), ["agent", "start", "scout-2", "--kind", "pi", "--pane", "w1:p9", "--timeout", "60000", "--", "--session", "/s s.jsonl"]);
   assert.equal(made.some(c => c[0] === "agent" && c[1] === "prompt"), false);
 
@@ -54,7 +57,7 @@ it("starts a named agent in an unfocused split of the parent's own pane, else a 
     writeFileSync(log, "");
     layout(panes as any, zoomed);  // the parent is too small, or the tab is zoomed
     assert.equal((await herdr.startAgent(launch)).surface, "w1:p8");
-    assert.deepEqual(calls()[2].slice(0, 7), ["tab", "create", "--workspace", "w1", "--no-focus", "--label", "Scout"]);
+    assert.deepEqual(opening().slice(0, 7), ["tab", "create", "--workspace", "w1", "--no-focus", "--label", "Scout"]);
   }
 });
 
@@ -65,12 +68,39 @@ it("splits the largest unfocused pane it opened before the parent's own pane", a
   const split = (panes: any[]) => {
     reply("layout", { result: { layout: { zoomed: false, panes: panes.map(([pane_id, width, height, focused]) => ({ pane_id, focused, rect: { width, height } })) } } });
     writeFileSync(log, "");
-    return herdr.startAgent(launch).then(() => calls()[2]);
+    return herdr.startAgent(launch).then(() => opening());
   };
   assert.deepEqual((await split([["w1:p1", 100, 25], ["w1:p9", 100, 50], ["w1:p2", 200, 50]])).slice(0, 5), ["pane", "split", "w1:p9", "--direction", "down"]);
   assert.deepEqual((await split([["w1:p1", 200, 50], ["w1:p9", 100, 50]])).slice(0, 3), ["pane", "split", "w1:p9"]);  // even when the parent's is bigger
   assert.deepEqual((await split([["w1:p1", 100, 50], ["w1:p9", 100, 25]])).slice(0, 3), ["pane", "split", "w1:p1"]);  // agent panes too small
-  assert.deepEqual((await split([["w1:p1", 100, 25], ["w1:p9", 100, 50, true]])).slice(0, 2), ["tab", "create"]);  // the user is in it
+  assert.deepEqual((await split([["w1:p1", 100, 25], ["w1:p9", 100, 50, true]])).slice(0, 3), ["pane", "split", "w1:p9"]);  // focused only within its tab
+  reply("panes", { result: { panes: [{ pane_id: "w1:p1", tab_id: "w1:t1" }, { pane_id: "w1:p9", tab_id: "w1:t1", focused: true }] } });
+  try {
+    assert.deepEqual((await split([["w1:p1", 100, 25], ["w1:p9", 100, 50]])).slice(0, 2), ["tab", "create"]);  // the user is in it
+  } finally {
+    rmSync(join(dir, "panes"));
+  }
+});
+
+it("fills background tabs of its own agents before opening another", async () => {
+  writeFileSync(join(dir, "start"), "");
+  layout([["w1:p1", 100, 25]]);
+  assert.equal((await herdr.startAgent(launch)).surface, "w1:p8");  // a background tab opened by this parent
+  const panes = (...extra: [string, string][]) => reply("panes", { result: { panes: [["w1:p1", "w1:t1"], ["w1:p8", "w1:t2"], ...extra].map(([pane_id, tab_id]) => ({ pane_id, tab_id })) } });
+  reply("layout-w1:p8", { result: { layout: { zoomed: false, panes: [{ pane_id: "w1:p8", focused: true, rect: { width: 200, height: 50 } }] } } });
+  try {
+    panes();
+    writeFileSync(log, "");
+    await herdr.startAgent(launch);
+    assert.deepEqual(opening().slice(0, 5), ["pane", "split", "w1:p8", "--direction", "right"]);  // its tab focus is not the user's
+    panes(["w1:p7", "w1:t2"]);  // the user opened a pane there
+    writeFileSync(log, "");
+    await herdr.startAgent(launch);
+    assert.deepEqual(opening().slice(0, 2), ["tab", "create"]);
+  } finally {
+    rmSync(join(dir, "panes"));
+    rmSync(join(dir, "layout-w1:p8"));
+  }
 });
 
 it("defaults to readable 80-column by 24-row panes, otherwise opens a tab", async () => {
@@ -89,7 +119,7 @@ it("defaults to readable 80-column by 24-row panes, otherwise opens a tab", asyn
     layout([["w1:p1", width, height]]);
     const { surface } = await herdr.startAgent(launch);
     assert.equal(surface, direction ? "w1:p9" : "w1:p8", `${width}×${height}`);
-    if (direction) assert.equal(calls()[2][4], direction);
+    if (direction) assert.equal(opening()[4], direction);
   }
 });
 

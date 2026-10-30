@@ -1,7 +1,7 @@
 /**
  * herdr operations. Each subagent is a named herdr agent in its own pane: an
- * unfocused split of the parent's pane or of a subagent pane it opened (a background
- * tab when those are too small),
+ * unfocused split of the parent's pane or of a subagent pane it opened, in the parent's
+ * tab or a background tab of its agents (a new background tab when those are too small),
  * started with `herdr agent start` so it shows in herdr's agents sidebar, with
  * state reported by herdr's pi integration. Pane ids look like `w1:p2`.
  */
@@ -115,17 +115,27 @@ async function openPane(launch: AgentLaunch, signal?: AbortSignal): Promise<stri
   const parent = current.pane_id;
   const minColumns = positiveInteger(process.env.PI_SUBAGENT_MIN_COLUMNS, 80);
   const minRows = positiveInteger(process.env.PI_SUBAGENT_MIN_ROWS, 24);
-  const { layout } = await herdrAsync(["pane", "layout", "--pane", parent], { signal });
+  // The pane list's `focused` is workspace-wide; a layout's is per tab.
+  const { panes } = await herdrAsync(["pane", "list", "--workspace", current.workspace_id], { signal });
+  const focused = panes.find((pane: any) => pane.focused)?.pane_id;
+  const tabs = new Map<string, string[]>();
+  for (const pane of panes) tabs.set(pane.tab_id, [...tabs.get(pane.tab_id) ?? [], pane.pane_id]);
+  // Fill the parent's tab, then background tabs holding only this parent's agents.
+  const layouts = [parent, ...[...tabs].filter(([tab, ids]) => tab !== current.tab_id && ids.every(id => opened.has(id))).map(([, ids]) => ids[0])];
   // Split the largest unfocused agent pane, else the parent's own pane, never a pane of the user's;
-  // a background tab when all are too small or the tab is zoomed. Never unzoom or rearrange.
+  // a background tab when all are too small or zoomed. Never unzoom or rearrange.
   const area = (pane: any) => pane.rect.width * pane.rect.height;
-  const own = layout.zoomed ? [] : layout.panes.filter((pane: any) => pane.pane_id === parent);
-  const agents = layout.zoomed ? [] : layout.panes.filter((pane: any) => opened.has(pane.pane_id) && !pane.focused);
-  const candidates = [...agents.sort((a: any, b: any) => area(b) - area(a)), ...own];
   let target = parent, direction: "right" | "down" | null = null;
-  for (const pane of candidates) {
-    direction = splitDirection(pane.rect.width, pane.rect.height, minColumns, minRows);
-    if (direction) { target = pane.pane_id; break; }
+  for (const id of layouts) {
+    const { layout } = await herdrAsync(["pane", "layout", "--pane", id], { signal });
+    if (layout.zoomed) continue;
+    const own = layout.panes.filter((pane: any) => pane.pane_id === parent);
+    const agents = layout.panes.filter((pane: any) => opened.has(pane.pane_id) && pane.pane_id !== focused);
+    for (const pane of [...agents.sort((a: any, b: any) => area(b) - area(a)), ...own]) {
+      direction = splitDirection(pane.rect.width, pane.rect.height, minColumns, minRows);
+      if (direction) { target = pane.pane_id; break; }
+    }
+    if (direction) break;
   }
   const env = Object.entries(launch.env).flatMap(([key, value]) => ["--env", `${key}=${value}`]);
   // Neither abortable nor timed out: herdr may create the pane before it answers, and only
