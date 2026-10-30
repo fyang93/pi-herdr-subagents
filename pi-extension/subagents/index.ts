@@ -62,8 +62,6 @@ const launchDeps = { startAgent, findSessionAgent, watchSubagent };
 // /reload re-imports this file, giving fresh module-level state, but closures from
 // the old module keep running. See https://github.com/HazAT/pi-interactive-subagents/issues/5
 const POLL_ABORT_KEY = Symbol.for("pi-subagents/poll-abort-controller");
-// Running subagents handed from the old module load to the new one across /reload.
-const RELOAD_HANDOFF_KEY = Symbol.for("pi-subagents/reload-handoff");
 
 {
   const prevAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
@@ -122,8 +120,8 @@ function watchAndDeliver(running: RunningSubagent): void {
   if (!pi) return;
   const { signal } = running.abortController = new AbortController();
   const lifecycle = getModuleAbortSignal();
-  // Reload hands delivery to the new watcher; shutdown must not start a turn on a stale pi.
-  const silenced = () => running.handedOff || signal.aborted || lifecycle.aborted;
+  // Shutdown must not start a turn on a stale pi.
+  const silenced = () => signal.aborted || lifecycle.aborted;
   refreshWidget();
   unconsumed.add(running.id);
   const watching = running.watching = track(launchDeps.watchSubagent(running, signal));
@@ -225,24 +223,16 @@ interface RunningSubagent {
   status?: string;
   /** Settles once the watcher has reported the subagent and cleaned up after it. */
   watching?: Promise<unknown>;
-  /** Handed to the reloaded extension: leave the pane open and report nothing. */
-  handedOff?: boolean;
-  /** Delivered question files whose deletion failed; retained across reload without sending twice. */
+  /** Delivered question files whose deletion failed; retried without sending twice. */
   questionCleanup?: Set<string>;
   noticeCleanup?: Set<string>;
-}
-
-interface ReloadHandoff {
-  running: RunningSubagent[];
-  held: Array<[string, Parameters<ExtensionAPI["sendMessage"]>[0]]>;
 }
 
 /** All currently running subagents, keyed by id. */
 const runningSubagents = new Map<string, RunningSubagent>();
 // Sessions a pi is being started on, by a launch or a resume: until it is tracked in
 // runningSubagents, nothing else may start another pi on the same transcript.
-const STARTING_SESSIONS_KEY = Symbol.for("pi-subagents/starting-sessions");
-const startingSessions = ((globalThis as any)[STARTING_SESSIONS_KEY] ??= new Set<string>()) as Set<string>;
+const startingSessions = new Set<string>();
 
 // When this extension is loaded inside a subagent that itself spawns children
 // (e.g. a worker delegating to scout/researcher), `subagent-done.ts` runs in the
@@ -712,8 +702,7 @@ function transmit(pi: ExtensionAPI, deliveryId: string, tracked: Parameters<Exte
 
 /** Set while a prompt submitted to an idle parent is prepared, until its run starts or a grace period ends. */
 let preparing: ReturnType<typeof setTimeout> | undefined;
-/** Plain message data survives reload without retaining the old extension API. */
-const held: ReloadHandoff["held"] = [];
+const held: Array<[string, Parameters<ExtensionAPI["sendMessage"]>[0]]> = [];
 
 function releaseHeld(): void {
   clearTimeout(preparing);
@@ -806,8 +795,7 @@ async function watchSubagent(
 
     // A completion receipt does not grant ownership of a pane now hosting another session.
     if (!preservePane) await closeOrReport(running.name, running.surface, deps.close);
-    // Consumed only now, and not once handed off: the reloaded watcher still needs it.
-    if (!running.handedOff) for (const marker of [".exit", ".exiting"]) {
+    for (const marker of [".exit", ".exiting"]) {
       try { rmSync(sessionFile + marker, { force: true }); }
       catch (error) { console.warn(`Could not remove subagent marker ${sessionFile + marker}: ${error}`); }
     }
@@ -824,7 +812,7 @@ async function watchSubagent(
       ...(stats ? { stats } : {}),
     };
   } catch (err: any) {
-    if (!running.handedOff && !preservePane) {
+    if (!preservePane) {
       // Cancelled before the watcher saw a move or another session in the pane: look again, to close
       // the pane where the agent is now, and never one now hosting another session.
       const found = await (deps.status ?? agentStatus)(running.herdrName);
@@ -859,21 +847,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     const prevAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
     if (!prevAbort || prevAbort.signal.aborted) {
       (globalThis as any)[POLL_ABORT_KEY] = new AbortController();
-    }
-    // Keep watching what the previous load handed over; a child that finished
-    // meanwhile is found by its exit marker on the first check.
-    const handoff = (globalThis as any)[RELOAD_HANDOFF_KEY] as ReloadHandoff | undefined;
-    delete (globalThis as any)[RELOAD_HANDOFF_KEY];
-    if (event.reason === "reload") {
-      for (const previous of handoff?.running ?? []) {
-        const running: RunningSubagent = { ...previous, handedOff: false };
-        runningSubagents.set(running.id, running);
-        watchAndDeliver(running);
-      }
-      for (const [id, message] of handoff?.held ?? []) {
-        if (message.customType === "subagent_result") unconsumed.add(id);
-        sendTracked(pi, id, message);
-      }
     }
   });
 
@@ -925,18 +898,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   // Clean up on session shutdown
   pi.on("session_shutdown", async (event, ctx) => {
     const moduleAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
-    // /reload re-imports this module in the same process: hand running subagents
-    // to the new load instead of closing their panes.
-    if (event.reason === "reload") (globalThis as any)[RELOAD_HANDOFF_KEY] = {
-      running: [...runningSubagents.values()], held: held.slice(),
-    } satisfies ReloadHandoff;
-    for (const agent of runningSubagents.values()) {
-      if (event.reason === "reload") agent.handedOff = true;
-      agent.abortController?.abort();
-    }
+    for (const agent of runningSubagents.values()) agent.abortController?.abort();
     if (moduleAbort) moduleAbort.abort();
     runningSubagents.clear();
-    unconsumed.clear(); // none will be delivered here; a reloaded module counts its own
+    unconsumed.clear(); // none will be delivered here
     undelivered.clear();
     queued.clear();
     clearTimeout(preparing);

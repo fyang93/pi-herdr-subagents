@@ -274,12 +274,11 @@ test("manual compaction retains inbox replies and delivers them once, in order, 
   await h.stop();
 });
 
-test("tree navigation after resume excludes old answers and sibling errors but keeps fresh answers across reload", async () => {
+test("tree navigation after resume excludes old answers and sibling errors but keeps fresh answers", async () => {
   const navigate = join(root, "navigate-tree.ts");
   writeFileSync(navigate, `export default (pi:any) => {
     process.env.PI_SUBAGENT_AUTO_EXIT = "0";
     pi.registerCommand("smoke-tree", {handler: async (id:string, ctx:any) => { await ctx.navigateTree(id.trim(), {summarize:false}); }});
-    pi.registerCommand("smoke-reload", {handler: async (_args:string, ctx:any) => { await ctx.reload(); }});
   };`);
   const h = start({ beforeExtensions: [navigate] });
   await h.command("get_state");
@@ -317,45 +316,9 @@ test("tree navigation after resume excludes old answers and sibling errors but k
   replies.push({ text: "FRESH SWITCHED-BRANCH ANSWER" });
   prompt(resumed, "NEW TASK ON OLD BRANCH");
   await waitFor(() => resumed.records.some(r => r.type === "agent_settled"), resumed.diagnostic);
-  assert.equal((await resumed.command("prompt", { message: "/smoke-reload" })).success, true, resumed.diagnostic());
   await resumed.stop();
   assert.equal(requests.length, 1);
   assert.deepEqual(resumed.sidecar(".exit"), { type: "done", summary: "FRESH SWITCHED-BRANCH ANSWER" });
-});
-
-test("parent reload delivers held questions and results once through the new runtime", async () => {
-  const wrapper = join(root, "reload-parent.ts"), stateFile = join(root, "reload-state.json");
-  writeFileSync(wrapper, `
-import parent, { __test__ as t } from ${JSON.stringify(resolve("pi-extension/subagents/index.ts"))};
-import { publishQuestion, pendingQuestions } from ${JSON.stringify(resolve("pi-extension/subagents/session.ts"))};
-import { writeFileSync } from "node:fs";
-export default function (pi:any) {
-  process.env.PI_SUBAGENT_AUTO_EXIT = "0";
-  parent(pi);
-  pi.on("input", (event:any) => event.text === "HANDLED_INPUT" ? {action:"handled"} : undefined);
-  pi.registerCommand("smoke-stage", {handler: async () => {
-    const file = ${JSON.stringify(join(root, "reload-question.jsonl"))};
-    publishQuestion(file, "HELD_QUESTION");
-    t.deliverPendingQuestion({id:"held-child", name:"held-child", sessionFile:file, startTime:Date.now()} as any);
-    t.notify({customType:"subagent_result", content:"HELD_RESULT", display:true});
-    writeFileSync(${JSON.stringify(stateFile)}, JSON.stringify({pending:t.undelivered.size, files:pendingQuestions(file).files.length}));
-  }});
-  pi.registerCommand("smoke-reload", {handler: async (_args:any, ctx:any) => { await ctx.reload(); }});
-}`);
-  const h = start({ beforeExtensions: [wrapper] });
-  await h.command("get_state");
-  assert.equal((await h.command("prompt", { message: "HANDLED_INPUT" })).success, true);
-  assert.equal((await h.command("prompt", { message: "/smoke-stage" })).success, true);
-  assert.deepEqual(JSON.parse(readFileSync(stateFile, "utf8")), { pending: 2, files: 0 });
-  assert.equal(requests.length, 0, "both notices are held, not sent to the old runtime");
-  assert.equal((await h.command("prompt", { message: "/smoke-reload" })).success, true);
-  const notices = () => sessionEntries(h).filter(e => e.type === "custom_message" && ["subagent_question", "subagent_result"].includes(e.customType));
-  await waitFor(() => existsSync(h.session) && notices().length === 2 && h.records.some(r => r.type === "agent_settled"), h.diagnostic);
-  assert.match(JSON.stringify(notices()), /HELD_QUESTION/);
-  assert.match(JSON.stringify(notices()), /HELD_RESULT/);
-  assert.equal((await h.command("prompt", { message: "/smoke-reload" })).success, true);
-  await h.stop();
-  assert.equal(notices().length, 2, "a second reload does not duplicate delivered notices");
 });
 
 test("busy Pi takes an inbox message as a steer before settled auto-exit", async () => {

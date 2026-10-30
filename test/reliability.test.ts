@@ -165,7 +165,7 @@ it("a failed resume releases the message queue so the next message can retry", a
   assert.equal(state.startingSessions.size, 0);
 });
 
-it("question cleanup errors neither close a working child nor repeat delivered questions, including after reload", async t => {
+it("question cleanup errors neither close a working child nor repeat delivered questions", async t => {
   const h = await parent(t), child = h.live("worker");
   publishQuestion(child.sessionFile, "FIRST?");
   const [file] = pendingQuestions(child.sessionFile).files;
@@ -184,7 +184,7 @@ it("question cleanup errors neither close a working child nor repeat delivered q
       options.onTick!("working");
       publishQuestion(child.sessionFile, "SECOND?");
       options.onTick!("working");
-      state.deliverPendingQuestion({ ...child }); // the plain running record is handed across reload
+      state.deliverPendingQuestion({ ...child });
       assert.deepEqual(h.sent.map(m => m.details.question), ["FIRST?", "SECOND?"]);
       assert.equal(fs.existsSync(file), true);
       failing = false;

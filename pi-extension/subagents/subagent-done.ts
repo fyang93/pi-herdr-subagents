@@ -78,8 +78,6 @@ export function findLatestAssistantError(
   return null;
 }
 
-const CHILD_STATE_KEY = Symbol.for("pi-subagents/child-state");
-
 interface ChildState {
   /** An ask_question is unanswered; cleared only when a reply is submitted (`input`), not by a run something else started. */
   awaitingAnswer: boolean;
@@ -87,9 +85,9 @@ interface ChildState {
   skills: string[];
   /** Entries on every branch before this run; /tree must not turn an old answer into its result. */
   existingEntryIds: Set<string>;
-  /** When a task that has started no run is taken as refused; kept across /reload. */
+  /** When a task that has started no run is taken as refused. */
   runDeadline: number | null;
-  /** Submitted files whose deletion failed must never be submitted again, including after reload. */
+  /** Submitted files whose deletion failed must never be submitted again. */
   inboxCleanup: Set<string>;
   /**
    * The inbox file handed to Pi but not yet queued or started: Pi runs input handlers first, and a
@@ -161,8 +159,7 @@ export default function (pi: ExtensionAPI) {
   let finished = false;
   // A done task found Pi still busy (a manual /compact): it exits when that ends.
   let exitAfterCompaction = false;
-  // Kept process-wide so a /reload, which re-runs this factory, does not forget it.
-  const state = ((globalThis as any)[CHILD_STATE_KEY] ??= newChildState([])) as ChildState;
+  const state = newChildState([]);
   // Why a task never started a run: Pi refuses a prompt without a model or credentials before any.
   let startError: SubagentErrorInfo | null = null;
   let runPending: ReturnType<typeof setTimeout> | undefined;
@@ -246,14 +243,11 @@ export default function (pi: ExtensionAPI) {
   }
 
   // Show widget + status bar on session start
-  pi.on("session_start", (event, ctx) => {
+  pi.on("session_start", (_event, ctx) => {
     messages = undefined;
     finished = false;
-    if (event.reason !== "reload") {
-      Object.assign(state, newChildState(ctx.sessionManager.getEntries()));
-      delete process.env.PI_SUBAGENT_SKILLS;
-    }
-    if (autoExit) watchRunStart(ctx); // a deadline set before a /reload, with this session's ctx
+    Object.assign(state, newChildState(ctx.sessionManager.getEntries()));
+    delete process.env.PI_SUBAGENT_SKILLS;
 
     renderWidget(ctx);
     if (subagentName) pi.setSessionName(`subagent ${subagentName}`);

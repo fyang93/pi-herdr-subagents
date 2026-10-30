@@ -1199,7 +1199,6 @@ describe("subagent-done.ts", () => {
       };
       const ask = () => askWith("v1 or v2?");
       return { api, emit, settle, ask, askWith, restore, ctx, branch,
-        reload() { emit("session_shutdown", { reason: "reload" }); handlers.clear(); subagentDoneExtension(api); emit("session_start", { reason: "reload" }); },
         get shutdownCalls() { return shutdownCalls; } };
     }
 
@@ -1355,28 +1354,6 @@ describe("subagent-done.ts", () => {
       }
     });
 
-    it("keeps the deadline of a task that started no run across /reload", async (t) => {
-      t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
-      const dir = createTestDir();
-      const sessionFile = join(dir, "s.jsonl");
-      const h = setupCapturingExtension(sessionFile);
-      try {
-        h.emit("input");
-        t.mock.timers.tick(RUN_START_TIMEOUT / 2);
-        h.emit("session_shutdown", { reason: "reload" });
-        let reloadedShutdowns = 0;
-        const reloaded = { ...h.ctx, shutdown() { reloadedShutdowns++; } };
-        subagentDoneExtension(h.api); // /reload re-runs the factory
-        h.emit("session_start", { reason: "reload" }, reloaded);
-        t.mock.timers.tick(RUN_START_TIMEOUT / 2);
-        assert.ok(reloadedShutdowns >= 1, "the reloaded session ends it on time");
-        assert.equal(h.shutdownCalls, 0, "never through the stale context");
-      } finally {
-        h.restore();
-        rmSync(dir, { recursive: true, force: true });
-      }
-    });
-
     it("does not report an earlier run's provider error for a resumed run ended early", async () => {
       const dir = createTestDir();
       const sessionFile = join(dir, "s.jsonl");
@@ -1469,22 +1446,6 @@ describe("subagent-done.ts", () => {
       }
     });
 
-    it("remembers an unanswered question across /reload", async () => {
-      const dir = createTestDir();
-      const h = setupCapturingExtension(join(dir, "s.jsonl"));
-      try {
-        await h.ask();
-        subagentDoneExtension(h.api); // /reload re-runs the factory
-        h.emit("session_start", { reason: "reload" }, h.ctx);
-        h.emit("agent_start"); // woken by something other than a reply
-        await h.settle();
-        assert.equal(h.shutdownCalls, 0);
-      } finally {
-        h.restore();
-        rmSync(dir, { recursive: true, force: true });
-      }
-    });
-
     it("drops an unsent question or interruption notice once input arrives", async () => {
       const dir = createTestDir();
       const session = join(dir, "s.jsonl");
@@ -1570,9 +1531,6 @@ describe("subagent-done.ts", () => {
           { text: "next", options: { deliverAs: "steer" } },
         ]);
         assert.deepEqual(pendingInboxMessages(session), []);
-        h.reload();
-        t.mock.timers.tick(250);
-        assert.equal(sent.length, 2, "submitted files are gone, also after reload");
       } finally { h.restore(); rmSync(dir, { recursive: true, force: true }); }
     });
 
@@ -1683,42 +1641,6 @@ describe("subagent-done.ts", () => {
         assert.deepEqual(pendingInboxMessages(session), [unread]);
         assert.equal(sent.length, 1);
       } finally { h.restore(); rmSync(dir, { recursive: true, force: true }); }
-    });
-
-    it("retries inbox cleanup without resubmitting or crashing, retaining deferred exit across reload", async (t) => {
-      t.mock.timers.enable({ apis: ["setInterval"] });
-      const dir = createTestDir(), session = join(dir, "s.jsonl");
-      const h = setupCapturingExtension(session), sent: string[] = [], warnings: string[] = [];
-      h.api.sendUserMessage = (text: string) => { sent.push(text); h.emit("message_start", { message: { role: "user" } }); };
-      const file = publishInboxMessage(session, "ONCE");
-      const remove = fs.rmSync;
-      let failing = true;
-      const mocked = t.mock.method(fs, "rmSync", (path: any, options: any) => {
-        if (path === file && failing) throw Object.assign(new Error("simulated cleanup failure"), { code: "EACCES" });
-        return remove(path, options);
-      });
-      syncBuiltinESMExports();
-      t.mock.method(console, "warn", (message: string) => warnings.push(message));
-      try {
-        t.mock.timers.tick(250);
-        assert.deepEqual(sent, ["ONCE"]);
-        await h.settle();
-        assert.equal(h.shutdownCalls, 0, "wait for the receipt to be removed");
-        t.mock.timers.tick(250);
-        h.reload();
-        t.mock.timers.tick(250);
-        assert.deepEqual(sent, ["ONCE"], "failed deletion is not a new message");
-        assert.equal(warnings.length, 1);
-        failing = false;
-        t.mock.timers.tick(250);
-        assert.deepEqual(pendingInboxMessages(session), []);
-        assert.equal(h.shutdownCalls, 1, "the deferred completion survives reload");
-      } finally {
-        mocked.mock.restore();
-        syncBuiltinESMExports();
-        h.restore();
-        rmSync(dir, { recursive: true, force: true });
-      }
     });
 
     it("loads every configured skill with the first task, so one run has them all", async () => {
@@ -2998,21 +2920,6 @@ describe("watchSubagent", () => {
     assert.deepEqual(closed, ["w1:p9", "w1:p9"]);
   });
 
-  it("leaves a handed-off pane open when its watcher is aborted", async () => {
-    const closed: string[] = [];
-    const wait = (_target: string, signal: AbortSignal) => new Promise((_resolve, reject) => {
-      signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
-      if (signal.aborted) reject(new Error("aborted"));
-    });
-    const aborted = new AbortController();
-    aborted.abort();
-    const handedOff = { ...running, handedOff: true };
-    assert.equal((await testApi.watchSubagent(handedOff, aborted.signal, { wait, close: (pane: string) => { closed.push(pane); } })).summary, "Subagent cancelled.");
-    assert.equal(closed.length, 0);
-    assert.equal((await testApi.watchSubagent({ ...running }, aborted.signal, { wait, close: (pane: string) => { closed.push(pane); } })).summary, "Subagent cancelled.");
-    assert.deepEqual(closed, ["w1:p9"]);
-  });
-
   it("on cancellation, closes the pane the agent moved to, and never one now hosting another session", async () => {
     const wait = () => Promise.reject(new Error("aborted"));
     const aborted = new AbortController();
@@ -3025,27 +2932,6 @@ describe("watchSubagent", () => {
     };
     assert.deepEqual(await cancel(running.sessionFile), ["w2:p1"], "moved before the watcher saw it");
     assert.deepEqual(await cancel("/another-session.jsonl"), [], "the pane now runs another session");
-  });
-
-  it("keeps the exit marker when /reload hands the subagent over while its pane closes", async () => {
-    const root = createTestDir();
-    const sessionFile = join(root, "closing.jsonl");
-    writeFileSync(sessionFile, [USER_MSG, ASSISTANT_MSG].map((e) => JSON.stringify(e)).join("\n") + "\n");
-    writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done" }));
-    const child = { ...running, sessionFile };
-    try {
-      await testApi.watchSubagent(child, new AbortController().signal, {
-        wait: async () => ({ reason: "done", exitCode: 0 }),
-        close: async () => { child.handedOff = true; }, // shutdown(reload) runs during the close
-      });
-      assert.ok(existsSync(`${sessionFile}.exit`), "the reloaded watcher still finds the result");
-      await testApi.watchSubagent({ ...running, sessionFile }, new AbortController().signal, {
-        wait: async () => ({ reason: "done", exitCode: 0 }), close: () => {},
-      });
-      assert.ok(!existsSync(`${sessionFile}.exit`), "a delivered result consumes its marker");
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
   });
 
   it("reports the answer the child read from its active branch", async () => {
@@ -3106,117 +2992,6 @@ describe("watchSubagent", () => {
 });
 
 describe("session shutdown", () => {
-  it("hands running subagents to the reloaded module instead of closing them", async () => {
-    const testApi = (subagentsModule as any).__test__;
-    const originalWatch = testApi.launchDeps.watchSubagent;
-    const moduleKey = Symbol.for("pi-subagents/poll-abort-controller");
-    const originalModule = (globalThis as any)[moduleKey];
-    (globalThis as any)[moduleKey] = new AbortController();
-    const { api } = createMockExtensionApi();
-    const sent: any[] = [];
-    api.sendMessage = (message: any) => { sent.push(message); };
-    let shutdown!: (event: any) => void, sessionStart!: (event: any, ctx: any) => void;
-    api.on = (event: string, handler: any) => {
-      if (event === "session_shutdown") shutdown = handler;
-      if (event === "session_start") sessionStart = handler;
-    };
-    const watched: any[] = [];
-    testApi.launchDeps.watchSubagent = async (child: any, signal: AbortSignal) => {
-      watched.push(child);
-      if (child.handedOff === false) return { name: child.name, task: child.task, summary: "Real result", exitCode: 0, elapsed: 1 };
-      await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
-      return { name: child.name, task: child.task, summary: "Subagent cancelled.", exitCode: 1, elapsed: 1 };
-    };
-    try {
-      (subagentsModule as any).default(api);
-      const children: any[] = [
-        { id: "reload-pi", name: "pi", task: "pi task", surface: "w1:p1", startTime: 1, sessionFile: "/tmp/pi.jsonl", interactive: true },
-        { id: "reload-fresh", name: "fresh", task: "fresh task", surface: "w1:p2", startTime: 2, sessionFile: "/tmp/fresh.jsonl", interactive: false },
-      ];
-      for (const child of children) {
-        testApi.runningSubagents.set(child.id, child);
-        testApi.watchAndDeliver(child);
-      }
-      shutdown({ reason: "reload" });
-      await delay(10);
-      assert.equal(testApi.runningSubagents.size, 0);
-      assert.ok(children.every((child) => child.handedOff));
-      assert.equal(sent.length, 0, "a handed-off subagent must not be reported as cancelled");
-
-      sessionStart({ reason: "reload" }, {});
-      await delay(10);
-      const resumed = watched.slice(2);
-      assert.deepEqual(resumed.map((child) => [child.name, child.task, child.startTime, child.interactive]),
-        [["pi", "pi task", 1, true], ["fresh", "fresh task", 2, false]]);
-      assert.deepEqual(sent.map((m) => m.content.match(/Real result/)?.[0]), ["Real result", "Real result"]);
-      assert.deepEqual(sent.map(m => m.details.summary), ["Real result", "Real result"]);
-
-      sessionStart({ reason: "reload" }, {});
-      await delay(10);
-      assert.equal(watched.length, 4, "a handoff is consumed once");
-    } finally {
-      testApi.launchDeps.watchSubagent = originalWatch;
-      testApi.runningSubagents.clear();
-      (globalThis as any)[moduleKey].abort();
-      (globalThis as any)[moduleKey] = originalModule;
-    }
-  });
-
-  it("hands held questions and completed results to the new API once, retaining pending-result counts", async () => {
-    const testApi = subagentsModule.__test__;
-    const root = createTestDir();
-    const sessionFile = join(root, "held.jsonl");
-    const originalWatch = testApi.launchDeps.watchSubagent;
-    const moduleKey = Symbol.for("pi-subagents/poll-abort-controller");
-    const originalModule = (globalThis as any)[moduleKey];
-    (globalThis as any)[moduleKey] = new AbortController();
-    const childCount = (globalThis as any)[Symbol.for("pi-subagents/running-children-count")];
-    const handlers = new Map<string, (...args: any[]) => any>();
-    const { api } = createMockExtensionApi();
-    const oldSent: any[] = [], newSent: any[] = [];
-    api.on = (event: string, handler: any) => { handlers.set(event, handler); };
-    api.sendMessage = (message: any) => oldSent.push(message);
-    const ctx = { isIdle: () => true, hasUI: false };
-    testApi.undelivered.clear(); testApi.unconsumed.clear(); testApi.queued.clear();
-    testApi.launchDeps.watchSubagent = async (child: any) => {
-      testApi.runningSubagents.delete(child.id);
-      return { summary: "Held result", exitCode: 0, elapsed: 1 };
-    };
-    try {
-      subagentsModule.default(api);
-      handlers.get("session_start")!({ reason: "startup" }, ctx);
-      handlers.get("input")!({ text: "handled by another extension" }, ctx);
-      const child: any = { id: "held-child", name: "held-child", task: "task", surface: "w1:p9", herdrName: "held-child", sessionFile, startTime: Date.now(), interactive: false };
-      publishQuestion(sessionFile, "Held question?");
-      testApi.deliverPendingQuestion(child);
-      testApi.runningSubagents.set(child.id, child);
-      testApi.watchAndDeliver(child);
-      await delay(0);
-      assert.deepEqual(oldSent, []);
-      assert.equal(pendingQuestions(sessionFile).files.length, 0);
-      assert.equal(testApi.undelivered.size, 2);
-      assert.equal(testApi.runningSubagents.size, 0, "completed child cannot be recovered from running watchers");
-      await handlers.get("session_shutdown")!({ reason: "reload" }, ctx);
-      api.sendMessage = () => assert.fail("old API must not be used after reload");
-      subagentsModule.default({ ...api, sendMessage: (message: any) => newSent.push(message) });
-      handlers.get("session_start")!({ reason: "reload" }, ctx);
-      assert.deepEqual(newSent.map(m => m.customType), ["subagent_question", "subagent_result"]);
-      assert.equal(childCount(), 1, "the result must enter the conversation before a nested parent may exit");
-      for (const message of newSent) handlers.get("message_start")!({ message: { role: "custom", ...message } });
-      assert.equal(childCount(), 0);
-      assert.equal(testApi.undelivered.size, 0);
-      handlers.get("session_start")!({ reason: "reload" }, ctx);
-      handlers.get("agent_start")!({});
-      assert.equal(newSent.length, 2, "handoff and old held queue are consumed once");
-    } finally {
-      await handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
-      testApi.launchDeps.watchSubagent = originalWatch;
-      testApi.runningSubagents.clear(); testApi.undelivered.clear(); testApi.unconsumed.clear(); testApi.queued.clear();
-      (globalThis as any)[moduleKey] = originalModule;
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
-
   it("reports nothing, and rejects nothing, when a session switch cancels a watched subagent", async () => {
     const testApi = (subagentsModule as any).__test__;
     const originalWatch = testApi.launchDeps.watchSubagent;
