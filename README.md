@@ -159,7 +159,7 @@ Child tools widgets toggle with `Ctrl+Alt+O`; completion messages expand with `C
 
 ```sh
 npm ci --ignore-scripts
-npm test              # isolated stub herdr; no inherited subagent environment
+npm test              # type-check, then isolated stub herdr; no inherited subagent environment
 npm run test:runtime  # local Pi 1.1.0, localhost simulated model
 npm run test:e2e      # separate private herdr server; no working panes touched
 ```
