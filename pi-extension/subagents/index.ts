@@ -1,20 +1,20 @@
-import type { ExtensionAPI, ExtensionContext, FileEntry, Theme } from "@earendil-works/pi-coding-agent";
-import { getAgentDir, keyHint, parseFrontmatter, parseSessionEntries, ProjectTrustStore } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, FileEntry } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, parseSessionEntries, ProjectTrustStore } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
-import { Box, Text, TruncatedText, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
-import { parseEnv } from "node:util";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import {
-  readdirSync,
-  readFileSync,
-  existsSync,
-  mkdirSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
+  buildSubagentToolAllowlist,
+  discoverAgentDefinitions,
+  loadAgentDefaults,
+  NO_AGENTS,
+  resolveModelEnv,
+  SUBAGENT_ALLOWLIST,
+  type AgentDefinition,
+} from "./agents.ts";
 import {
   isHerdrAvailable,
   herdrSetupHint,
@@ -26,9 +26,18 @@ import {
   waitForExit,
   closePane,
 } from "./herdr.ts";
-
 import {
-  currentTool,
+  formatContextUsage,
+  formatElapsed,
+  formatTokens,
+  formatUsageSegments,
+  listRenderers,
+  messageRenderers,
+  registerMessageRenderers,
+  renderSubagentWidgetLines,
+  spawnRenderers,
+} from "./render.ts";
+import {
   getSessionId,
   readNameRegistry,
   pendingQuestions,
@@ -43,6 +52,7 @@ import {
   type SessionStats,
   type SubagentLoadout,
 } from "./session.ts";
+
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
 const launchDeps = { startAgent, findSessionAgent, watchSubagent };
@@ -85,147 +95,6 @@ const SubagentParams = Type.Object({
   ),
 });
 
-type SubagentSessionMode = "standalone" | "lineage-only" | "fork";
-
-interface AgentDefaults {
-  model?: string;
-  tools?: string | string[];
-  skills?: string;
-  thinking?: string;
-  /**
-   * A non-empty list grants this agent the subagent spawning toolset and limits
-   * it to spawning the listed agents — this, not the `tools` list, grants
-   * spawning. Enforced in the child via the PI_SUBAGENT_ALLOWED env var.
-   */
-  subagentAgents?: string[];
-  autoExit?: boolean;
-  interactive?: boolean;
-  systemPromptMode?: "append" | "replace";
-  sessionMode?: SubagentSessionMode;
-  cwd?: string;
-  body?: string;
-  disableModelInvocation?: boolean;
-}
-
-type AgentSource = "global" | "project";
-
-interface AgentDefinition extends AgentDefaults {
-  name: string;
-  description?: string;
-  disableModelInvocation: boolean;
-}
-
-interface ListedAgentDefinition extends AgentDefinition {
-  source: AgentSource;
-}
-
-/**
- * The full subagent lifecycle/spawning toolset registered by this extension.
- * Added to explicit tool allowlists when `subagent_agents` grants delegation.
- * Spawn targets are independently restricted by PI_SUBAGENT_ALLOWED.
- */
-const SPAWNING_TOOLS = [
-  "subagent",
-  "subagent_message",
-  "subagents_list",
-] as const;
-
-/**
- * When this process was spawned as a restricted subagent, the parent pins the
- * set of agents it may itself spawn via PI_SUBAGENT_ALLOWED. `null` means no
- * restriction (top-level session); an empty set denies delegation.
- */
-const SUBAGENT_ALLOWLIST: Set<string> | null = (() => {
-  const raw = process.env.PI_SUBAGENT_ALLOWED;
-  if (raw === undefined) return process.env.PI_SUBAGENT_AGENT ? new Set<string>() : null;
-  return new Set(raw.split(",").map((s) => s.trim()).filter(Boolean));
-})();
-
-function parseOptionalBoolean(value: unknown): boolean | undefined {
-  return typeof value === "boolean" ? value : undefined;
-}
-
-/** Parse a comma-separated frontmatter value into a trimmed list (or undefined). */
-function parseCommaList(value: string | undefined): string[] | undefined {
-  if (value == null) return undefined;
-  const list = value.split(",").map((s) => s.trim()).filter(Boolean);
-  return list.length > 0 ? list : undefined;
-}
-
-/** `value` when it is one of `allowed`, else undefined. */
-function oneOf<T extends string>(value: string | undefined, allowed: readonly T[]): T | undefined {
-  return allowed.includes(value as T) ? (value as T) : undefined;
-}
-
-/** A project's `.env` variables, read for lookups only: loading them would leak into every command pi runs. */
-function projectEnv(cwd: string): Record<string, string | undefined> {
-  try { return parseEnv(readFileSync(join(cwd, ".env"), "utf8")); } catch { return {}; }
-}
-
-/** Expand `${NAME}` from the environment, else from the project's `.env`. */
-function resolveModelEnv(model: string | undefined, cwd = process.cwd()): string | undefined {
-  let dotenv: Record<string, string | undefined> | undefined;
-  return model?.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_match, name: string) => {
-    const value = process.env[name] ?? (dotenv ??= projectEnv(cwd))[name];
-    if (value == null || !value.trim()) throw new Error(`Subagent model references unset environment variable: ${name}`);
-    return value.trim();
-  });
-}
-
-function parseAgentDefinition(content: string, fallbackName: string): AgentDefinition | null {
-  // Only files that open with frontmatter are agents; a README.md beside them is not.
-  if (!/^---\r?\n/.test(content)) return null;
-  let parsed: { frontmatter: Record<string, unknown>; body: string };
-  try {
-    parsed = parseFrontmatter<Record<string, unknown>>(content);
-  } catch {
-    return null;
-  }
-  const { frontmatter, body } = parsed;
-  if (!frontmatter || typeof frontmatter !== "object" || Array.isArray(frontmatter)) return null;
-  const field = (key: string): string | undefined =>
-    frontmatter[key] == null ? undefined : String(frontmatter[key]).trim();
-  return {
-    name: field("name") ?? fallbackName,
-    description: field("description"),
-    model: field("model"),
-    tools: Array.isArray(frontmatter.tools) ? frontmatter.tools.map(String) : field("tools"),
-    systemPromptMode: oneOf(field("system-prompt"), ["append", "replace"] as const),
-    skills: field("skill") ?? (typeof frontmatter.skills === "boolean" ? undefined : field("skills")),
-    thinking: field("thinking"),
-    subagentAgents: parseCommaList(field("subagent_agents")),
-    autoExit: parseOptionalBoolean(frontmatter["auto-exit"]),
-    interactive: parseOptionalBoolean(frontmatter.interactive),
-    sessionMode: oneOf(field("session-mode"), ["standalone", "lineage-only", "fork"] as const),
-    cwd: field("cwd"),
-    body: body.trim() || undefined,
-    disableModelInvocation: frontmatter["disable-model-invocation"] === true,
-  };
-}
-
-function discoverAgentDefinitions(cwd = process.cwd()): ListedAgentDefinition[] {
-  const agents = new Map<string, ListedAgentDefinition>();
-  const dirs: Array<{ path: string; source: AgentSource }> = [
-    { path: join(getAgentDir(), "agents"), source: "global" },
-    { path: join(cwd, ".pi", "agents"), source: "project" },
-  ];
-
-  for (const { path: dir, source } of dirs) {
-    if (!existsSync(dir)) continue;
-    for (const file of readdirSync(dir).filter((entry) => entry.endsWith(".md"))) {
-      let content: string;
-      try { content = readFileSync(join(dir, file), "utf8"); } catch { continue; } // e.g. a dangling link
-      const parsed = parseAgentDefinition(content, file.replace(/\.md$/, ""));
-      if (parsed) agents.set(parsed.name, { ...parsed, source });
-    }
-  }
-
-  // When this process is itself a restricted subagent, only expose the agents
-  // it is permitted to spawn (PI_SUBAGENT_ALLOWED). Top-level sessions see all.
-  const all = [...agents.values()];
-  return SUBAGENT_ALLOWLIST ? all.filter((a) => SUBAGENT_ALLOWLIST.has(a.name)) : all;
-}
-
 function getDefaultSessionDirFor(cwd: string, agentDir: string): string {
   const safePath = `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
   const sessionDir = join(agentDir, "sessions", safePath);
@@ -233,54 +102,9 @@ function getDefaultSessionDirFor(cwd: string, agentDir: string): string {
   return sessionDir;
 }
 
-// Same lookup as subagents_list: by declared name, project > global > package.
-function loadAgentDefaults(agentName: string, cwd?: string): AgentDefaults | null {
-  return discoverAgentDefinitions(cwd).find((agent) => agent.name === agentName) ?? null;
-}
-
-function formatElapsed(seconds: number): string {
-  if (seconds < 60) return `${seconds}s`;
-  const m = Math.floor(seconds / 60);
-  const s = seconds % 60;
-  return `${m}m ${s}s`;
-}
-
-/** Compact token count: 850, 3.2k, 45k. */
-function formatTokens(n: number): string {
-  return n < 1000 ? String(n) : n < 10000 ? `${(n / 1000).toFixed(1)}k` : `${Math.round(n / 1000)}k`;
-}
-
-/** Context-usage gauge: "18.0%/200k" when window known, else "37k ctx". */
-function formatContextUsage(tokens: number, contextWindow: number | undefined): string {
-  if (!contextWindow) return `${formatTokens(tokens)} ctx`;
-  const pct = (tokens / contextWindow) * 100;
-  const maxStr =
-    contextWindow >= 1_000_000
-      ? `${(contextWindow / 1_000_000).toFixed(1)}M`
-      : `${Math.round(contextWindow / 1000)}k`;
-  return `${pct.toFixed(1)}%/${maxStr}`;
-}
-
-/**
- * Build the dim usage line for a completed subagent, mirroring the format of
- * the in-process subagents extension: "↑in ↓out R… W… $cost · ctx".
- * `theme.fg` is applied by the caller; this returns plain segments joined.
- */
-function formatUsageSegments(stats: SessionStats): string[] {
-  const segs: string[] = [];
-  if (stats.inputTokens) segs.push(`↑${formatTokens(stats.inputTokens)}`);
-  if (stats.outputTokens) segs.push(`↓${formatTokens(stats.outputTokens)}`);
-  if (stats.cacheReadTokens) segs.push(`R${formatTokens(stats.cacheReadTokens)}`);
-  if (stats.cacheWriteTokens) segs.push(`W${formatTokens(stats.cacheWriteTokens)}`);
-  if (stats.cost) segs.push(`$${stats.cost.toFixed(3)}`);
-  return segs;
-}
-
 const fail = (text: string, error = text) => ({
   content: [{ type: "text" as const, text }], details: { error }, isError: true,
 });
-
-const NO_AGENTS = "No subagent definitions found. Add profiles to .pi/agents/ or your Pi config's agents/ directory; see examples/agents/ in this package.";
 
 function herdrUnavailableResult() {
   return fail(`Subagents require herdr. ${herdrSetupHint()}`, "herdr not available");
@@ -445,43 +269,6 @@ let latestPi: ExtensionAPI | null = null;
 /** Latest UI context, for the running-subagents widget. */
 let latestCtx: ExtensionContext | null = null;
 
-// ── Running-subagents widget ──
-
-function formatClock(ms: number): string {
-  const seconds = Math.max(0, Math.floor(ms / 1000));
-  return `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
-}
-
-/** Right-hand label: herdr's state, plus the tool a working pi subagent is in. */
-function widgetStatus(running: RunningSubagent, theme: Pick<Theme, "fg">): string {
-  const status = running.status ?? "starting";
-  if (status === "blocked") return theme.fg("error", status);
-  if (status !== "working") return theme.fg("dim", status);
-  const tool = currentTool(running.sessionFile);
-  return theme.fg("warning", "working") + (tool ? ` · ${tool}` : "");
-}
-
-/** One bordered line per running subagent: elapsed, name (agent), state. */
-function renderSubagentWidgetLines(agents: RunningSubagent[], width: number, theme: Pick<Theme, "fg">, now = Date.now()): string[] {
-  if (width < 4) return [];
-  const inner = width - 2;
-  const title = `─ Subagents `;
-  const info = ` ${agents.length} running ─`;
-  const top = title.length + info.length <= inner
-    ? `${title}${"─".repeat(inner - title.length - info.length)}${info}`
-    : "─".repeat(inner);
-  const lines = [theme.fg("accent", `╭${top}╮`)];
-  for (const agent of agents) {
-    const right = ` ${widgetStatus(agent, theme)} `;
-    const left = truncateToWidth(` ${formatClock(now - agent.startTime)}  ${agent.name}${agent.agent ? ` (${agent.agent})` : ""}`,
-      Math.max(0, inner - visibleWidth(right)));
-    const row = truncateToWidth(left + " ".repeat(Math.max(0, inner - visibleWidth(left) - visibleWidth(right))) + right, inner);
-    lines.push(theme.fg("accent", "│") + row + " ".repeat(Math.max(0, inner - visibleWidth(row))) + theme.fg("accent", "│"));
-  }
-  lines.push(theme.fg("accent", `╰${"─".repeat(inner)}╯`));
-  return lines;
-}
-
 let requestWidgetRender: (() => void) | undefined;
 
 /** Show the widget while subagents run (redrawn every second), remove it when none are left. */
@@ -507,39 +294,6 @@ function refreshWidget(): void {
       },
     };
   }, { placement: "aboveEditor" });
-}
-
-const SUBAGENT_CONTROL_TOOLS = ["ask_question"] as const;
-
-/** Preserve Pi's allowlist or relative selector, enabling required child tools in the same mode. */
-function buildSubagentToolAllowlist(
-  effectiveTools?: string | string[],
-  opts?: { grantSpawning?: boolean },
-): string | null {
-  const requested = (Array.isArray(effectiveTools) ? effectiveTools : [effectiveTools ?? ""])
-    .flatMap((value) => value.trim().split(/[\s,]+/))
-    .filter(Boolean);
-  if (requested.length === 0) return null;
-
-  const relative = requested.every((tool) => /^[+-]/.test(tool));
-  if (!relative && requested.some((tool) => /^[+-]/.test(tool))) {
-    throw new Error("tools must use either plain names or only +name/-name selectors, not both.");
-  }
-  for (const tool of requested) {
-    if (!(relative ? /^[+-][a-zA-Z0-9_-]+$/ : /^[a-zA-Z0-9_*-]+$/).test(tool)) {
-      throw new Error(`Invalid tool selector: ${tool}`);
-    }
-  }
-
-  const required = [...SUBAGENT_CONTROL_TOOLS, ...(opts?.grantSpawning ? SPAWNING_TOOLS : [])];
-  // Keep relative selectors ordered: Pi applies them left-to-right, so a Set
-  // would incorrectly collapse sequences such as -bash,+bash,-bash.
-  const allow = requested.filter((tool) => !relative || !required.some((name) => tool === `-${name}`));
-  for (const tool of required) {
-    const selector = relative ? `+${tool}` : tool;
-    if (!allow.includes(selector)) allow.push(selector);
-  }
-  return allow.join(",");
 }
 
 /**
@@ -1201,6 +955,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       promptSnippet:
         "After spawning, end your turn or do independent work. Do not wait, poll tools or logs, or invent results.",
       parameters: SubagentParams,
+      ...spawnRenderers,
 
       async execute(toolCallId, params, signal, _onUpdate, ctx) {
         // Prevent self-spawning (e.g. planner spawning another planner)
@@ -1280,67 +1035,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           },
         };
       },
-
-      renderCall(args, theme) {
-        const partialArgs = args as Record<string, unknown>;
-        const agentName =
-          typeof partialArgs.agent === "string" && partialArgs.agent ? partialArgs.agent : "";
-        const name =
-          typeof partialArgs.name === "string" && partialArgs.name
-            ? partialArgs.name
-            : agentName || "(unnamed)";
-        const task = typeof partialArgs.task === "string" ? partialArgs.task : "";
-        // Only show the agent tag separately when a distinct name was given.
-        const agent =
-          agentName && name !== agentName ? theme.fg("dim", ` (${agentName})`) : "";
-        const cwdHint = typeof partialArgs.cwd === "string" && partialArgs.cwd
-          ? theme.fg("dim", ` in ${partialArgs.cwd}`)
-          : "";
-        let text =
-          "○ " +
-          theme.fg("toolTitle", theme.bold(name)) +
-          agent +
-          cwdHint;
-
-        // Show a one-line task preview. renderCall is called repeatedly as the
-        // LLM generates tool arguments, so args.task grows token by token.
-        // We keep it compact here — Ctrl+O on renderResult expands the full content.
-        if (task) {
-          const firstLine = task.split("\n").find((l: string) => l.trim()) ?? "";
-          const preview = firstLine.length > 100 ? firstLine.slice(0, 100) + "…" : firstLine;
-          if (preview) {
-            text += "\n" + theme.fg("toolOutput", preview);
-          }
-          const totalLines = task.split("\n").length;
-          if (totalLines > 1) {
-            text += theme.fg("muted", ` (${totalLines} lines)`);
-          }
-        }
-
-        return new Text(text, 0, 0);
-      },
-
-      renderResult(result, _opts, theme) {
-        const details = result.details as any;
-        const name = details?.name ?? "(unnamed)";
-
-        // "Started" result — tool returned immediately
-        if (details?.status === "started") {
-          return new Text(
-            theme.fg("accent", "●") +
-              " " +
-              theme.fg("toolTitle", theme.bold(name)) +
-              theme.fg("dim", " — started"),
-            0,
-            0,
-          );
-        }
-
-        // Validation or launch error
-        const first = result.content[0];
-        const text = first?.type === "text" ? first.text : "";
-        return new Text(theme.fg("dim", text), 0, 0);
-      },
     });
 
   // ── subagents_list tool ──
@@ -1368,22 +1062,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           details: { agents: list },
         };
       },
-
-      renderResult(result, _opts, theme) {
-        const details = result.details as any;
-        const agents = details?.agents ?? [];
-        if (agents.length === 0) return new Text(theme.fg("dim", NO_AGENTS), 0, 0);
-        const lines = agents.map((a: any) => {
-          const badge = a.source === "project" ? theme.fg("accent", " (project)") : "";
-          const desc = a.description ? theme.fg("dim", ` — ${a.description}`) : "";
-          const model = a.model ? theme.fg("dim", ` [${a.model}]`) : "";
-          return `  ${theme.fg("toolTitle", theme.bold(a.name))}${badge}${model}${desc}`;
-        });
-        return new Text(lines.join("\n"), 0, 0);
-      },
+      ...listRenderers,
     });
-
-
 
   // ── subagent_message tool ──
   pi.registerTool({
@@ -1404,46 +1084,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             "Message text.",
         }),
       }),
-
-      renderCall(args, theme) {
-        const target = args.name ?? "(unknown)";
-        return new Text(
-          "○ " + theme.fg("toolTitle", theme.bold(target)) + theme.fg("dim", " — message"),
-          0,
-          0,
-        );
-      },
-
-      renderResult(result, _opts, theme) {
-        const details = result.details as any;
-
-        if (details?.status === "steered") {
-          return new Text(
-            theme.fg("success", "✓") +
-              " " +
-              theme.fg("toolTitle", theme.bold(details.name ?? "subagent")) +
-              theme.fg("dim", " — message delivered"),
-            0,
-            0,
-          );
-        }
-
-        if (details?.status === "started") {
-          return new Text(
-            theme.fg("accent", "●") +
-              " " +
-              theme.fg("toolTitle", theme.bold(details.name ?? "Resume")) +
-              theme.fg("dim", " — resumed"),
-            0,
-            0,
-          );
-        }
-
-        // Fallback / error
-        const first = result.content[0];
-        const text = first?.type === "text" ? first.text : "";
-        return new Text(theme.fg("dim", text), 0, 0);
-      },
+      ...messageRenderers,
 
       async execute(_toolCallId, params, signal, _onUpdate, ctx) {
         const requestedName = params.name?.trim();
@@ -1572,142 +1213,5 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     },
   });
 
-  // ── subagent_result message renderer ──
-  pi.registerMessageRenderer("subagent_result", (message, options, theme) => {
-    const details = message.details as any;
-    if (!details) return undefined;
-
-    return {
-      invalidate() {},
-      render(width: number): string[] {
-        const name = details.name ?? "subagent";
-        const exitCode = details.exitCode ?? 0;
-        const errorMessage = typeof details.errorMessage === "string" ? details.errorMessage : "";
-        const failed = exitCode !== 0 || !!errorMessage;
-        const elapsed = details.elapsed != null ? formatElapsed(details.elapsed) : "?";
-        const bgFn = failed
-          ? (text: string) => theme.bg("toolErrorBg", text)
-          : (text: string) => theme.bg("toolSuccessBg", text);
-        const stats = (details.stats ?? null) as SessionStats | null;
-        const icon = failed
-          ? theme.fg("error", "✗")
-          : theme.fg("success", "✓");
-        const agentTag = details.agent ? theme.fg("dim", ` (${details.agent})`) : "";
-        const modelTag = stats?.model ? theme.fg("dim", ` (${stats.model})`) : "";
-        const titleSegment = `${icon} ${theme.fg("toolTitle", theme.bold(name))}${agentTag}${modelTag} ${theme.fg("dim", "—")} `;
-
-        // Success: icon already conveys "completed", so show "N tools · duration"
-        // like the in-process extension. Failure: surface the failure reason.
-        let header: string;
-        if (failed) {
-          const reason = errorMessage ? "failed (provider/agent error)" : details.endedEarly ? "ended early" : `failed (exit ${exitCode})`;
-          header = `${titleSegment}${theme.fg("error", reason)} ${theme.fg("dim", `· ${elapsed}`)}`;
-        } else {
-          const toolPart = stats ? `${stats.toolCount} tools · ${elapsed}` : elapsed;
-          header = `${titleSegment}${theme.fg("dim", toolPart)}`;
-        }
-
-        // Usage line: ↑in ↓out R… W… $cost · context-gauge (color-coded by %).
-        let usageLine: string | null = null;
-        if (stats) {
-          const segs = formatUsageSegments(stats).map((s) => theme.fg("dim", s));
-          if (stats.contextTokens > 0) {
-            const window = stats.contextWindow;
-            const ctxStr = formatContextUsage(stats.contextTokens, window);
-            const pct = window ? (stats.contextTokens / window) * 100 : 0;
-            const coloredCtx =
-              pct > 90 ? theme.fg("error", ctxStr) : pct > 70 ? theme.fg("warning", ctxStr) : theme.fg("dim", ctxStr);
-            segs.push(coloredCtx);
-          }
-          if (segs.length > 0) usageLine = segs.join(theme.fg("dim", " "));
-        }
-
-        // Older session messages predate the summary field.
-        const summary = details.summary ?? (typeof message.content === "string" ? message.content : "")
-          .replace(/\n\n(If more work is needed, f|F)ollow up with subagent_message[\s\S]+$/, "")
-          .replace(/^Sub-agent "[^\n]*\n\n/, "");
-
-        // Build content for the box
-        const contentLines = [header];
-        if (usageLine) contentLines.push(usageLine);
-        // The provider's error, which a partial answer in the summary would otherwise hide.
-        if (errorMessage && !summary.includes(errorMessage)) contentLines.push(theme.fg("error", `Error: ${errorMessage}`));
-
-        if (options.expanded) {
-          // Full view: complete summary + session info
-          if (summary) contentLines.push(summary);
-          if (details.name || details.sessionFile) {
-            contentLines.push("");
-            if (details.name) {
-              contentLines.push(
-                theme.fg(
-                  "dim",
-                  `Follow up:  subagent_message({ name: ${JSON.stringify(details.name)}, message: "…" })`,
-                ),
-              );
-            }
-            if (details.sessionFile) {
-              contentLines.push(theme.fg("muted", `Session file: ${details.sessionFile}`));
-            }
-          }
-        } else {
-          // Collapsed: preview + expand hint
-          if (summary) {
-            const previewLines = summary.split("\n").slice(0, 5);
-            for (const line of previewLines) {
-              contentLines.push(theme.fg("dim", truncateToWidth(line, Math.max(0, width - 2))));
-            }
-            const totalLines = summary.split("\n").length;
-            if (totalLines > 5) {
-              contentLines.push(theme.fg("muted", `… ${totalLines - 5} more lines`));
-            }
-          }
-          contentLines.push(theme.fg("muted", keyHint("app.tools.expand", "to expand")));
-        }
-
-        const box = new Box(1, 1, bgFn);
-        box.addChild(new Text(contentLines.join("\n"), 0, 0));
-        return box.render(width);
-      },
-    };
-  });
-
-  // ── subagent_status message renderer ──
-  pi.registerMessageRenderer("subagent_status", (message, _options, theme) => {
-    const details = message.details as any;
-    const line = details?.line ?? details?.lines?.join("\n");
-    if (!line) return undefined;
-
-    const box = new Box(1, 1, (text: string) => theme.bg("customMessageBg", text));
-    box.addChild(new Text(
-      `${theme.fg("accent", "•")} ${theme.fg("toolTitle", theme.bold("Subagent status"))}\n${theme.fg("dim", line)}`,
-      0, 0,
-    ));
-    return box;
-  });
-
-  // ── subagent_question message renderer ──
-  pi.registerMessageRenderer("subagent_question", (message, options, theme) => {
-    const details = message.details as any;
-    if (!details) return undefined;
-
-    const name = details.name ?? "subagent";
-    const agentTag = details.agent ? theme.fg("dim", ` (${details.agent})`) : "";
-    const box = new Box(1, 1, (text: string) => theme.bg("toolSuccessBg", text));
-    box.addChild(new Text(
-      `${theme.fg("accent", "?")} ${theme.fg("toolTitle", theme.bold(name))}${agentTag} ${theme.fg("dim", "— asks a question")}`,
-      0, 0,
-    ));
-    if (options.expanded) {
-      box.addChild(new Text(
-        `\n${details.question ?? ""}\n\n${theme.fg("dim", `Reply: subagent_message({ name: ${JSON.stringify(name)}, message: "…" })`)}`,
-        0, 0,
-      ));
-    } else {
-      box.addChild(new TruncatedText(theme.fg("dim", (details.question ?? "").split("\n")[0])));
-      box.addChild(new Text(theme.fg("muted", keyHint("app.tools.expand", "to expand")), 0, 0));
-    }
-    return box;
-  });
-
+  registerMessageRenderers(pi);
 }
