@@ -148,6 +148,27 @@ async function openPane(launch: AgentLaunch, signal?: AbortSignal): Promise<stri
 }
 
 /**
+ * Wait until a new pane's shell, whichever it is, looks to be at its prompt, as `herdr agent
+ * start` requires: it has printed something and runs nothing else, twice in a row. Until then
+ * its startup (rc files, prompt tools) may swallow the command herdr types. Only a wait: when
+ * the shell never looks ready (an empty prompt) or herdr cannot tell, `agent start` decides.
+ */
+async function waitForShell(surface: string, signal?: AbortSignal, timeout = 10_000): Promise<void> {
+  const deadline = Date.now() + timeout;
+  for (let ready = 0; ready < 2 && Date.now() < deadline;) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    signal?.throwIfAborted();
+    try {
+      const { process_info: info } = await herdrAsync(["pane", "process-info", "--pane", surface], { signal });
+      const idle = info.foreground_processes.length === 1 && info.foreground_processes[0].pid === info.shell_pid;
+      ready = idle && (await readScreen(surface, 5)).trim() ? ready + 1 : 0;
+    } catch {
+      return;
+    }
+  }
+}
+
+/**
  * Open a pane and start the agent, waiting for Pi to be ready.
  * Every failure after the pane exists closes it, and so does `signal`: the caller
  * never learns the pane, so nothing else would.
@@ -162,7 +183,7 @@ export async function startAgent(launch: AgentLaunch, signal?: AbortSignal): Pro
   const surface = await opening;
   await herdrAsync(["pane", "rename", surface, launch.name]).catch(() => {});
   try {
-    signal?.throwIfAborted();
+    await waitForShell(surface, signal);
     let agent = "";
     for (let attempt = 0; ; attempt++) {
       const taken = new Set<string>(((await herdrAsync(["agent", "list"], { signal }))?.agents ?? []).map((a: any) => a.name).filter(Boolean));

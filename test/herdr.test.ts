@@ -25,6 +25,9 @@ case "$1 $2" in
   "agent start") [ -e ${JSON.stringify(join(dir, "start_hang"))} ] && sleep 5; cat ${JSON.stringify(join(dir, "start"))}; [ -s ${JSON.stringify(join(dir, "start"))} ] && grep -q error ${JSON.stringify(join(dir, "start"))} && exit 1; true ;;
   "agent get") file=${JSON.stringify(join(dir, "agent"))}; [ -e "$file-$3" ] && file="$file-$3"; cat "$file"; grep -q error "$file" && exit 1; true ;;
   "pane close") [ -e ${JSON.stringify(join(dir, "close_fail"))} ] && { echo '{"error":{"code":"server_error","message":"busy"}}' >&2; exit 1; }; echo '{"result":{}}' ;;
+  "pane process-info") busy=${JSON.stringify(join(dir, "shell_busy"))}; n=$(cat "$busy" 2>/dev/null || echo 0)
+    if [ "$n" -gt 0 ]; then echo $((n - 1)) > "$busy"; echo '{"result":{"process_info":{"shell_pid":7,"foreground_processes":[{"pid":7},{"pid":8}]}}}'
+    else echo '{"result":{"process_info":{"shell_pid":7,"foreground_processes":[{"pid":7}]}}}'; fi ;;
   "pane read") printf '{not json\\nlast line\\n' ;;
   "integration status") cat ${JSON.stringify(join(dir, "status"))} ;;
   *) echo '{"result":{}}' ;;
@@ -228,6 +231,18 @@ it("picks another name once when a parallel start took it, and keeps the pane's 
   reply("start", { error: { code: "timeout", message: "timed out" } });
   await assert.rejects(herdr.startAgent(launch), /timeout[\s\S]*Last output in the pane:\n\{not json\nlast line/);
   writeFileSync(join(dir, "start"), "");
+});
+
+it("starts pi only once the new pane's shell is at its prompt", async () => {
+  layout([["w1:p1", 200, 50]]);
+  writeFileSync(join(dir, "start"), "");
+  writeFileSync(join(dir, "shell_busy"), "3");  // still running its startup
+  writeFileSync(log, "");
+  await herdr.startAgent(launch);
+  const made = calls().map(c => c.slice(0, 2).join(" "));
+  assert.equal(made.filter(c => c === "pane process-info").length, 5, "three busy, then idle twice");
+  assert.ok(made.lastIndexOf("pane process-info") < made.indexOf("agent start"));
+  rmSync(join(dir, "shell_busy"));
 });
 
 it("closes the pane when listing agents fails after it was created", async () => {

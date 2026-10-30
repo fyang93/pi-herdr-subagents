@@ -124,7 +124,10 @@ try {
   for (const key of Object.keys(process.env)) delete process.env[key];
   Object.assign(process.env, privateEnv);
   writeFileSync(join(binDir, "pi"), `#!/bin/sh\nexec ${quote(process.execPath)} ${quote(piCLI)} "$@"\n`, { mode: 0o700 });
-  writeFileSync(join(binDir, "shell"), `#!/bin/sh\nexec ${quote(bash)} --noprofile --norc -i\n`, { mode: 0o700 });
+  // A slow shell startup that, like fish's terminal queries or a prompt plugin, reads away
+  // input typed before its prompt: pi must start only once the prompt is up.
+  writeFileSync(join(binDir, "shellrc"), `sleep 1\nread -r -s -t 0.2 -d "" _\nPS1='$ '\n`);
+  writeFileSync(join(binDir, "shell"), `#!/bin/sh\nexec ${quote(bash)} --noprofile --rcfile ${quote(join(binDir, "shellrc"))} -i\n`, { mode: 0o700 });
   writeFileSync(join(base, "herdr.toml"), `onboarding = false\n[terminal]\ndefault_shell = ${JSON.stringify(join(binDir, "shell"))}\nshell_mode = "non_login"\n[update]\nversion_check = false\nmanifest_check = false\n[session]\nresume_agents_on_restore = false\n`);
   writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ retry: { enabled: false }, compaction: { enabled: false }, cacheWarming: "off" }));
   // This wrapper is also inherited by detached child closers. The literal named-server
