@@ -12,7 +12,6 @@ import {
   readFileSync,
   existsSync,
   mkdirSync,
-  unlinkSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -857,6 +856,14 @@ let integrationReady: Promise<unknown> = Promise.resolve();
 /** Subagents whose pane could not be closed, so they may still be working unsupervised. */
 const leftOpen: string[] = [];
 
+/** Close a subagent's pane; one that stays open is reported at shutdown, as it may still be working. */
+async function closeOrReport(name: string, surface: string, close?: (surface: string) => void | Promise<void>): Promise<void> {
+  try { await closePane(surface, close); } catch (error) {
+    console.warn(`Could not close subagent pane ${surface}: ${error}`);
+    leftOpen.push(`${name} (herdr pane ${surface})`);
+  }
+}
+
 /** Launches and watchers still running; shutdown waits for them to close their panes. */
 const inFlight = new Set<Promise<unknown>>();
 
@@ -879,7 +886,7 @@ function startTracked(launch: AgentLaunch, message: string, cancel?: AbortSignal
       signal.throwIfAborted();
       publishInboxMessage(launch.env.PI_SUBAGENT_SESSION, message);
     } catch (error) {
-      await closePane(started.surface).catch(() => { leftOpen.push(`${launch.name} (herdr pane ${started.surface})`); });
+      await closeOrReport(launch.name, started.surface);
       throw error;
     }
     return started;
@@ -964,30 +971,22 @@ function notify(message: Parameters<ExtensionAPI["sendMessage"]>[0]): boolean {
   return latestPi !== null && sendTracked(latestPi, randomUUID(), message);
 }
 
-/** Steer the notice for a signal file, consuming the file once it is queued; a failed send retries next tick. */
-function deliverOnce(file: string, message: Parameters<ExtensionAPI["sendMessage"]>[0], pendingCleanup?: Set<string>): void {
-  if (pendingCleanup?.has(file)) {
-    try { unlinkSync(file); } catch { if (!existsSync(file)) pendingCleanup.delete(file); }
-    if (!existsSync(file)) pendingCleanup.delete(file);
-    return;
-  }
-  if (!notify(message)) return;
-  try { unlinkSync(file); }
-  catch { pendingCleanup?.add(file); }
-}
-
-/** Wake the parent once when a subagent turn is interrupted in its own pane. */
+/**
+ * Wake the parent once when a subagent turn is interrupted in its own pane: the marker is
+ * consumed once the notice is queued, and one whose removal failed is never sent again.
+ */
 function reportPaused(running: RunningSubagent): void {
   const file = `${running.sessionFile}.paused`;
-  const pendingCleanup = running.noticeCleanup ??= new Set<string>();
-  if (!existsSync(file) && !pendingCleanup.has(file)) return;
-  deliverOnce(file, {
+  const cleanup = running.noticeCleanup ??= new Set<string>();
+  if (cleanup.has(file)) return void removeConsumedFile(file, cleanup);
+  if (!existsSync(file)) return;
+  if (notify({
     customType: "subagent_status",
     content: `Sub-agent "${running.name}" had its turn interrupted in herdr pane ${running.surface} and is waiting for input. ` +
       `subagent_message({ name: ${JSON.stringify(running.name)}, message: "…" }) continues it.`,
     display: true,
     details: { line: `${running.name}: interrupted, waiting in pane ${running.surface}` },
-  }, pendingCleanup);
+  })) removeConsumedFile(file, cleanup);
 }
 
 /**
@@ -1051,12 +1050,7 @@ async function watchSubagent(
     const subagentSessionId = getSessionId(sessionFile);
 
     // A completion receipt does not grant ownership of a pane now hosting another session.
-    try {
-      if (!preservePane) await closePane(running.surface, deps.close);
-    } catch (error) {
-      console.warn(`Could not close completed subagent pane ${running.surface}: ${error}`);
-      leftOpen.push(`${running.name} (herdr pane ${running.surface})`);
-    }
+    if (!preservePane) await closeOrReport(running.name, running.surface, deps.close);
     // Consumed only now, and not once handed off: the reloaded watcher still needs it.
     if (!running.handedOff) for (const marker of [".exit", ".exiting"]) {
       try { rmSync(sessionFile + marker, { force: true }); }
@@ -1075,11 +1069,7 @@ async function watchSubagent(
       ...(stats ? { stats } : {}),
     };
   } catch (err: any) {
-    if (!running.handedOff && !preservePane) {
-      try { await closePane(running.surface, deps.close); } catch {
-        leftOpen.push(`${running.name} (herdr pane ${running.surface})`);
-      }
-    }
+    if (!running.handedOff && !preservePane) await closeOrReport(running.name, running.surface, deps.close);
     runningSubagents.delete(running.id);
 
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
