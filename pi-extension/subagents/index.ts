@@ -1,4 +1,4 @@
-import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, FileEntry, Theme } from "@earendil-works/pi-coding-agent";
 import { getAgentDir, keyHint, parseFrontmatter, parseSessionEntries, ProjectTrustStore } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
 import { Box, Text, TruncatedText, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
@@ -41,7 +41,6 @@ import {
   seedSubagentSessionFile,
   summarizeSessionStats,
   writeSubagentLoadout,
-  type SessionEntry,
   type SessionStats,
   type SubagentLoadout,
 } from "./session.ts";
@@ -303,9 +302,9 @@ function watchAndDeliver(running: RunningSubagent): void {
   const silenced = () => running.handedOff || signal.aborted || lifecycle.aborted;
   refreshWidget();
   unconsumed.add(running.id);
-  running.watching = track(launchDeps.watchSubagent(running, signal));
+  const watching = running.watching = track(launchDeps.watchSubagent(running, signal));
   // watchSubagent reports its own failures as results; it does not reject.
-  void running.watching
+  void watching
     .then((result) => {
       if (silenced()) return unconsumed.delete(running.id);
       sendTracked(pi, running.id, {
@@ -713,8 +712,8 @@ function clearStaleMarkers(sessionFile: string): void {
 }
 
 /** A session file's entries, parsed leniently as Pi does; none when it cannot be read. */
-function readSession(sessionFile: string): SessionEntry[] {
-  try { return parseSessionEntries(readFileSync(sessionFile, "utf8")) as SessionEntry[]; } catch { return []; }
+function readSession(sessionFile: string): FileEntry[] {
+  try { return parseSessionEntries(readFileSync(sessionFile, "utf8")); } catch { return []; }
 }
 
 export const __test__ = {
@@ -750,9 +749,9 @@ export const __test__ = {
  * Call watchSubagent() on the returned object to observe completion.
  */
 async function launchSubagent(
-  params: Static<typeof SubagentParams>,
+  params: Static<typeof SubagentParams> & { name: string },
   def: AgentDefinition,
-  ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string; getBranch(): SessionEntry[] }; cwd: string; model?: { provider: string; id: string } },
+  ctx: Pick<ExtensionContext, "sessionManager" | "cwd" | "model">,
   artifactDir: string,
   opts: { signal?: AbortSignal; toolCallId?: string; thinking?: string } = {},
 ): Promise<RunningSubagent> {
@@ -1263,9 +1262,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const registryNames = new Set(Object.keys(readNameRegistry(parentArtifactDir)));
         const baseName = params.name?.trim() || params.agent;
         if (!isValidRunName(baseName)) return fail("Subagent name must be a single line of 1–64 characters without control characters.");
-        params.name = uniqueRunningName(baseName, registryNames);
+        const name = uniqueRunningName(baseName, registryNames);
         // No await before launchSubagent registers the name, so parallel spawns see it.
-        const running = await launchSubagent(params, def, ctx, parentArtifactDir, { signal, toolCallId, thinking: pi.getThinkingLevel() });
+        const running = await launchSubagent({ ...params, name }, def, ctx, parentArtifactDir, { signal, toolCallId, thinking: pi.getThinkingLevel() });
         watchAndDeliver(running);
 
         // Return immediately
@@ -1274,7 +1273,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             {
               type: "text",
               text:
-                `Sub-agent "${params.name}" launched and is now running in the background. ` +
+                `Sub-agent "${name}" launched and is now running in the background. ` +
                 `Do NOT generate or assume any results — you have no idea what the sub-agent will do or produce. ` +
                 `The results will be delivered to you automatically as a steer message when the sub-agent finishes. ` +
                 `Until then, move on to other work or tell the user you're waiting.`,
@@ -1282,7 +1281,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           ],
           details: {
             id: running.id,
-            name: params.name,
+            name,
             task: params.task,
             agent: params.agent,
             sessionFile: running.sessionFile,

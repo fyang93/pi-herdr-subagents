@@ -12,12 +12,12 @@
  * (`awaitingAnswer`), and the parent replies with subagent_message — which lands
  * as the subagent's next turn.
  */
-import { parseFrontmatter, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { parseFrontmatter, type AgentEndEvent, type ExtensionAPI, type ExtensionContext, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
-import { findLastAssistantMessage, pendingInboxMessages, publishQuestion, removeConsumedFile, type SessionEntry } from "./session.ts";
+import { findLastAssistantMessage, pendingInboxMessages, publishQuestion, removeConsumedFile } from "./session.ts";
 
 /**
  * Number of child subagents this session itself still has in flight.
@@ -38,9 +38,11 @@ export function runningChildrenCount(): number {
   return (globalThis as any)[Symbol.for("pi-subagents/running-children-count")]?.() ?? 0;
 }
 
+type AgentMessage = AgentEndEvent["messages"][number];
+
 /** Pi marks Escape aborts on the assistant message or settled event. */
-export function wasAborted(message: any): boolean {
-  return message?.stopReason === "aborted";
+export function wasAborted(message: AgentMessage | undefined): boolean {
+  return message?.role === "assistant" && message.stopReason === "aborted";
 }
 
 export interface SubagentErrorInfo {
@@ -57,7 +59,7 @@ export interface SubagentErrorInfo {
  * aborted by the user (the settled handler keeps that session open).
  */
 export function findLatestAssistantError(
-  messages: any[] | undefined,
+  messages: AgentMessage[] | undefined,
 ): SubagentErrorInfo | null {
   if (!messages) return null;
   for (let i = messages.length - 1; i >= 0; i--) {
@@ -148,7 +150,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   const sessionFile = process.env.PI_SUBAGENT_SESSION;
-  let messages: any[] | undefined;
+  let messages: AgentMessage[] | undefined;
   // Set when this extension ends the session after a completed final turn.
   let finished = false;
   // A done task found Pi still busy (a manual /compact): it exits when that ends.
@@ -159,11 +161,10 @@ export default function (pi: ExtensionAPI) {
   let startError: SubagentErrorInfo | null = null;
   let runPending: ReturnType<typeof setTimeout> | undefined;
   let inboxTimer: ReturnType<typeof setInterval> | undefined;
-  let inboxProcessing: Promise<void> | undefined;
 
   function processInbox(ctx: ExtensionContext): void {
     // Manual compaction rejects sendUserMessage asynchronously, so leave the inbox untouched.
-    if (inboxProcessing || !sessionFile || finished || (!ctx.isIdle() && !ctx.signal)) return;
+    if (!sessionFile || finished || (!ctx.isIdle() && !ctx.signal)) return;
     const cleanup = state.inboxCleanup;
     for (const file of cleanup) if (!removeConsumedFile(file, cleanup)) return;
     let files: string[];
@@ -189,18 +190,9 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     const idle = ctx.isIdle();
-    let submitted: Promise<unknown> | undefined;
-    try { submitted = pi.sendUserMessage(message, { deliverAs: "steer" }); }
+    try { pi.sendUserMessage(message, { deliverAs: "steer" }); }
     catch { return; } // keep it, and retry in order next tick
-    const finish = () => {
-      if (!removeConsumedFile(file, cleanup)) return;
-      if (!idle) processInbox(ctx);
-    };
-    if (submitted?.then) {
-      inboxProcessing = Promise.resolve(submitted).then(finish, () => {}).finally(() => { inboxProcessing = undefined; });
-    } else {
-      finish();
-    }
+    if (removeConsumedFile(file, cleanup) && !idle) processInbox(ctx);
   }
 
   /** End an autonomous subagent whose task has started no run by its deadline. */
@@ -219,7 +211,7 @@ export default function (pi: ExtensionAPI) {
 
   /** This run's entries, on the active branch: after /tree that is not the file's last branch. */
   function runEntries(ctx: ExtensionContext): SessionEntry[] {
-    return (ctx.sessionManager.getBranch() as SessionEntry[]).filter((entry) => !state.existingEntryIds.has(entry.id));
+    return ctx.sessionManager.getBranch().filter((entry) => !state.existingEntryIds.has(entry.id));
   }
 
   /**
@@ -232,7 +224,7 @@ export default function (pi: ExtensionAPI) {
     try {
       const entries = runEntries(ctx);
       summary = findLastAssistantMessage(entries);
-      errorInfo ??= findLatestAssistantError(entries.flatMap((entry) => (entry.type === "message" ? [(entry as any).message] : [])));
+      errorInfo ??= findLatestAssistantError(entries.flatMap((entry) => (entry.type === "message" ? [entry.message] : [])));
     } catch {} // the parent then reports the run without its answer
     const type = errorInfo ? "error" : finished || !autoExit ? "done" : "quit";
     try { writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type, ...errorInfo, summary }), { mode: 0o600 }); } catch {}

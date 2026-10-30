@@ -14,21 +14,7 @@ import {
 } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
-
-export interface SessionEntry {
-  type: string;
-  id: string;
-  parentId?: string;
-  [key: string]: unknown;
-}
-
-export interface MessageEntry extends SessionEntry {
-  type: "message";
-  message: {
-    role: "user" | "assistant" | "toolResult";
-    content: Array<{ type: string; text?: string; [key: string]: unknown }>;
-  };
-}
+import type { FileEntry, SessionEntry } from "@earendil-works/pi-coding-agent";
 
 export type SeededSubagentSessionMode = "lineage-only" | "fork";
 
@@ -42,7 +28,7 @@ export type SeededSubagentSessionMode = "lineage-only" | "fork";
 function forkContext(branch: SessionEntry[], forkPoint?: string): SessionEntry[] {
   const encloses = (id: unknown) => typeof id === "string" && (forkPoint === id || !!forkPoint?.startsWith(`${id}/`));
   const spawning = branch.findIndex((entry) =>
-    entry.type === "message" && (entry as MessageEntry).message?.content?.some?.((part) => part.type === "toolCall" && encloses(part.id)));
+    entry.type === "message" && entry.message.role === "assistant" && entry.message.content.some((part) => part.type === "toolCall" && encloses(part.id)));
   return spawning === -1 ? branch : branch.slice(0, spawning);
 }
 
@@ -334,43 +320,35 @@ export function findLastAssistantMessage(entries: SessionEntry[]): string | null
   // replace it. Keep every completed reply since the last user input.
   const replies: string[] = [];
   for (let i = entries.length - 1; i >= 0; i--) {
-    const entry = entries[i];
-    if (entry.type !== "message") continue;
-    const message = (entry as MessageEntry).message as { role: string; content: any[]; stopReason?: unknown };
-    if (message.role === "user") break;
-    if (message.role !== "assistant" || message.stopReason !== "stop") continue;
-    const text = textOf(message.content);
+    const message = messageOf(entries[i]);
+    if (message?.role === "user") break;
+    if (message?.role !== "assistant" || message.stopReason !== "stop") continue;
+    const text = textOf(message);
     if (text) replies.unshift(text);
   }
   return replies.length > 1 && replies[replies.length - 1] === last ? replies.join("\n\n") : last;
 }
 
-function textOf(content: any[]): string {
-  const text = content
-    .filter((block) => block.type === "text" && typeof block.text === "string" && block.text.trim() !== "")
-    .map((block) => block.text as string)
+type AgentMessage = Extract<SessionEntry, { type: "message" }>["message"];
+type AssistantMessage = Extract<AgentMessage, { role: "assistant" }>;
+
+const messageOf = (entry: FileEntry): AgentMessage | undefined => entry.type === "message" ? entry.message : undefined;
+
+function textOf(message: AssistantMessage): string {
+  const text = message.content
+    .flatMap((block) => block.type === "text" && typeof block.text === "string" && block.text.trim() !== "" ? [block.text] : [])
     .join("\n");
   return text.trim() ? text : "";
 }
 
 function findLastAssistantText(entries: SessionEntry[]): string | null {
   for (let i = entries.length - 1; i >= 0; i--) {
-    const entry = entries[i];
-    if (entry.type !== "message") continue;
-    const msg = entry as MessageEntry;
-    if (msg.message.role !== "assistant") continue;
-
-    const text = textOf(msg.message.content);
+    const message = messageOf(entries[i]);
+    if (message?.role !== "assistant") continue;
+    const text = textOf(message);
     if (text) return text;
-
-    const stopReason = (msg.message as { stopReason?: unknown }).stopReason;
-    const errorMessage = (msg.message as { errorMessage?: unknown }).errorMessage;
-    if (
-      stopReason === "error" &&
-      typeof errorMessage === "string" &&
-      errorMessage.trim() !== ""
-    ) {
-      return `Subagent error: ${errorMessage.trim()}`;
+    if (message.stopReason === "error" && typeof message.errorMessage === "string" && message.errorMessage.trim() !== "") {
+      return `Subagent error: ${message.errorMessage.trim()}`;
     }
   }
   return null;
@@ -400,7 +378,7 @@ export interface SessionStats {
  * standalone usage entries, compactions and branch summaries. The context size is the
  * last assistant turn's `totalTokens` (the live context window occupancy).
  */
-export function summarizeSessionStats(entries: SessionEntry[]): SessionStats {
+export function summarizeSessionStats(entries: FileEntry[]): SessionStats {
   const stats: SessionStats = {
     model: null,
     provider: null,

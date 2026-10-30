@@ -88,7 +88,7 @@ async function parent(t: TestContext) {
     fs.writeFileSync(sessionFile, JSON.stringify({ type: "session", id: name, version: 3, cwd: dir }) + "\n");
     writeSubagentLoadout(sessionFile, { ...loadout, cwd: dir, agentDir: dir });
     registerName(join(dir, "artifacts", "parent"), name, { sessionFile });
-    const child = { id: name, name, task: "original", surface: "w1:p2", herdrName: name,
+    const child: { abortController?: AbortController } & Parameters<typeof state.watchAndDeliver>[0] = { id: name, name, task: "original", surface: "w1:p2", herdrName: name,
       sessionFile, startTime: Date.now(), interactive: false };
     state.runningSubagents.set(name, child);
     state.watchAndDeliver(child);
@@ -176,7 +176,7 @@ it("question cleanup errors neither close a working child nor repeat delivered q
     return remove(path, options);
   });
   const warnings: string[] = [];
-  t.mock.method(console, "warn", message => warnings.push(String(message)));
+  t.mock.method(console, "warn", (message: unknown) => warnings.push(String(message)));
   const closed: string[] = [];
   await state.watchSubagent(child, new AbortController().signal, {
     wait: async (_name, _signal, options) => {

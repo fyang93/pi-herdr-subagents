@@ -133,7 +133,7 @@ test("resume replays the loadout snapshot; a bare resume would drop identity and
 test("resume keeps a replace-mode identity and the session's later model/thinking switch", async () => {
   const testApi = (await import("../pi-extension/subagents/index.ts")).__test__;
   const loadout = {
-    toolAllowlist: testApi.buildSubagentToolAllowlist("read"), systemPromptMode: "replace",
+    toolAllowlist: testApi.buildSubagentToolAllowlist("read"), systemPromptMode: "replace" as const,
     identity: "REPLACE_MARKER: you are a read-only scout.",
   };
   const launchArgs: string[] = [];
