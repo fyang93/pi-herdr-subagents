@@ -80,7 +80,7 @@ You are a specialized agent that does X...
 | --- | --- | --- |
 | `name` | string | Profile name used by `agent` |
 | `description` | string | Shown in `subagents_list` |
-| `model` | string | Launch default; omitted inherits the parent's current model. `${NAME}` expands an environment variable; missing or empty variables fail the launch |
+| `model` | string | Launch default; omitted inherits the parent's current model. `${NAME}` expands an environment variable, else one from the project's `.env`; missing or empty variables fail the launch |
 | `thinking` | string | Pi level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Applies with or without `model`; omitted inherits the parent's level on launch |
 | `tools` | string or string[] | Plain names (`read,bash,codemode`) are a strict allowlist; `+name`/`-name` selectors (`"+codemode -bash"` or `[+codemode, -bash]`) modify defaults in order and retain extension tools. Mixing forms (`read,-bash`) is rejected at spawn. Empty/omitted uses defaults. `ask_question` and permitted spawning tools are added automatically |
 | `subagent_agents` | string | Comma-separated profiles the child may spawn. A non-empty list grants `subagent`, `subagent_message`, `subagents_list` and restricts targets; empty/omitted denies spawning. An agent cannot spawn its own profile, even if listed |

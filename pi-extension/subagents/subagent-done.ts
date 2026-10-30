@@ -84,14 +84,12 @@ interface ChildState {
   /** Skills to load with the first task, so one run has them all; Pi's `/skill:` expands one per prompt. */
   skills: string[];
   /** Entries on every branch before this run; /tree must not turn an old answer into its result. */
-  existingEntryIds?: Set<string>;
-  /** Present only in a child started before the entry-ID snapshot was introduced. */
-  baseline?: string | null;
+  existingEntryIds: Set<string>;
   /** When a task that has started no run is taken as refused; kept across /reload. */
   runDeadline: number | null;
   /** Submitted files whose deletion failed must never be submitted again, including after reload. */
-  inboxCleanup?: Set<string>;
-  exitAfterInbox?: boolean;
+  inboxCleanup: Set<string>;
+  exitAfterInbox: boolean;
 }
 
 /** A loaded skill as Pi's `/skill:name` expansion renders it, or "" when no such skill is loaded. */
@@ -166,7 +164,7 @@ export default function (pi: ExtensionAPI) {
   function processInbox(ctx: ExtensionContext): void {
     // Manual compaction rejects sendUserMessage asynchronously, so leave the inbox untouched.
     if (inboxProcessing || !sessionFile || finished || (!ctx.isIdle() && !ctx.signal)) return;
-    const cleanup = state.inboxCleanup ??= new Set<string>();
+    const cleanup = state.inboxCleanup;
     for (const file of cleanup) if (!removeConsumedFile(file, cleanup)) return;
     let files: string[];
     try { files = pendingInboxMessages(sessionFile); }
@@ -214,21 +212,14 @@ export default function (pi: ExtensionAPI) {
       if (finished || !ctx.isIdle()) return;
       const model = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "no model";
       startError = { errorMessage: `Pi started no run for the task within ${RUN_START_TIMEOUT / 1000} s (${model}); it refuses a prompt when the model has no usable credentials, or none is selected.` };
-      finished = true;
-      if (sessionFile) try { writeFileSync(`${sessionFile}.exiting`, "{}", { mode: 0o600 }); } catch {}
-      ctx.shutdown();
+      shutdown(ctx);
     }, Math.max(0, state.runDeadline - Date.now()));
     runPending.unref(); // Pi's own loop keeps the process alive
   }
 
   /** This run's entries, on the active branch: after /tree that is not the file's last branch. */
   function runEntries(ctx: ExtensionContext): SessionEntry[] {
-    const branch = ctx.sessionManager.getBranch() as SessionEntry[];
-    const existing = state.existingEntryIds;
-    if (existing) return branch.filter((entry) => !existing.has(entry.id));
-    // shortcut: pre-upgrade children only saved a leaf, start a new child for full branch-history isolation.
-    const baseline = branch.findIndex((entry) => entry.id === state.baseline);
-    return state.baseline === null ? branch : baseline < 0 ? [] : branch.slice(baseline + 1);
+    return (ctx.sessionManager.getBranch() as SessionEntry[]).filter((entry) => !state.existingEntryIds.has(entry.id));
   }
 
   /**
@@ -361,8 +352,14 @@ export default function (pi: ExtensionAPI) {
       exitAfterCompaction = true;
       return;
     }
-    // Pi stops reading input as it shuts down, before the exit marker can be written on quit:
-    // say so first, so a message sent meanwhile is not taken for received.
+    shutdown(ctx);
+  }
+
+  /**
+   * End this session. Pi stops reading input as it shuts down, before the exit marker can be
+   * written on quit: say so first, so a message sent meanwhile is not taken for received.
+   */
+  function shutdown(ctx: ExtensionContext) {
     finished = true;
     if (sessionFile) try { writeFileSync(`${sessionFile}.exiting`, "{}", { mode: 0o600 }); } catch {}
     ctx.shutdown();

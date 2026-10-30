@@ -1291,26 +1291,6 @@ describe("subagent-done.ts", () => {
       }
     });
 
-    it("preserves ordinary results on a pre-upgrade child's reload, but never falls back to an unrelated branch", () => {
-      for (const baseline of [null, "old", "missing"] as const) {
-        const dir = createTestDir(), sessionFile = join(dir, "legacy.jsonl");
-        const h = setupCapturingExtension(sessionFile);
-        try {
-          const state = (globalThis as any)[Symbol.for("pi-subagents/child-state")];
-          delete state.existingEntryIds;
-          state.baseline = baseline;
-          if (baseline !== null) h.branch.push({ ...ASSISTANT_MSG, id: "old" });
-          if (baseline !== "missing") h.branch.push({ type: "message", id: "new", message: { role: "assistant", content: [{ type: "text", text: "Fresh answer" }] } });
-          h.reload();
-          h.emit("session_shutdown", { reason: "quit" }, h.ctx);
-          assert.equal(JSON.parse(readFileSync(sessionFile + ".exit", "utf8")).summary, baseline === "missing" ? null : "Fresh answer");
-        } finally {
-          h.restore();
-          rmSync(dir, { recursive: true, force: true });
-        }
-      }
-    });
-
     it("reports a failed last turn as an error when a human quits an interactive child", async () => {
       const dir = createTestDir();
       const sessionFile = join(dir, "s.jsonl");

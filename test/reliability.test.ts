@@ -274,6 +274,14 @@ it("expands model environment variables and rejects missing values", t => {
   assert.equal(state.resolveModelEnv("fixed/model"), "fixed/model");
   delete process.env.AUDIT_MODEL;
   assert.throws(() => state.resolveModelEnv("${AUDIT_MODEL}"), /unset environment variable/);
+  // The project's .env fills in, without entering the environment; the environment wins.
+  const dir = fs.mkdtempSync(join(tmpdir(), "model-env-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(join(dir, ".env"), "AUDIT_MODEL=dotenv/model\n");
+  assert.equal(state.resolveModelEnv("${AUDIT_MODEL}", dir), "dotenv/model");
+  assert.equal(process.env.AUDIT_MODEL, undefined);
+  process.env.AUDIT_MODEL = "provider/model";
+  assert.equal(state.resolveModelEnv("${AUDIT_MODEL}", dir), "provider/model");
 });
 
 it("only accepts explicit, valid completion marker types", () => {

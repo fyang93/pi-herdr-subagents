@@ -6,6 +6,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
+import { parseEnv } from "node:util";
 import {
   readdirSync,
   readFileSync,
@@ -158,9 +159,16 @@ function oneOf<T extends string>(value: string | undefined, allowed: readonly T[
   return allowed.includes(value as T) ? (value as T) : undefined;
 }
 
-function resolveModelEnv(model: string | undefined): string | undefined {
+/** A project's `.env` variables, read for lookups only: loading them would leak into every command pi runs. */
+function projectEnv(cwd: string): Record<string, string | undefined> {
+  try { return parseEnv(readFileSync(join(cwd, ".env"), "utf8")); } catch { return {}; }
+}
+
+/** Expand `${NAME}` from the environment, else from the project's `.env`. */
+function resolveModelEnv(model: string | undefined, cwd = process.cwd()): string | undefined {
+  let dotenv: Record<string, string | undefined> | undefined;
   return model?.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_match, name: string) => {
-    const value = process.env[name];
+    const value = process.env[name] ?? (dotenv ??= projectEnv(cwd))[name];
     if (value == null || !value.trim()) throw new Error(`Subagent model references unset environment variable: ${name}`);
     return value.trim();
   });
@@ -273,6 +281,8 @@ function formatUsageSegments(stats: SessionStats): string[] {
 const fail = (text: string, error = text) => ({
   content: [{ type: "text" as const, text }], details: { error }, isError: true,
 });
+
+const NO_AGENTS = "No subagent definitions found. Add profiles to .pi/agents/ or your Pi config's agents/ directory; see examples/agents/ in this package.";
 
 function herdrUnavailableResult() {
   return fail(`Subagents require herdr. ${herdrSetupHint()}`, "herdr not available");
@@ -748,7 +758,7 @@ async function launchSubagent(
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
   const id = randomUUID().slice(0, 8);
-  const effectiveModel = params.model ?? resolveModelEnv(def.model) ?? (ctx.model && `${ctx.model.provider}/${ctx.model.id}`);
+  const effectiveModel = params.model ?? resolveModelEnv(def.model, ctx.cwd) ?? (ctx.model && `${ctx.model.provider}/${ctx.model.id}`);
   const thinking = def.thinking ?? opts.thinking;
   const interactive = def.interactive ?? !def.autoExit;
   const cwd = params.cwd ? resolve(ctx.cwd, params.cwd) : def.cwd ? resolve(getAgentDir(), def.cwd) : ctx.cwd;
@@ -1083,8 +1093,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   latestPi = pi;
   pi.on("session_start", (event, ctx) => {
     latestCtx = ctx;
-    const envFile = resolve(ctx.cwd ?? process.cwd(), ".env");
-    if (existsSync(envFile)) process.loadEnvFile(envFile);
     // Subagents are new pi processes, so they load herdr's state integration once installed.
     if (isHerdrAvailable()) {
       integrationReady = ensurePiIntegration().then(
@@ -1102,16 +1110,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     }
     // Keep watching what the previous load handed over; a child that finished
     // meanwhile is found by its exit marker on the first check.
-    const handoff = (globalThis as any)[RELOAD_HANDOFF_KEY] as ReloadHandoff | RunningSubagent[] | undefined;
+    const handoff = (globalThis as any)[RELOAD_HANDOFF_KEY] as ReloadHandoff | undefined;
     delete (globalThis as any)[RELOAD_HANDOFF_KEY];
     if (event.reason === "reload") {
-      // Accept the old array shape on the first reload after upgrading this extension.
-      for (const previous of (Array.isArray(handoff) ? handoff : handoff?.running) ?? []) {
+      for (const previous of handoff?.running ?? []) {
         const running: RunningSubagent = { ...previous, handedOff: false };
         runningSubagents.set(running.id, running);
         watchAndDeliver(running);
       }
-      for (const [id, message] of (Array.isArray(handoff) ? [] : handoff?.held) ?? []) {
+      for (const [id, message] of handoff?.held ?? []) {
         if (message.customType === "subagent_result") unconsumed.add(id);
         sendTracked(pi, id, message);
       }
@@ -1368,7 +1375,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         });
 
         return {
-          content: [{ type: "text", text: lines.length ? lines.join("\n") : "No subagent definitions found. Add profiles to .pi/agents/ or your Pi config's agents/ directory; see examples/agents/ in this package." }],
+          content: [{ type: "text", text: lines.length ? lines.join("\n") : NO_AGENTS }],
           details: { agents: list },
         };
       },
@@ -1376,7 +1383,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       renderResult(result, _opts, theme) {
         const details = result.details as any;
         const agents = details?.agents ?? [];
-        if (agents.length === 0) return new Text(theme.fg("dim", "No subagent definitions found. Add profiles to .pi/agents/ or your Pi config's agents/ directory; see examples/agents/ in this package."), 0, 0);
+        if (agents.length === 0) return new Text(theme.fg("dim", NO_AGENTS), 0, 0);
         const lines = agents.map((a: any) => {
           const badge = a.source === "project" ? theme.fg("accent", " (project)") : "";
           const desc = a.description ? theme.fg("dim", ` — ${a.description}`) : "";
