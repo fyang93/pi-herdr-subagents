@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionContext, FileEntry } from "@earendil-works/pi-coding-agent";
-import { getAgentDir, parseSessionEntries, ProjectTrustStore } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, parseSessionEntries } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -287,19 +287,16 @@ function refreshWidget(): void {
   }, { placement: "aboveEditor" });
 }
 
-/**
- * The APPEND_SYSTEM.md Pi itself would load in `cwd`: the project's, when that folder is
- * recorded as trusted, else the global one.
- */
+/** The APPEND_SYSTEM.md Pi itself would load in `cwd`, which children trust: the project's, else the global one. */
 function discoveredAppendFile(cwd: string, agentDir: string): string | undefined {
   const project = join(cwd, ".pi", "APPEND_SYSTEM.md");
-  if (existsSync(project) && new ProjectTrustStore(agentDir).get(cwd) === true) return project;
+  if (existsSync(project)) return project;
   const global = join(agentDir, "APPEND_SYSTEM.md");
   return existsSync(global) ? global : undefined;
 }
 
 /**
- * Apply a loadout snapshot to pi arguments: identity, optional tool allowlist and the
+ * Apply a loadout snapshot to pi arguments: folder trust, identity, optional tool allowlist and the
  * delegation helper. Extensions are discovered normally.
  *
  * Shared by the initial `launchSubagent` and the `subagent_message` resume path.
@@ -313,6 +310,8 @@ function applyLoadoutToArgs(
   loadout: Partial<SubagentLoadout>,
   sessionFile: string,
 ): void {
+  // Choosing a child's folder is the user's call: trust it, so no trust dialog stalls the start.
+  args.push("--approve");
   if (loadout.identity && loadout.systemPromptMode) {
     // Passed as a file: herdr refuses agent arguments with line breaks. One per session, rewritten on resume.
     const identityFile = `${sessionFile}.identity.md`;

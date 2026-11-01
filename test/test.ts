@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { initTheme, parseSessionEntries, ProjectTrustStore } from "@earendil-works/pi-coding-agent";
+import { initTheme, parseSessionEntries } from "@earendil-works/pi-coding-agent";
 import { setTimeout as delay } from "node:timers/promises";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 
@@ -833,10 +833,8 @@ describe("subagent discovery", () => {
       assert.deepEqual(appended(), [id]);
       writeFileSync(join(agentDir, "APPEND_SYSTEM.md"), "global");
       assert.deepEqual(appended(), [join(agentDir, "APPEND_SYSTEM.md"), id]);
-      // The project's own replaces the global one only where Pi trusts it: here, by a trusted parent folder.
+      // Children trust their folder, so its own replaces the global one.
       writeFileSync(join(role, ".pi", "APPEND_SYSTEM.md"), "role");
-      assert.deepEqual(appended(), [join(agentDir, "APPEND_SYSTEM.md"), id]);
-      new ProjectTrustStore(agentDir).set(join(d, "project"), true);
       assert.deepEqual(appended(), [join(role, ".pi", "APPEND_SYSTEM.md"), id]);
     });
   });
@@ -847,7 +845,7 @@ describe("subagent discovery", () => {
       agent: null, toolAllowlist: null, systemPromptMode: null,
       identity: null, spawnable: null, cwd: null, agentDir: null,
     }, "/nonexistent/s.jsonl");
-    assert.deepEqual(parts, []);
+    assert.deepEqual(parts, ["--approve"]);
   });
 
 

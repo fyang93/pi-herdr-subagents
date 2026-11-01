@@ -195,7 +195,7 @@ export async function startAgent(launch: AgentLaunch, signal?: AbortSignal): Pro
         // Another parent took the name meanwhile; nothing started, so pick again once.
         if (error instanceof HerdrError && error.code === "agent_name_taken" && attempt === 0) continue;
         if (error instanceof HerdrError && error.code === "agent_not_ready") {
-          throw new Error(`pi did not become ready; it may be waiting at a startup dialog (such as trusting ${launch.cwd}). Answer it by running pi there once, then spawn again.`);
+          throw new Error(`pi did not become ready; it may be waiting at a startup dialog in ${launch.cwd}. Answer it by running pi there once, then spawn again.`);
         }
         throw error;
       }

@@ -213,7 +213,7 @@ it("finds the live pi agent running a session file", async () => {
 
 it("closes the pane on every start failure, explaining one that never became ready", async () => {
   layout([["w1:p1", 200, 50]]);
-  for (const [code, expected] of [["agent_not_ready", /startup dialog \(such as trusting \/repo\)/], ["agent_start_failed", /agent_start_failed/]] as const) {
+  for (const [code, expected] of [["agent_not_ready", /startup dialog in \/repo/], ["agent_start_failed", /agent_start_failed/]] as const) {
     reply("start", { error: { code, message: "no" } });
     writeFileSync(log, "");
     await assert.rejects(herdr.startAgent(launch), expected);

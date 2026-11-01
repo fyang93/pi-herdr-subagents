@@ -86,7 +86,7 @@ You are a specialized agent that does X...
 | `subagent_agents` | string | Comma-separated profiles the child may spawn. A non-empty list grants `subagent`, `subagent_message`, `subagents_list` and restricts targets; empty/omitted denies spawning. An agent cannot spawn its own profile, even if listed |
 | `skills` | string | Comma-separated skill names (also `skill:`); all load with the first task, in one run |
 | `session-mode` | string | `standalone` (default): fresh, unlinked session. `lineage-only`: fresh with `parentSession` linkage for discovery/fork UX, no copied turns. `fork`: copy the caller's active branch up to the assistant message making the spawn call, not an abandoned `/tree` branch |
-| `system-prompt` | string | `append` or `replace`: body becomes the child's system identity. Append also includes the `APPEND_SYSTEM.md` Pi would discover: the role folder's when present and trusted, otherwise the global file. Omitted: prepend the body to the task instead |
+| `system-prompt` | string | `append` or `replace`: body becomes the child's system identity. Append also includes the `APPEND_SYSTEM.md` Pi would discover: the role folder's when present, otherwise the global file. Omitted: prepend the body to the task instead |
 | `auto-exit` | boolean | Shut down automatically after settled work; recommended for autonomous profiles. See below |
 | `interactive` | boolean | Suppress blocked-dialog notifications when true; default is the inverse of `auto-exit`. Set explicitly to override |
 | `cwd` | string | Default working directory; see [Role folders](#role-folders) |
@@ -121,13 +121,15 @@ All three use `auto-exit: true` and `system-prompt: append`.
 
 ## Role folders
 
-`cwd` sets only the start directory. Pi loads its `AGENTS.md` and trusted project `.pi/` resources (skills, extensions, settings, `APPEND_SYSTEM.md`). The config directory (`PI_CODING_AGENT_DIR`) stays the parent's, so global extensions and herdr's integration still load.
+`cwd` sets only the start directory. Pi loads its `AGENTS.md` and project `.pi/` resources (skills, extensions, settings, `APPEND_SYSTEM.md`). Children start with `--approve`, so they trust their folder without a dialog: point `cwd` only at folders whose project extensions you are willing to run. The config directory (`PI_CODING_AGENT_DIR`) stays the parent's, so global extensions and herdr's integration still load.
 
 ```typescript
 subagent({ agent: "worker", cwd: "agents/sre", task: "Review the deployment pipeline" });
 ```
 
 The tool's `cwd` is relative to the caller; frontmatter `cwd` is relative to the Pi config directory (`~/.pi/agent` by default). Use an absolute frontmatter path for a project folder.
+
+To run several workers that edit the same repository in parallel, give each its own `git worktree` and pass it as `cwd`, so their changes do not collide.
 
 ## Tool access and extensions
 
@@ -143,13 +145,12 @@ New sidecars (loadout, identity, registry, questions, inbox and markers) use `06
 
 ## How it works
 
-- **Panes:** split, without focus, the largest unfocused subagent pane the caller opened in its tab, else the caller's current pane, else the largest in a background tab holding only the caller's subagents, or open a new background tab if either half would be under **80 columns × 24 rows** (readability-first default) (`PI_SUBAGENT_MIN_COLUMNS`, `PI_SUBAGENT_MIN_ROWS`) or the tab is zoomed. Other panes are never rearranged. Herdr names derive from display names (`Scout: auth` → `scout-auth`) and get suffixes when taken.
-- **Delivery:** publish tasks only after Pi is ready. Children take inbox messages in order, leave them unread during manual compaction, and delete files when submitted to Pi. Failed cleanup is retried without submitting messages or questions twice; an inbox receipt that cannot be removed keeps the child open until cleanup succeeds. Resume clears stale markers and inbox files; a waiting messaging tool reclaims its unread message before resuming.
-- **Status:** the theme-aware widget shows elapsed time, profile, state and last tool (parallel calls may still have another tool running). Herdr's sidebar shows working, idle, blocked or done. Tracking follows pane moves; a replacement with a different reported session is never adopted, reported or closed; the last-known pane is retained for inspection when session identity differs. A missing session report alone is not a mismatch.
-- **Attention:** autonomous children notify the parent once when blocked at a dialog or interrupted by Escape; their panes stay open. Use `subagent_message` to continue an interrupted child. Interactive children suppress blocked notices by default.
-- **Completion:** `<session>.exit` reports `done` after final work or a human's interactive exit, early `quit` for an autonomous child, or `error`, with the active-branch answer. Provider failures and output-limit truncation report an error with any partial answer. Usage comes from the session. Allow Pi's shutdown up to 30 seconds, close the pane, then deliver the result. Missing or invalid completion markers mean interruption once the agent exits; leave the pane open for inspection. Notices wait for a parent prompt being prepared and survive cleared queues: after Escape they are appended without starting a turn, otherwise steered again.
-- **Failures:** pi starts once the new pane's shell is at its prompt (up to 10 seconds), so shell startup cannot swallow the launch; startup errors include recent pane output before cleanup. Answer startup dialogs (such as folder trust) by running pi there once. An autonomous task that starts no run within 30 seconds (such as missing model/credentials) fails instead of hanging; prompt preparation cancels that deadline and extension dialogs pause it. Failed pane closes are retried and unresolved panes reported. A concurrent name collision is retried once; only layout inspection and pane creation are serialized.
-- **Shutdown:** parent exit, `/reload` or `/new`, `/resume`, `/fork` closes tracked panes, including starts in progress. Finished children can still be resumed by name with `subagent_message`.
+- **Panes:** each child gets an unfocused split next to the caller's subagents or its own pane, or a background tab when a half would be under 80 × 24 cells (`PI_SUBAGENT_MIN_COLUMNS`, `PI_SUBAGENT_MIN_ROWS`) or the tab is zoomed. Other panes are never rearranged.
+- **Status:** a widget shows each child's elapsed time, profile, state and last tool; herdr's sidebar shows working, idle, blocked or done. Tracking follows pane moves.
+- **Attention:** an autonomous child blocked at a dialog or interrupted with Escape notifies the parent once and stays open; `subagent_message` continues it.
+- **Completion:** the result is the child's final answer on its active branch, with usage stats. A provider error or an answer cut off at the output limit is reported as a failure with any partial answer. The pane closes, then the result is steered into the parent; a child that vanishes without reporting is marked interrupted and its pane is left open.
+- **Failures:** startup errors include the pane's recent output. An autonomous task that starts no run within 30 seconds (e.g. missing model credentials) fails instead of hanging.
+- **Shutdown:** parent exit, `/reload`, `/new`, `/resume` and `/fork` close the panes of running children. Finished children can still be resumed by name.
 
 Child tools widgets toggle with `Ctrl+Alt+O`; completion messages expand with `Ctrl+O`.
 
