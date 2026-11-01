@@ -195,6 +195,25 @@ test("a prompt survives a child's result starting a run while an earlier input h
   assert.match(JSON.stringify(requests), /CHILD_RESULT/);
 });
 
+test("child notices arriving during a run reach the next model call together, and the last one gets answered", async () => {
+  // Loads this package's extension and sends notices through it at chosen moments of the run.
+  const driver = join(root, "notice-driver.ts");
+  writeFileSync(driver, `import ext, { __test__ } from ${JSON.stringify(resolve("pi-extension/subagents/index.ts"))};
+    export default (pi:any)=>{ext(pi);let tools=0;const say=(text:string)=>__test__.notify({customType:"subagent_status",content:text,display:true});
+    pi.on("tool_execution_start",()=>{if(tools++)return;say("NOTICE_ONE");say("NOTICE_TWO");});
+    pi.on("tool_execution_end",()=>{setTimeout(()=>say("NOTICE_LAST"),150);});};`);
+  const h = start({ extensions: [driver] });
+  await h.command("get_state");
+  replies = [{ tool: "read", args: { path: "missing.txt" } }, { delay: 600, text: "ANSWER" }, { text: "DONE" }];
+  prompt(h, "USER_TASK");
+  await h.exited();
+  const seen = requests.map(request => JSON.stringify(request.messages));
+  assert.equal(seen.length, 3, h.diagnostic());
+  assert.match(seen[1], /NOTICE_ONE[\s\S]*NOTICE_TWO/, "both in the call after the tool");
+  assert.doesNotMatch(seen[1], /NOTICE_LAST/);
+  assert.match(seen[2], /NOTICE_LAST/, "one more call answers the notice that came with the final reply");
+});
+
 test("YAML quoted/list tools become a real CLI loadout", async () => {
   const config = join(root, "yaml-agent-config"); const cwd = join(root, "yaml-project");
   mkdirSync(join(config, "agents"), { recursive: true }); mkdirSync(cwd, { recursive: true });

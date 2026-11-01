@@ -2682,7 +2682,7 @@ describe("result and question renderers", () => {
         assert.ok(plain(renderer(message, { expanded: true }, theme).render(512)).includes(argument));
       }
     } finally {
-      testApi.undelivered.clear(); testApi.queued.clear();
+      testApi.appended.clear();
       rmSync(dir, { recursive: true, force: true });
     }
   });
@@ -3210,7 +3210,7 @@ describe("session shutdown", () => {
     }
   });
 
-  it("sends a result or question again after Escape dropped it from Pi's queue", async () => {
+  it("batches notices during a run, and has the model answer them before the run settles", async () => {
     const testApi = (subagentsModule as any).__test__;
     const originalWatch = testApi.launchDeps.watchSubagent;
     const childCount = (globalThis as any)[Symbol.for("pi-subagents/running-children-count")];
@@ -3219,52 +3219,62 @@ describe("session shutdown", () => {
     const { api } = createMockExtensionApi();
     const sent: Array<{ message: any; options: any }> = [];
     api.sendMessage = (message: any, options: any) => { sent.push({ message, options }); };
-    const handlers = new Map<string, (event: any, ctx?: any) => void>();
+    const handlers = new Map<string, (event: any, ctx?: any) => any>();
     api.on = (event: string, handler: any) => { handlers.set(event, handler); };
     testApi.unconsumed.clear();
-    testApi.undelivered.clear();
-    // The child asks, then finishes; both notices are steered while the parent is busy.
+    // The first child asks, then finishes, while the parent is working.
     testApi.launchDeps.watchSubagent = async (child: any) => {
-      publishQuestion(sessionFile, "Which way?");
-      testApi.deliverPendingQuestion(child);
+      if (child.id === "busy-parent") {
+        publishQuestion(sessionFile, "Which way?");
+        testApi.deliverPendingQuestion(child);
+      }
       testApi.runningSubagents.delete(child.id);
       return { summary: "Done.", exitCode: 0, elapsed: 1 };
     };
+    const settle = (contextMessages: any[], pendingMessages: any[] = []) =>
+      handlers.get("agent_before_settle")!({ context: { contextMessages, pendingMessages } });
     try {
       (subagentsModule as any).default(api);
-      handlers.get("session_start")!({ reason: "startup" }, { isIdle: () => false }); // the parent is working
+      handlers.get("session_start")!({ reason: "startup" }, { isIdle: () => false });
+      handlers.get("agent_start")!({});
       const child = { id: "busy-parent", name: "busy-parent", task: "t", surface: "w1:p1", herdrName: "busy-parent", startTime: 1, sessionFile, interactive: false };
       testApi.runningSubagents.set(child.id, child);
       testApi.watchAndDeliver(child);
       await delay(1);
       assert.deepEqual(sent.map(({ message }) => message.customType), ["subagent_question", "subagent_result"]);
-      assert.deepEqual(pendingQuestions(sessionFile).files, [], "the question file is consumed once queued");
-      // Escape: Pi drops both queued steers and ends the run aborted.
-      handlers.get("agent_settled")!({ aborted: true });
-      const again = sent.slice(2);
-      assert.deepEqual(again.map(({ message }) => message.customType), ["subagent_question", "subagent_result"]);
-      assert.ok(again.every(({ options }) => options.triggerTurn === false), "appended, without the turn the user stopped");
-      // Appended is delivered: Pi reports no message_start to extensions for it.
+      assert.ok(sent.every(({ options }) => options.triggerTurn === false), "Pi appends both when the turn ends");
+      assert.deepEqual(pendingQuestions(sessionFile).files, [], "the question file is consumed once handed to Pi");
+      assert.equal(childCount(), 1, "until the model has it");
+      // The final turn ended with both appended after the answer: one more model call takes them in.
+      const notice = { role: "custom", ...sent[1].message };
+      assert.deepEqual(settle([{ role: "assistant" }, notice]), { continue: true });
+      assert.deepEqual(settle([{ role: "assistant" }], [notice]), { continue: true }, "or still pending in Pi");
       assert.equal(childCount(), 0);
-      handlers.get("agent_settled")!({ aborted: true });
-      assert.equal(sent.length, 4, "nothing left to send again");
-
-      // Editing queued input (Alt+Up) clears Pi's queue without aborting: steer it again, to be taken in as before.
-      testApi.watchAndDeliver({ ...child, id: "dequeued" });
+      // Answered: the run may settle. A notice arriving from now on waits for that, then starts a run.
+      assert.equal(settle([notice, { role: "assistant" }]), undefined);
+      testApi.watchAndDeliver({ ...child, id: "late" });
       await delay(1);
+      assert.equal(sent.length, 2);
       handlers.get("agent_settled")!({ aborted: false });
-      const steered = sent.at(-1)!;
-      assert.equal(steered.message.details.deliveryId, "dequeued");
-      assert.deepEqual(steered.options, { triggerTurn: true, deliverAs: "steer" });
-      assert.equal(childCount(), 1, "until it is taken in");
-      handlers.get("message_start")!({ message: { role: "custom", ...steered.message } });
+      assert.equal(sent.length, 3);
+      assert.equal(sent[2].message.details.deliveryId, "late");
+      assert.deepEqual(sent[2].options, { triggerTurn: true });
+
+      // Escape: Pi appends what it holds without the turn the user stopped; nothing is sent again.
+      handlers.get("agent_start")!({});
+      testApi.watchAndDeliver({ ...child, id: "stopped" });
+      await delay(1);
+      assert.deepEqual(sent[3].options, { triggerTurn: false });
+      handlers.get("agent_settled")!({ aborted: true });
+      assert.equal(sent.length, 4);
+      assert.equal(childCount(), 1, "only the late one, until its run takes it in");
+      handlers.get("message_start")!({ message: { role: "custom", ...sent[2].message } });
       assert.equal(childCount(), 0);
     } finally {
       testApi.launchDeps.watchSubagent = originalWatch;
       testApi.runningSubagents.clear();
       testApi.unconsumed.clear();
-      testApi.undelivered.clear();
-      testApi.queued.clear();
+      testApi.appended.clear();
       rmSync(root, { recursive: true, force: true });
     }
   });
@@ -3276,7 +3286,6 @@ describe("session shutdown", () => {
     api.sendMessage = (message: any) => { sent.push(message); };
     const handlers = new Map<string, (...args: any[]) => void>();
     api.on = (event: string, handler: any) => { handlers.set(event, handler); };
-    testApi.undelivered.clear();
     t.mock.timers.enable({ apis: ["setTimeout"] });
     try {
       (subagentsModule as any).default(api);
@@ -3295,12 +3304,11 @@ describe("session shutdown", () => {
       t.mock.timers.tick(30_000);
       assert.equal(sent.length, 2);
     } finally {
-      testApi.undelivered.clear();
-      testApi.queued.clear();
+      testApi.appended.clear();
     }
   });
 
-  it("sends an interruption or blocked notice again after Escape dropped it", async () => {
+  it("reports an interruption and a blocked dialog once each", async () => {
     const testApi = (subagentsModule as any).__test__;
     const root = createTestDir();
     const sessionFile = join(root, "stuck.jsonl");
@@ -3309,10 +3317,9 @@ describe("session shutdown", () => {
     api.sendMessage = (message: any, options: any) => { sent.push({ message, options }); };
     const handlers = new Map<string, (event: any, ctx?: any) => void>();
     api.on = (event: string, handler: any) => { handlers.set(event, handler); };
-    testApi.undelivered.clear();
     try {
       (subagentsModule as any).default(api);
-      handlers.get("session_start")!({ reason: "startup" }, { isIdle: () => false }); // the parent is working
+      handlers.get("session_start")!({ reason: "startup" }, { isIdle: () => true });
       writeFileSync(`${sessionFile}.paused`, "{}");
       const child = { id: "stuck", name: "stuck", task: "t", surface: "w1:p4", herdrName: "stuck", startTime: 1, sessionFile, interactive: false };
       await testApi.watchSubagent(child, new AbortController().signal, {
@@ -3324,13 +3331,10 @@ describe("session shutdown", () => {
       });
       assert.deepEqual(sent.map(({ message }) => message.details.line.replace("stuck: ", "")), ["interrupted, waiting in pane w1:p4", "blocked at a dialog in pane w1:p4"]);
       assert.equal(existsSync(`${sessionFile}.paused`), false);
-      handlers.get("agent_settled")!({ aborted: true }); // Escape dropped both
-      assert.equal(sent.length, 4);
-      assert.ok(sent.slice(2).every(({ message, options }) => message.customType === "subagent_status" && options.triggerTurn === false));
+      assert.ok(sent.every(({ options }) => options.triggerTurn === true), "each wakes the idle parent");
     } finally {
       testApi.runningSubagents.clear();
-      testApi.undelivered.clear();
-      testApi.queued.clear();
+      testApi.appended.clear();
       rmSync(root, { recursive: true, force: true });
     }
   });

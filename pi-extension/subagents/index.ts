@@ -246,14 +246,13 @@ const RUNNING_CHILDREN_COUNT_KEY = Symbol.for("pi-subagents/running-children-cou
 const unconsumed = new Set<string>();
 (globalThis as any)[RUNNING_CHILDREN_COUNT_KEY] = () => new Set([...runningSubagents.keys(), ...unconsumed]).size;
 
-/**
- * Results, questions and status notices sent but not yet in the conversation, by delivery id.
- * A queued steer is dropped when the user presses Escape, so these are sent again once that run ends.
- */
-const undelivered = new Map<string, Parameters<ExtensionAPI["sendMessage"]>[0]>();
+/** Delivery ids of notices handed to Pi during the current run, for it to append when a turn ends. */
+const appended = new Set<string>();
 
-/** Of `undelivered`, those that waited in Pi's queue during the current run. */
-const queued = new Set<string>();
+/** Between agent_start and agent_settled. */
+let runActive = false;
+/** From the run's last check for unanswered notices until it settles. */
+let settling = false;
 
 /** Latest ExtensionAPI, used to deliver watcher notifications to the parent. */
 let latestPi: ExtensionAPI | null = null;
@@ -476,8 +475,7 @@ export const __test__ = {
   watchAndDeliver,
   runningSubagents,
   unconsumed,
-  undelivered,
-  queued,
+  appended,
   formatElapsed,
   formatTokens,
   formatContextUsage,
@@ -676,28 +674,33 @@ function deliverPendingQuestion(running: RunningSubagent): void {
   if (delivered) for (const file of files) removeConsumedFile(file, cleanup); // malformed ones too
 }
 
-/** Steer a notice into the parent, keeping it until it enters the conversation; false when that pi is stale. */
+/** Send a notice into the parent, tagged so its arrival is recognised; false when that pi is stale. */
 function sendTracked(pi: ExtensionAPI, deliveryId: string, message: Parameters<ExtensionAPI["sendMessage"]>[0]): boolean {
   const tracked = { ...message, details: { ...(message.details as object), deliveryId } };
-  undelivered.set(deliveryId, tracked);
   // While a submitted prompt is prepared Pi still reports idle, and a run started now would
-  // make it reject that prompt: hold the notice for the run the prompt starts.
-  if (preparing) return held.push([deliveryId, tracked]), true;
+  // make it reject that prompt: hold the notice for the run the prompt starts. Once the run
+  // has passed its last check for unanswered notices, hold it for the run's end.
+  if (preparing || settling) return held.push([deliveryId, tracked]), true;
   return transmit(pi, deliveryId, tracked);
 }
 
 function transmit(pi: ExtensionAPI, deliveryId: string, tracked: Parameters<ExtensionAPI["sendMessage"]>[0]): boolean {
-  // Sent while the parent is busy — running, retrying or compacting — it may wait in Pi's
-  // queue, which Escape or editing queued input clears. A stale ctx throws: nothing is queued.
-  try { if (latestCtx && !latestCtx.isIdle()) queued.add(deliveryId); } catch {}
+  // During a run Pi appends the notice when the turn ends, together with every other one that
+  // arrived meanwhile, so the next model call takes them in at once; user input keeps its own
+  // queue. Otherwise the notice starts a run. A stale ctx throws: treat the parent as idle.
+  let batched = false;
+  try { batched = runActive && !!latestCtx && !latestCtx.isIdle(); } catch {}
   try {
-    pi.sendMessage(tracked, { triggerTurn: true, deliverAs: "steer" });
-    return true;
+    pi.sendMessage(tracked, { triggerTurn: !batched });
   } catch {
-    undelivered.delete(deliveryId);
     return false;
   }
+  if (batched) appended.add(deliveryId);
+  return true;
 }
+
+/** A notice this extension sent: results, questions and status notices carry a delivery id. */
+const isNotice = (message: any): boolean => message?.role === "custom" && typeof message.details?.deliveryId === "string";
 
 /** Set while a prompt submitted to an idle parent is prepared, until its run starts or a grace period ends. */
 let preparing: ReturnType<typeof setTimeout> | undefined;
@@ -865,33 +868,34 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     pi.sendUserMessage(content, { deliverAs: "steer" });
     return { action: "handled" as const };
   });
-  pi.on("agent_start", releaseHeld);
-
-  // A result or question is taken in when its message enters the conversation: starting a run,
-  // steered into one, or appended.
-  pi.on("message_start", (event) => {
-    const deliveryId = (event.message as any)?.details?.deliveryId;
-    if ((event.message as any)?.role !== "custom" || typeof deliveryId !== "string") return;
-    undelivered.delete(deliveryId);
-    unconsumed.delete(deliveryId);
+  pi.on("agent_start", () => {
+    runActive = true;
+    releaseHeld();
   });
-  // A queued notice not taken in by the time the run settles was cleared from Pi's queue: by
-  // Escape, or by editing queued input. Send it again — after Escape appended, without starting
-  // the turn the user just stopped; otherwise steered, to be taken in as before.
-  pi.on("agent_settled", (event) => {
-    const dropped = [...queued].filter((deliveryId) => undelivered.has(deliveryId));
-    queued.clear();
-    for (const deliveryId of dropped) {
-      try {
-        pi.sendMessage(undelivered.get(deliveryId)!, event.aborted ? { triggerTurn: false } : { triggerTurn: true, deliverAs: "steer" });
-      } catch {
-        continue;
-      }
-      if (!event.aborted) continue; // its message_start acknowledges it
-      // Appended to the conversation; Pi tells extensions of no message_start for it.
-      undelivered.delete(deliveryId);
-      unconsumed.delete(deliveryId);
-    }
+  // A notice is taken in when its message starts a run or enters one.
+  pi.on("message_start", (event) => {
+    if (isNotice(event.message)) unconsumed.delete((event.message as any).details.deliveryId);
+  });
+  // Pi appends notices sent during a run as its turns end, and tells extensions of no
+  // message_start for them. Before the run settles, have the model answer any it has not.
+  pi.on("agent_before_settle", (event) => {
+    for (const deliveryId of appended) unconsumed.delete(deliveryId);
+    appended.clear();
+    if (event.context.pendingMessages.some(isNotice) || isNotice(event.context.contextMessages.at(-1))) return { continue: true };
+    settling = true;
+  });
+  // The run continues after all, say for queued user input: notices go into it again.
+  pi.on("turn_start", () => {
+    settling = false;
+    releaseHeld();
+  });
+  // Notices appended to a run the user stopped stay without starting the turn they stopped;
+  // those held since the last check start a run of their own.
+  pi.on("agent_settled", () => {
+    for (const deliveryId of appended) unconsumed.delete(deliveryId);
+    appended.clear();
+    runActive = settling = false;
+    releaseHeld();
   });
 
   // Clean up on session shutdown
@@ -901,8 +905,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     if (moduleAbort) moduleAbort.abort();
     runningSubagents.clear();
     unconsumed.clear(); // none will be delivered here
-    undelivered.clear();
-    queued.clear();
+    appended.clear();
+    runActive = settling = false;
     clearTimeout(preparing);
     preparing = undefined;
     held.length = 0;

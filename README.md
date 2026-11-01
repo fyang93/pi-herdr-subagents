@@ -1,6 +1,6 @@
 # pi-herdr-subagents
 
-Async subagents for [pi](https://github.com/badlogic/pi-mono), running as named agents in [herdr](https://herdr.dev). Spawn a sub-agent, keep working, and get its result steered back automatically. Multiple sub-agents run concurrently in their own panes without stealing keyboard focus.
+Async subagents for [pi](https://github.com/badlogic/pi-mono), running as named agents in [herdr](https://herdr.dev). Spawn a sub-agent, keep working, and get its result delivered back automatically. Multiple sub-agents run concurrently in their own panes without stealing keyboard focus.
 
 ## Install and requirements
 
@@ -148,7 +148,7 @@ New sidecars (loadout, identity, registry, questions, inbox and markers) use `06
 - **Panes:** each child gets an unfocused split next to the caller's subagents or its own pane, or a background tab when a half would be under 80 × 24 cells (`PI_SUBAGENT_MIN_COLUMNS`, `PI_SUBAGENT_MIN_ROWS`) or the tab is zoomed. Other panes are never rearranged.
 - **Status:** a widget shows each child's elapsed time, profile, state and last tool; herdr's sidebar shows working, idle, blocked or done. Tracking follows pane moves.
 - **Attention:** an autonomous child blocked at a dialog or interrupted with Escape notifies the parent once and stays open; `subagent_message` continues it.
-- **Completion:** the result is the child's final answer on its active branch, with usage stats. A provider error or an answer cut off at the output limit is reported as a failure with any partial answer. The pane closes, then the result is steered into the parent; a child that vanishes without reporting is marked interrupted and its pane is left open.
+- **Completion:** the result is the child's final answer on its active branch, with usage stats. A provider error or an answer cut off at the output limit is reported as a failure with any partial answer. The pane closes, then the result goes to the parent: it starts a run when the parent is idle; during a run, results, questions and notices that arrive meanwhile enter the next model call together, and the parent answers them before its run ends (your own queued messages are unaffected). A child that vanishes without reporting is marked interrupted and its pane is left open.
 - **Failures:** startup errors include the pane's recent output. An autonomous task that starts no run within 30 seconds (e.g. missing model credentials) fails instead of hanging.
 - **Shutdown:** parent exit, `/reload`, `/new`, `/resume` and `/fork` close the panes of running children. Finished children can still be resumed by name.
 
