@@ -80,11 +80,11 @@ function positiveInteger(value: string | undefined, fallback: number): number {
   return Number.isSafeInteger(number) && number > 0 ? number : fallback;
 }
 
-/** Split direction that leaves both halves usable; a cell is about twice as tall as wide. */
+/** Split direction that leaves both halves usable, side by side first. */
 export function splitDirection(width: number, height: number, minColumns: number, minRows: number): "right" | "down" | null {
-  const fits = { right: Math.floor(width / 2) >= minColumns && height >= minRows, down: width >= minColumns && Math.floor(height / 2) >= minRows };
-  const order: ("right" | "down")[] = height * 2 > width ? ["down", "right"] : ["right", "down"];
-  return order.find(direction => fits[direction]) ?? null;
+  if (Math.floor(width / 2) >= minColumns && height >= minRows) return "right";
+  if (width >= minColumns && Math.floor(height / 2) >= minRows) return "down";
+  return null;
 }
 
 /** A herdr agent name ([a-z][a-z0-9_-]{0,31}) for a display name, unique among live agents. */
@@ -113,7 +113,7 @@ async function openPane(launch: AgentLaunch, signal?: AbortSignal): Promise<stri
   // Ask herdr for the caller's pane: HERDR_PANE_ID is only a launch-time alias after a move.
   const { pane: current } = await herdrAsync(["pane", "current", "--current"], { signal });
   const parent = current.pane_id;
-  const minColumns = positiveInteger(process.env.PI_SUBAGENT_MIN_COLUMNS, 80);
+  const minColumns = positiveInteger(process.env.PI_SUBAGENT_MIN_COLUMNS, 60);
   const minRows = positiveInteger(process.env.PI_SUBAGENT_MIN_ROWS, 24);
   // The pane list's `focused` is workspace-wide; a layout's is per tab.
   const { panes } = await herdrAsync(["pane", "list", "--workspace", current.workspace_id], { signal });

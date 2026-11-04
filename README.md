@@ -145,7 +145,7 @@ New sidecars (loadout, identity, registry, questions, inbox and markers) use `06
 
 ## How it works
 
-- **Panes:** each child gets an unfocused split next to the caller's subagents or its own pane, or a background tab when a half would be under 80 × 24 cells (`PI_SUBAGENT_MIN_COLUMNS`, `PI_SUBAGENT_MIN_ROWS`) or the tab is zoomed. Other panes are never rearranged.
+- **Panes:** each child gets an unfocused split (side by side when both halves fit, else stacked) next to the caller's subagents or its own pane, or a background tab when a half would be under 60 × 24 cells (`PI_SUBAGENT_MIN_COLUMNS`, `PI_SUBAGENT_MIN_ROWS`) or the tab is zoomed. Other panes are never rearranged.
 - **Status:** a widget shows each child's elapsed time, profile, state and last tool; herdr's sidebar shows working, idle, blocked or done. Tracking follows pane moves.
 - **Attention:** an autonomous child blocked at a dialog or interrupted with Escape notifies the parent once and stays open; `subagent_message` continues it.
 - **Completion:** the result is the child's final answer on its active branch, with usage stats. A provider error or an answer cut off at the output limit is reported as a failure with any partial answer. The pane closes, then the result goes to the parent: it starts a run when the parent is idle; during a run, results, questions and notices that arrive meanwhile enter the next model call together, and the parent answers them before its run ends (your own queued messages are unaffected). A child that vanishes without reporting is marked interrupted and its pane is left open.

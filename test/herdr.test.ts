@@ -106,16 +106,16 @@ it("fills background tabs of its own agents before opening another", async () =>
   }
 });
 
-it("defaults to readable 80-column by 24-row panes, otherwise opens a tab", async () => {
+it("defaults to 60-column by 24-row panes, side by side first, otherwise opens a tab", async () => {
   for (const [width, height, direction] of [
-    [220, 60, "right"],
-    [110, 60, "down"],
-    [160, 24, "right"],
-    [80, 48, "down"],
-    [159, 24, null],
-    [80, 47, null],
-    [110, 30, null],
-    [55, 30, null],
+    [147, 51, "right"],
+    [120, 80, "right"],
+    [120, 24, "right"],
+    [119, 48, "down"],
+    [60, 48, "down"],
+    [119, 47, null],
+    [120, 23, null],
+    [59, 48, null],
   ] as const) {
     writeFileSync(log, "");
     writeFileSync(join(dir, "start"), "");
