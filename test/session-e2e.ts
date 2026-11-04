@@ -1,5 +1,5 @@
 // Standalone, opt-in: node test/session-e2e.ts
-// Real local Pi 1.1 + production herdr helpers, with a registered in-memory model.
+// Real local Pi 1.5 + production herdr helpers, with a registered in-memory model.
 // Every native CLI invocation is pinned to an owned named server, never the caller's server.
 import assert from "node:assert/strict";
 import { execFile, execFileSync, spawn } from "node:child_process";
@@ -20,7 +20,7 @@ const bash = execFileSync("/bin/sh", ["-c", "command -v bash"], { encoding: "utf
 const piCLI = join(repo, "node_modules/@earendil-works/pi-coding-agent/dist/cli.js");
 const installedIntegration = join(homedir(), ".pi/agent/extensions/herdr-agent-state.ts");
 assert.ok(existsSync(installedIntegration), "Install the official herdr Pi integration first.");
-assert.ok(existsSync(piCLI), "Install this repository's local Pi 1.1 dependencies first.");
+assert.ok(existsSync(piCLI), "Install this repository's local Pi 1.5 dependencies first.");
 const originalEnv = { ...process.env };
 const base = mkdtempSync(join(tmpdir(), "pi-session-e2e-"));
 const server = `pi-session-e2e-${process.pid}-${Date.now().toString(36)}`;
@@ -190,7 +190,7 @@ export default function(pi:any) {
 }
 `);
   const piVersion = execFileSync(process.execPath, [piCLI, "--version"], { encoding: "utf8" }).trim();
-  assert.equal(piVersion, "1.1.0", "Use the repository's real Pi 1.1.0, not a global CLI.");
+  assert.equal(piVersion, "1.5.0", "Use the repository's real Pi 1.5.0, not a global CLI.");
   console.log(`${execFileSync(realHerdr, ["--version"], { encoding: "utf8" }).trim()} / pi ${piVersion}; private server ${server}`);
   // Refuse an existing server, including if the probe fails for an unexpected reason.
   await assert.rejects(cli(["agent", "list"]), (error: any) => {
@@ -380,7 +380,8 @@ export default function(pi:any) {
   assert.equal(followFirst.details.sessionFile, childFile);
   console.log("PASS: busy subagent_message uses a plain steer; private sidecars");
 
-  // Control: a bare resume really loses both, so the checks above have teeth.
+  // Control: a bare resume really loses the identity, so the checks above have teeth. Since
+  // Pi 1.3 it restores the session's active tools.
   const bare = await startAgent({
     name: "bare-resume", cwd: project,
     env: { PI_SUBAGENT_SESSION: childFile, PI_SUBAGENT_NAME: "bare-resume", PI_SUBAGENT_AUTO_EXIT: "1" },
@@ -391,10 +392,10 @@ export default function(pi:any) {
   const bareRequests = requestsFor(childFile).filter(request => !request.identity);
   assert.ok(bareRequests.length > 0);
   assert.equal(bareRequests.at(-1).identity, false, "bare resume drops the identity");
-  assert.ok(bareRequests.at(-1).tools.includes("write"), "bare resume restores default tools");
+  assert.ok(!bareRequests.at(-1).tools.includes("write"), "bare resume keeps the session's tools");
   await closeSurface(bare.surface);
   await gone(bare.surface);
-  console.log("PASS: real extension spawn+resume keeps identity and tools and closes finished panes; bare resume control loses them");
+  console.log("PASS: real extension spawn+resume keeps identity and tools and closes finished panes; bare resume control loses the identity");
 
   // Optional failure coverage; launch.args also permits future CLI/start-failure probes.
   if (originalEnv.PI_SESSION_E2E_ERRORS === "1") {

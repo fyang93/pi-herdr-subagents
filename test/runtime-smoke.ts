@@ -1,4 +1,4 @@
-// Real Pi 1.1.0 CLI runtime smoke tests; all model traffic is localhost-only.
+// Real Pi 1.5.0 CLI runtime smoke tests; all model traffic is localhost-only.
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
@@ -89,7 +89,7 @@ const lastAssistant = (h: ReturnType<typeof start>) => sessionEntries(h).filter(
 const userTexts = (messages: any[]) => messages.filter(message => message.role === "user").map(message => typeof message.content === "string" ? message.content : message.content.filter((part: any) => part.type === "text").map((part: any) => part.text).join("\n"));
 after(async () => { for (const child of children) child.kill("SIGKILL"); server.closeAllConnections(); await new Promise<void>(r => server.close(() => r())); rmSync(root, { recursive: true, force: true }); });
 
-test("Pi 1.1 modifier loadout retains defaults, adds codemode and excludes bash; allowlist includes helper", async () => {
+test("Pi modifier loadout retains defaults, adds codemode and excludes bash; allowlist includes helper", async () => {
   const testApi = (await import("../pi-extension/subagents/index.ts")).__test__;
   const allow = testApi.buildSubagentToolAllowlist("+codemode,-bash");
   const childArgs: string[] = [];
@@ -101,7 +101,7 @@ test("Pi 1.1 modifier loadout retains defaults, adds codemode and excludes bash;
   assert.deepEqual(allow, "+codemode,-bash,+ask_question");
 });
 
-test("resume replays the loadout snapshot; a bare resume would drop identity and tools", async () => {
+test("resume replays the loadout snapshot; a bare resume would drop the identity", async () => {
   const testApi = (await import("../pi-extension/subagents/index.ts")).__test__;
   const identity = "IDENTITY_MARKER: you are a read-only scout.";
   const loadout = { agent: "scout", toolAllowlist: testApi.buildSubagentToolAllowlist("read"),
@@ -123,11 +123,12 @@ test("resume replays the loadout snapshot; a bare resume would drop identity and
   assert.match(lastRequest(), /IDENTITY_MARKER/, "replayed resume keeps the identity");
   assert.deepEqual(lastTools(), ["ask_question", "read"], "replayed resume keeps the tool restriction");
 
-  // Control: Pi patches the session to the current flags, so a bare resume loses both.
+  // Control: Pi rebuilds the system prompt from the current flags, so a bare resume loses the
+  // identity. Since Pi 1.3 it restores the session's active tools.
   const bare = start({ session });
   await bare.command("get_state"); prompt(bare, "CONTINUE_BARE"); await bare.exited();
   assert.doesNotMatch(lastRequest(), /IDENTITY_MARKER/);
-  assert.ok(lastTools().includes("bash"), lastTools().join(","));
+  assert.deepEqual(lastTools(), ["ask_question", "read"]);
 });
 
 test("resume keeps a replace-mode identity and the session's later model/thinking switch", async () => {

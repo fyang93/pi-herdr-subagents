@@ -299,8 +299,8 @@ function discoveredAppendFile(cwd: string, agentDir: string): string | undefined
  * delegation helper. Extensions are discovered normally.
  *
  * Shared by the initial `launchSubagent` and the `subagent_message` resume path.
- * Native resume rebuilds the system prompt and tools from the current flags and
- * patches the session to match, so resume must replay them. Model and thinking
+ * Native resume rebuilds the system prompt from the current flags, so resume must replay
+ * them; replaying the tools too keeps the saved selection authoritative. Model and thinking
  * are the launch's alone: the session keeps them, including a later switch.
  * Env vars and cwd are the caller's responsibility.
  */

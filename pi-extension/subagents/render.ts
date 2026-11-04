@@ -1,5 +1,5 @@
 /** How subagents look in the parent: tool calls and results, their messages, and the running-subagents widget. */
-import { keyHint, type ExtensionAPI, type Theme, type ToolRenderers } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, type Theme, type ToolRenderers } from "@earendil-works/pi-coding-agent";
 import { Box, Text, TruncatedText, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { NO_AGENTS } from "./agents.ts";
 import { currentTool, type SessionStats } from "./session.ts";
@@ -299,7 +299,7 @@ export function registerMessageRenderers(pi: ExtensionAPI): void {
               contentLines.push(theme.fg("muted", `… ${totalLines - 5} more lines`));
             }
           }
-          contentLines.push(theme.fg("muted", keyHint("app.tools.expand", "to expand")));
+          contentLines.push(theme.fg("muted", options.keyHint("app.tools.expand", "to expand")));
         }
 
         const box = new Box(1, 1, bgFn);
@@ -342,7 +342,7 @@ export function registerMessageRenderers(pi: ExtensionAPI): void {
       ));
     } else {
       box.addChild(new TruncatedText(theme.fg("dim", (details.question ?? "").split("\n")[0])));
-      box.addChild(new Text(theme.fg("muted", keyHint("app.tools.expand", "to expand")), 0, 0));
+      box.addChild(new Text(theme.fg("muted", options.keyHint("app.tools.expand", "to expand")), 0, 0));
     }
     return box;
   });

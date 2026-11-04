@@ -2595,6 +2595,9 @@ describe("subagent interruption", () => {
   });
 });
 
+/** Pi injects keyHint into renderer options. */
+const keyHint = (_keybinding: string, description: string) => `Ctrl+O ${description}`;
+
 describe("subagent status renderer", () => {
   function createTheme() {
     return {
@@ -2698,7 +2701,7 @@ describe("result and question renderers", () => {
       const expanded = renderer(message, { expanded: true }, theme).render(24);
       assert.ok(plain(expanded).includes(text), `${type} must not lose wrapped text`);
       assert.notEqual(expanded[0], "", "no extra spacer before the box");
-      const collapsed = renderer(message, { expanded: false }, theme).render(24);
+      const collapsed = renderer(message, { expanded: false, keyHint }, theme).render(24);
       assert.ok(plain(collapsed).includes("..."));
       assert.ok(!plain(collapsed).includes("TAIL_MARKER"));
       for (const line of [...expanded, ...collapsed]) assert.ok(visibleWidth(line) <= 24);
@@ -2725,7 +2728,7 @@ describe("result and question renderers", () => {
     // A partial answer does not hide the provider's error, collapsed or expanded.
     const details = { name: "Worker", elapsed: 3, exitCode: 1, errorMessage: "PROVIDER_ERROR", summary: "PARTIAL_ANSWER" };
     for (const expanded of [false, true]) {
-      const text = plain(renderer({ content: "", details }, { expanded }, theme).render(80));
+      const text = plain(renderer({ content: "", details }, { expanded, keyHint }, theme).render(80));
       assert.ok(text.includes("PROVIDER_ERROR") && text.includes("PARTIAL_ANSWER"), text);
     }
   });

@@ -8,7 +8,7 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono), running as named 
 pi install git:github.com/fyang93/pi-herdr-subagents
 ```
 
-Requires **pi 1.1.0+**, **Node.js 22.19+** and **herdr 0.9+**. Start pi inside a herdr pane (`herdr`, then `pi`). The extension installs herdr's Pi integration on first use; restart the parent if prompted. Children load it explicitly, even when settings exclude it, using their config directory's copy or the default `~/.pi/agent` copy. Launch fails if the integration is unavailable: restart recovery needs its session reports. To install it manually, run `herdr integration install pi`.
+Requires **pi 1.5.0+**, **Node.js 22.19+** and **herdr 0.9+**. Start pi inside a herdr pane (`herdr`, then `pi`). The extension installs herdr's Pi integration on first use; restart the parent if prompted. Children load it explicitly, even when settings exclude it, using their config directory's copy or the default `~/.pi/agent` copy. Launch fails if the integration is unavailable: restart recovery needs its session reports. To install it manually, run `herdr integration install pi`.
 
 ## Tools
 
@@ -159,7 +159,7 @@ Child tools widgets toggle with `Ctrl+Alt+O`; completion messages expand with `C
 ```sh
 npm ci --ignore-scripts
 npm test              # type-check, then isolated stub herdr; no inherited subagent environment
-npm run test:runtime  # local Pi 1.1.0, localhost simulated model
+npm run test:runtime  # local Pi 1.5.0, localhost simulated model
 npm run test:e2e      # separate private herdr server; no working panes touched
 ```
 
