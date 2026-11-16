@@ -1030,7 +1030,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const lines = list.map((a) => {
           const badge = a.source === "project" ? " (project)" : "";
           const desc = a.description ? ` — ${a.description}` : "";
-          const model = a.model ? ` [${a.model}]` : "";
+          const resolvedModel = resolveModelEnv(a.model, ctx.cwd);
+          const model = resolvedModel ? ` [${resolvedModel}]` : "";
           return `• ${a.name}${badge}${model}${desc}`;
         });
 
