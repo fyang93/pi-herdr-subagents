@@ -3,7 +3,7 @@ import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
-import { existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { cpSync, existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -37,7 +37,7 @@ async function waitFor(check: () => any, detail: () => string, timeout = 5000) {
   while (Date.now() < until) { const value = check(); if (value) return value; await delay(10); }
   throw new Error(`Timed out: ${detail()}`);
 }
-function start(opts: { tools?: string; toolArgs?: string[]; extensions?: string[]; beforeExtensions?: string[]; autoRetry?: boolean; retryDelay?: number; terminal?: boolean; initialTask?: string; session?: string; model?: string | null; skillNames?: string; configure?: (dir: string, config: string) => void } = {}) {
+function start(opts: { tools?: string; toolArgs?: string[]; extensions?: string[]; beforeExtensions?: string[]; autoRetry?: boolean; retryDelay?: number; terminal?: boolean; initialTask?: string; session?: string; model?: string | null; skillNames?: string; env?: Record<string, string>; configure?: (dir: string, config: string) => void } = {}) {
   requests.length = 0; replies = [];
   const dir = join(root, String(++serial)); mkdirSync(join(dir, "config"), { recursive: true });
   const config = join(dir, "config");
@@ -52,6 +52,7 @@ function start(opts: { tools?: string; toolArgs?: string[]; extensions?: string[
         (key.startsWith("PI_SUBAGENT_") && !["PI_SUBAGENT_SESSION", "PI_SUBAGENT_NAME", "PI_SUBAGENT_AGENT", "PI_SUBAGENT_AUTO_EXIT"].includes(key))) delete (env as any)[key];
   }
   if (opts.skillNames) (env as any).PI_SUBAGENT_SKILLS = opts.skillNames;
+  Object.assign(env, opts.env);
   const args = [...(opts.terminal ? ["--tui-mode", "regular"] : ["--mode", "rpc"]), "--no-themes", "--session", session];
   // null leaves the model to the loadout args or, on resume, to the session.
   if (opts.model !== null) args.push("--model", opts.model ?? "simulation/sim-model");
@@ -213,6 +214,79 @@ test("child notices arriving during a run reach the next model call together, an
   assert.match(seen[1], /NOTICE_ONE[\s\S]*NOTICE_TWO/, "both in the call after the tool");
   assert.doesNotMatch(seen[1], /NOTICE_LAST/);
   assert.match(seen[2], /NOTICE_LAST/, "one more call answers the notice that came with the final reply");
+});
+
+// A child folder that installs this package itself, as a git worktree whose project settings
+// name it does on first start: a second physical copy next to the parent's `-e` one.
+const installedCopy = (dir: string) => {
+  const pkg = join(dir, ".pi", "git", "github.com", "fyang93", "pi-herdr-subagents");
+  mkdirSync(pkg, { recursive: true });
+  cpSync(resolve("package.json"), join(pkg, "package.json"));
+  cpSync(resolve("pi-extension"), join(pkg, "pi-extension"), { recursive: true });
+  writeFileSync(join(dir, ".pi", "settings.json"), JSON.stringify({ packages: ["git:github.com/fyang93/pi-herdr-subagents"] }));
+  mkdirSync(join(dir, ".pi", "agents"));
+  writeFileSync(join(dir, ".pi", "agents", "scout.md"), "---\nname: scout\ndescription: LISTED_SCOUT\n---\nScout.\n");
+  return join(pkg, "pi-extension", "subagents", "index.ts");
+};
+
+async function delegatingChild(launchArgs: string[], env: Record<string, string>, configure?: (dir: string) => void) {
+  const h = start({ toolArgs: launchArgs, env, configure: (dir) => { installedCopy(dir); configure?.(dir); } });
+  await h.command("get_state");
+  replies = [{ tool: "subagents_list" }, { text: "LISTED" }];
+  prompt(h); await h.exited();
+  assert.doesNotMatch(h.diagnostic(), /conflicts with/);
+  assert.deepEqual(h.tools().filter((name: string) => name.startsWith("subagent")).sort(), ["subagent", "subagent_message", "subagents_list"]);
+  assert.match(JSON.stringify(requests.at(-1)?.messages), /LISTED_SCOUT/, "delegation tools still work");
+}
+
+test("a spawning child whose folder installs its own copy of this package loads one, the parent's", async () => {
+  const testApi = (await import("../pi-extension/subagents/index.ts")).__test__;
+  const loadout = { toolAllowlist: testApi.buildSubagentToolAllowlist("read", { grantSpawning: true }), spawnable: ["scout"] };
+  const sessionFile = join(root, "worktree-child.jsonl");
+  const launchArgs: string[] = [];
+  testApi.applyLoadoutToArgs(launchArgs, loadout, sessionFile);
+  assert.ok(launchArgs.includes(resolve("pi-extension/subagents/index.ts")), "the parent's copy keeps delegation independent of the child's folder");
+  const env = testApi.subagentEnv(loadout as any, { name: "worker", sessionFile, autoExit: true });
+  await delegatingChild(launchArgs, { PI_SUBAGENT_EXTENSION: env.PI_SUBAGENT_EXTENSION, PI_SUBAGENT_ALLOWED: env.PI_SUBAGENT_ALLOWED });
+  // Resume rebuilds the same arguments and environment from the saved loadout.
+  const resumeArgs: string[] = [];
+  testApi.applyLoadoutToArgs(resumeArgs, loadout, sessionFile);
+  assert.deepEqual(resumeArgs, launchArgs);
+});
+
+test("a spawning child in the parent's own folder loads the one installed copy", async () => {
+  const testApi = (await import("../pi-extension/subagents/index.ts")).__test__;
+  const own = resolve("pi-extension/subagents/index.ts");
+  const loadout = { toolAllowlist: testApi.buildSubagentToolAllowlist("read", { grantSpawning: true }), spawnable: ["scout"] };
+  const launchArgs: string[] = [];
+  testApi.applyLoadoutToArgs(launchArgs, loadout, join(root, "same-folder.jsonl"));
+  const env: Record<string, string> = { PI_SUBAGENT_ALLOWED: "scout" };
+  // The parent loaded the copy installed in this folder, so it passes that same file.
+  await delegatingChild(launchArgs, env, (dir) => {
+    const copy = join(dir, ".pi", "git", "github.com", "fyang93", "pi-herdr-subagents", "pi-extension", "subagents", "index.ts");
+    launchArgs[launchArgs.indexOf(own)] = env.PI_SUBAGENT_EXTENSION = copy;
+  });
+});
+
+test("a Pi started by hand in a child's folder and environment keeps its folder's copy", async () => {
+  // Left over in the pane's shell: the variable names the parent's copy, but this launch has no -e for it.
+  await delegatingChild(["--approve", "--tools", "read,ask_question,subagent,subagent_message,subagents_list"],
+    { PI_SUBAGENT_EXTENSION: resolve("pi-extension/subagents/index.ts"), PI_SUBAGENT_ALLOWED: "scout" });
+});
+
+test("a child without delegation loads its folder's copy alone", async () => {
+  const testApi = (await import("../pi-extension/subagents/index.ts")).__test__;
+  const loadout = { toolAllowlist: testApi.buildSubagentToolAllowlist("read"), spawnable: null };
+  const sessionFile = join(root, "no-delegation.jsonl");
+  const launchArgs: string[] = [];
+  testApi.applyLoadoutToArgs(launchArgs, loadout, sessionFile);
+  assert.equal(launchArgs.includes("-e"), false);
+  const env = testApi.subagentEnv(loadout as any, { name: "scout", sessionFile, autoExit: true });
+  assert.equal(env.PI_SUBAGENT_EXTENSION, "");
+  const h = start({ toolArgs: launchArgs, env: { PI_SUBAGENT_EXTENSION: env.PI_SUBAGENT_EXTENSION }, configure: installedCopy });
+  await h.command("get_state"); prompt(h); await h.exited();
+  assert.doesNotMatch(h.diagnostic(), /conflicts with/);
+  assert.deepEqual(h.tools().sort(), ["ask_question", "read"]);
 });
 
 test("YAML quoted/list tools become a real CLI loadout", async () => {

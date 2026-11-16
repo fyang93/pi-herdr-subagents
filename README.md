@@ -141,6 +141,8 @@ The tool's `cwd` is relative to the caller; frontmatter `cwd` is relative to the
 
 To run several workers that edit the same repository in parallel, give each its own `git worktree` and pass it as `cwd`, so their changes do not collide.
 
+A child that may spawn loads its parent's copy of this extension with `-e`. Another copy its folder installs, such as a worktree's project package, stays inert in that launch or resume, so the tools are registered once. A Pi started by hand in the child's folder loads its own copy as usual. Every copy that may load, the parent's and those the child's folders install, must include this behaviour: an older installed or cached copy still registers its tools and conflicts. Update the package with `pi update git:github.com/fyang93/pi-herdr-subagents` from each affected project directory; plain `pi update` updates Pi itself.
+
 ## Tool access and extensions
 
 Tool restrictions are optional and **not a security sandbox**. `tools` becomes one `--tools` selection; required child tools use the same form. Without it, Pi's configured defaults apply even when spawning is allowed. Unknown allowlist names are ignored. `-name` removes a default tool, but extensions that register active tools (such as web or chat-push tools) remain available; use plain names to exclude them.

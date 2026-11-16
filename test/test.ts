@@ -2247,6 +2247,8 @@ describe("tool registration", () => {
         PI_SUBAGENT_NAME: name,
         PI_SUBAGENT_SESSION: sessionFile,
         PI_SUBAGENT_ALLOWED: "scout",
+        // The resumed child loads only the parent's copy of this extension.
+        PI_SUBAGENT_EXTENSION: fileURLToPath(new URL("../pi-extension/subagents/index.ts", import.meta.url)),
         PI_SUBAGENT_AGENT: "profile-no-longer-present",
         PI_CODING_AGENT_DIR: agentDir,
         PI_SUBAGENT_AUTO_EXIT: "1",

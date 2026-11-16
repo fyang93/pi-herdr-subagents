@@ -5,7 +5,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import {
   buildSubagentToolAllowlist,
   discoverAgentDefinitions,
@@ -55,8 +55,9 @@ import {
   type SubagentLoadout,
 } from "./session.ts";
 
-/** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
-const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
+/** This file, and its directory `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
+const EXTENSION_FILE = fileURLToPath(import.meta.url);
+const SUBAGENTS_DIR = dirname(EXTENSION_FILE);
 const launchDeps = { startAgent, promptAgent, findSessionAgent, watchSubagent };
 
 // Survive /reload: abort watchers from the previous module load.
@@ -337,8 +338,24 @@ function applyLoadoutToArgs(
   }
 
   if (loadout.spawnable?.length) {
-    args.push("-e", fileURLToPath(import.meta.url));
+    args.push("-e", EXTENSION_FILE);
   }
+}
+
+/** Whether two paths name the same file, as Pi compares extension paths: after resolving symlinks. */
+function sameFile(a: string, b: string): boolean {
+  const real = (path: string) => { try { return realpathSync(path); } catch { return resolve(path); } };
+  return real(a) === real(b);
+}
+
+/**
+ * Whether this extension should stay inert: this process is a child launched with another copy of
+ * it via `-e` (see applyLoadoutToArgs, subagentEnv). The variable alone is not enough: a Pi
+ * started by hand from a child's shell inherits it, without loading that copy.
+ */
+function anotherCopyLoaded(argv = process.argv, explicit = process.env.PI_SUBAGENT_EXTENSION): boolean {
+  if (!explicit || sameFile(explicit, EXTENSION_FILE)) return false;
+  return argv.some((arg, i) => (arg === "-e" || arg === "--extension") && i + 1 < argv.length && sameFile(argv[i + 1], explicit));
 }
 
 const shellQuote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`;
@@ -504,6 +521,7 @@ export const __test__ = {
   resolveModelEnv,
   buildSubagentToolAllowlist,
   applyLoadoutToArgs,
+  subagentEnv,
   uniqueRunningName,
   startingSessions,
   launchDeps,
@@ -697,6 +715,8 @@ function startTracked(launch: AgentLaunch, message: string, cancel?: AbortSignal
 function subagentEnv(loadout: SubagentLoadout, opts: { name: string; sessionFile: string; autoExit: boolean }): Record<string, string> {
   const env: Record<string, string> = {
     PI_SUBAGENT_ALLOWED: loadout.spawnable?.join(",") ?? "",
+    // The copy of this extension a spawning child loads with `-e`, see applyLoadoutToArgs.
+    PI_SUBAGENT_EXTENSION: loadout.spawnable?.length ? EXTENSION_FILE : "",
     PI_SUBAGENT_NAME: opts.name,
     PI_SUBAGENT_SESSION: opts.sessionFile,
   };
@@ -893,6 +913,10 @@ async function watchSubagent(
 }
 
 export default function subagentsExtension(pi: ExtensionAPI) {
+  // A spawning child loads its parent's copy with `-e`. Its folder may install another copy of
+  // this package, say a git worktree with its own project settings, which Pi loads too: Pi
+  // dedupes extensions by path only. That copy stays inert, so their tools do not conflict.
+  if (anotherCopyLoaded()) return;
   latestPi = pi;
   pi.on("session_start", (event, ctx) => {
     latestCtx = ctx;
