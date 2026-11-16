@@ -86,6 +86,11 @@ export interface SubagentLoadout {
   cwd: string | null;
   /** PI_CODING_AGENT_DIR the subagent resolved config/extensions from, or null. */
   agentDir: string | null;
+  /**
+   * A Claude Code subagent's session id and model. Its session file is then only the base
+   * of its sidecars: Claude keeps the transcript, and resumes it by this id.
+   */
+  claude?: { session: string; model: string | null };
 }
 
 /** Path of the loadout sidecar written next to a subagent session file. */
@@ -125,7 +130,8 @@ export function readSubagentLoadout(sessionFile: string): SubagentLoadout | null
       ["agent", "toolAllowlist", "identity", "cwd", "agentDir"].every((key) => isNullableString(parsed[key])) &&
       (parsed.systemPromptMode === null || parsed.systemPromptMode === "append" || parsed.systemPromptMode === "replace") &&
       (parsed.spawnable === null || (Array.isArray(parsed.spawnable) && parsed.spawnable.every((name: unknown) => typeof name === "string"))) &&
-      (parsed.interactive === undefined || typeof parsed.interactive === "boolean");
+      (parsed.interactive === undefined || typeof parsed.interactive === "boolean") &&
+      (parsed.claude === undefined || (typeof parsed.claude?.session === "string" && isNullableString(parsed.claude.model)));
     return valid ? (parsed as SubagentLoadout) : null;
   } catch {
     return null;

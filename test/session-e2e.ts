@@ -91,7 +91,7 @@ function watch(agent: string, file: string) {
 async function launch(name: string, options: { autoExit?: boolean; prompt?: string; args?: string[]; sessionFile?: string } = {}) {
   const file = options.sessionFile ?? join(project, `${name}.jsonl`);
   const started = await startAgent({
-    name, cwd: project,
+    name, kind: "pi", cwd: project,
     env: { HERDR_BIN_PATH: join(binDir, "herdr-private"), PI_SUBAGENT_SESSION: file, PI_SUBAGENT_NAME: name, PI_SUBAGENT_AGENT: "session-e2e", PI_SUBAGENT_AUTO_EXIT: options.autoExit === false ? "0" : "1" },
     args: ["--session", file, "--offline", "--no-mcp", "--no-themes", "--no-approve",
       "-e", integration, "-e", fixture, "-e", done, "--model", "session-e2e/scripted", "--thinking", "off", "--tools", "session_e2e_gate", ...(options.args ?? [])],
@@ -383,7 +383,7 @@ export default function(pi:any) {
   // Control: a bare resume really loses the identity, so the checks above have teeth. Since
   // Pi 1.3 it restores the session's active tools.
   const bare = await startAgent({
-    name: "bare-resume", cwd: project,
+    name: "bare-resume", kind: "pi", cwd: project,
     env: { PI_SUBAGENT_SESSION: childFile, PI_SUBAGENT_NAME: "bare-resume", PI_SUBAGENT_AUTO_EXIT: "1" },
     args: ["--session", childFile, "-e", done],
   });

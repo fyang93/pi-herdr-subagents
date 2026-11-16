@@ -27,6 +27,8 @@ interface AgentDefaults {
   cwd?: string;
   body?: string;
   disableModelInvocation?: boolean;
+  /** `claude` runs the agent in Claude Code instead of pi. */
+  cli?: "claude";
 }
 
 type AgentSource = "global" | "project";
@@ -122,6 +124,7 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
     cwd: field("cwd"),
     body: body.trim() || undefined,
     disableModelInvocation: frontmatter["disable-model-invocation"] === true,
+    cli: oneOf(field("cli"), ["claude"] as const),
   };
 }
 

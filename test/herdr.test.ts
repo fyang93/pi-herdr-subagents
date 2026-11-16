@@ -43,7 +43,7 @@ const layout = (panes: [string, number, number][], zoomed = false) => reply("lay
 });
 // The pane split or tab created for the last start.
 const opening = () => calls().find(c => c.slice(0, 2).join(" ") === "pane split" || c.slice(0, 2).join(" ") === "tab create")!;
-const launch = { name: "Scout", args: ["--session", "/s s.jsonl"], env: { PI_SUBAGENT_NAME: "Scout" }, cwd: "/repo" };
+const launch = { name: "Scout", kind: "pi" as const, args: ["--session", "/s s.jsonl"], env: { PI_SUBAGENT_NAME: "Scout" }, cwd: "/repo" };
 
 it("starts a named agent in an unfocused split of the parent's own pane, else a background tab", async () => {
   writeFileSync(log, "");
@@ -196,15 +196,16 @@ it("refuses a pi argument with a line break before opening a pane, as herdr woul
   assert.deepEqual(calls(), [], "no pane was opened");
 });
 
-it("finds the live pi agent running a session file", async () => {
+it("finds the live agent running a pi session file or a Claude session id", async () => {
   const session = (value: string, kind = "path") => ({ agent: "pi", kind, source: "herdr:pi", value });
   reply("list", { result: { agents: [
-    { agent: "claude", agent_session: session("/s/a.jsonl", "id"), pane_id: "w1:p2" }, // not a pi session path
     { agent: "pi", agent_session: session("/s/a.jsonl"), pane_id: "w1:p3" },            // unnamed: not ours
-    { agent: "pi", name: "worker", agent_session: session("/s/a.jsonl"), pane_id: "w1:p4" },
+    { agent: "pi", name: "worker", agent_session: session("/s/x/../a.jsonl"), pane_id: "w1:p4" },
+    { agent: "claude", name: "reviewer", agent_session: session("c0ffee", "id"), pane_id: "w1:p5" },
   ] } });
   try {
     assert.deepEqual(await herdr.findSessionAgent("/s/a.jsonl"), { agent: "worker", pane: "w1:p4" });
+    assert.deepEqual(await herdr.findSessionAgent("c0ffee"), { agent: "reviewer", pane: "w1:p5" });
     assert.equal(await herdr.findSessionAgent("/s/b.jsonl"), null);
   } finally {
     rmSync(join(dir, "list"));

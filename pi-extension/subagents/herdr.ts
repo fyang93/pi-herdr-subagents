@@ -3,7 +3,7 @@
  * unfocused split of the parent's pane or of a subagent pane it opened, in the parent's
  * tab or a background tab of its agents (a new background tab when those are too small),
  * started with `herdr agent start` so it shows in herdr's agents sidebar, with
- * state reported by herdr's pi integration. Pane ids look like `w1:p2`.
+ * state reported by herdr's pi (or Claude) integration. Pane ids look like `w1:p2`.
  */
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -98,6 +98,7 @@ export function agentName(display: string, taken: Set<string>): string {
 export interface AgentLaunch {
   /** Display name; the herdr agent name is derived from it. */
   name: string;
+  kind: "pi" | "claude";
   args: string[];
   env: Record<string, string>;
   cwd: string;
@@ -169,7 +170,7 @@ async function waitForShell(surface: string, signal?: AbortSignal, timeout = 10_
 }
 
 /**
- * Open a pane and start the agent, waiting for Pi to be ready.
+ * Open a pane and start the agent, waiting for it to be ready.
  * Every failure after the pane exists closes it, and so does `signal`: the caller
  * never learns the pane, so nothing else would.
  */
@@ -177,7 +178,7 @@ export async function startAgent(launch: AgentLaunch, signal?: AbortSignal): Pro
   if (!isHerdrAvailable()) throw new Error(`herdr is not available. ${herdrSetupHint()}`);
   // herdr refuses agent arguments it cannot encode for the pane's shell, such as line breaks.
   const unsafe = launch.args.find((arg) => /[\r\n]/.test(arg));
-  if (unsafe !== undefined) throw new Error(`A pi argument for "${launch.name}" spans lines, which herdr cannot pass: ${JSON.stringify(unsafe.slice(0, 80))}`);
+  if (unsafe !== undefined) throw new Error(`A ${launch.kind} argument for "${launch.name}" spans lines, which herdr cannot pass: ${JSON.stringify(unsafe.slice(0, 80))}`);
   const opening = creationQueue.then(() => openPane(launch, signal));
   creationQueue = opening.catch(() => {});
   const surface = await opening;
@@ -189,13 +190,14 @@ export async function startAgent(launch: AgentLaunch, signal?: AbortSignal): Pro
       const taken = new Set<string>(((await herdrAsync(["agent", "list"], { signal }))?.agents ?? []).map((a: any) => a.name).filter(Boolean));
       agent = agentName(launch.name, taken);
       try {
-        await herdrAsync(["agent", "start", agent, "--kind", "pi", "--pane", surface, "--timeout", "60000", "--", ...launch.args], { signal, timeout: 70_000 });
+        await herdrAsync(["agent", "start", agent, "--kind", launch.kind, "--pane", surface, "--timeout", "60000", "--", ...launch.args], { signal, timeout: 70_000 });
         break;
       } catch (error) {
         // Another parent took the name meanwhile; nothing started, so pick again once.
         if (error instanceof HerdrError && error.code === "agent_name_taken" && attempt === 0) continue;
         if (error instanceof HerdrError && error.code === "agent_not_ready") {
-          throw new Error(`pi did not become ready; it may be waiting at a startup dialog in ${launch.cwd}. Answer it by running pi there once, then spawn again.`);
+          const command = launch.kind === "claude" ? "claude --dangerously-skip-permissions" : "pi";
+          throw new Error(`${launch.kind} did not become ready; it may be waiting at a startup dialog in ${launch.cwd}. Answer it by running \`${command}\` there once, then spawn again.`);
         }
         throw error;
       }
@@ -213,6 +215,11 @@ export async function startAgent(launch: AgentLaunch, signal?: AbortSignal): Pro
 /** Recent output with soft wraps joined. */
 export async function readScreen(surface: string, lines = 50): Promise<string> {
   return (await herdrAsync(["pane", "read", surface, "--source", "recent-unwrapped", "--lines", String(Math.max(1, lines))], { raw: true })).trimEnd();
+}
+
+/** Submit a prompt to a Claude agent, which queues it while a turn runs. */
+export async function promptAgent(agent: string, text: string, signal?: AbortSignal): Promise<void> {
+  await herdrAsync(["agent", "prompt", agent, text], { signal });
 }
 
 export async function closeSurface(surface: string): Promise<void> {
@@ -234,6 +241,13 @@ export async function closePane(surface: string, close: (surface: string) => voi
 
 export type AgentStatus = "idle" | "working" | "blocked" | "done" | "unknown";
 
+/** The session herdr reports for an agent: a resolved transcript path (pi) or a session id (Claude). */
+function reportedSession(agent: any): string | null {
+  const session = agent?.agent_session;
+  if (typeof session?.value !== "string") return null;
+  return session.kind === "path" ? resolve(session.value) : session.value;
+}
+
 /**
  * A live agent's state and current pane, by herdr agent name: the name follows the
  * agent when its pane moves, a pane id does not. "exited" once herdr no longer
@@ -242,16 +256,17 @@ export type AgentStatus = "idle" | "working" | "blocked" | "done" | "unknown";
 export async function agentStatus(agent: string, signal?: AbortSignal): Promise<{ status: AgentStatus; pane: string; session: string | null } | "exited" | null> {
   try {
     const result = (await herdrAsync(["agent", "get", agent], { signal })).agent;
-    return { status: result.agent_status ?? "unknown", pane: result.pane_id, session: result.agent_session?.kind === "path" && typeof result.agent_session.value === "string" ? result.agent_session.value : null };
+    return { status: result.agent_status ?? "unknown", pane: result.pane_id, session: reportedSession(result) };
   } catch (error) {
     return error instanceof HerdrError && error.code === "agent_not_found" ? "exited" : null;
   }
 }
 
-/** The live pi agent running a session file, by herdr's session report; null when none is. */
-export async function findSessionAgent(sessionFile: string): Promise<{ agent: string; pane: string } | null> {
+/** The live agent running a session (a pi session file or a Claude session id), by herdr's session report; null when none is. */
+export async function findSessionAgent(session: string): Promise<{ agent: string; pane: string } | null> {
+  const key = session.startsWith("/") ? resolve(session) : session;
   const agents: any[] = (await herdrAsync(["agent", "list"]))?.agents ?? [];
-  const live = agents.find((a) => a.name && a.agent_session?.kind === "path" && typeof a.agent_session.value === "string" && resolve(a.agent_session.value) === resolve(sessionFile));
+  const live = agents.find((a) => a.name && reportedSession(a) === key);
   return live ? { agent: live.name, pane: live.pane_id } : null;
 }
 
@@ -366,9 +381,11 @@ function readExitSidecar(sessionFile?: string): ExitResult | undefined {
 export async function waitForExit(
   agent: string,
   signal: AbortSignal,
-  options: { interval: number; sessionFile?: string; exitGrace?: number; onTick?: (status: AgentStatus | null, pane?: string) => void },
+  options: { interval: number; sessionFile?: string; session?: string; exitGrace?: number; onTick?: (status: AgentStatus | null, pane?: string) => void },
 ): Promise<ExitResult> {
   const aborted = () => new Error("Aborted while waiting for subagent to finish");
+  // The session the agent must still report: a Claude session id, else the pi session file.
+  const expected = options.session ?? (options.sessionFile && resolve(options.sessionFile));
   let exitedBefore = false;
   let markerSince: number | undefined;
   let found: Awaited<ReturnType<typeof agentStatus>> = null;
@@ -387,7 +404,7 @@ export async function waitForExit(
       if (check || !live || exitedBefore || marker || Date.now() - lastCheck >= 15_000) {
         check = false;
         found = await agentStatus(agent, signal);
-        if (found && found !== "exited" && options.sessionFile && found.session && resolve(found.session) !== resolve(options.sessionFile)) {
+        if (found && found !== "exited" && expected && found.session && found.session !== expected) {
           return {
             ...(marker ?? readExitSidecar(options.sessionFile) ?? {
               reason: "interrupted" as const, exitCode: 1, errorMessage: `Agent ${agent} now reports a different session.`,

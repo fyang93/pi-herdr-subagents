@@ -91,6 +91,7 @@ You are a specialized agent that does X...
 | `interactive` | boolean | Suppress blocked-dialog notifications when true; default is the inverse of `auto-exit`. Set explicitly to override |
 | `cwd` | string | Default working directory; see [Role folders](#role-folders) |
 | `disable-model-invocation` | boolean | Hide from `subagents_list`, but allow explicit spawning |
+| `cli` | string | `claude` runs the agent in Claude Code instead of pi; see [Claude Code agents](#claude-code-agents) |
 
 ### Auto-exit
 
@@ -98,11 +99,19 @@ With `auto-exit: true`, write a final answer and stop; there is no done tool. Ex
 
 Submitted human or orchestrator input is more work and can finish normally. Escape/abort, an unsent editor draft, an unanswered `ask_question`, or unfinished child sub-agents keep the session open. A later submitted task can complete normally. Terminal provider errors exit only after settlement, not during transient retries.
 
+### Claude Code agents
+
+With `cli: claude`, the child runs `claude --dangerously-skip-permissions` in its pane as a herdr agent, with the task submitted as its first prompt. `model` takes Claude Code's names (`sonnet`, `opus`, `claude-sonnet-4-5`; an `anthropic/` prefix is dropped) and is never inherited from the parent; omitted uses Claude Code's default. `system-prompt` passes the body with `--append-system-prompt-file` or `--system-prompt-file`. Claude Code loads its own settings, `CLAUDE.md`, skills and MCP servers from `cwd`; `tools`, `thinking`, `skills`, `subagent_agents` and `session-mode` do not apply, and the child has no `ask_question`.
+
+Hooks passed with `--settings` hand Claude's final answer to the parent: with `auto-exit: true` at its first Stop, otherwise when the user leaves Claude. Escape leaves the turn unfinished and the pane open. `subagent_message` submits to a running child, which Claude queues during a turn, and resumes a finished one with `claude --resume`, keeping its session id. Usage stats are not reported.
+
+Claude Code asks once to trust a folder and once to accept bypass-permissions mode; a launch waiting at either fails with a hint to run `claude --dangerously-skip-permissions` there once. Install herdr's Claude integration (`herdr integration install claude`) so herdr reports the child's state and session.
+
 ## Example agents
 
-Optional profiles live in [`examples/agents/`](examples/agents/). They are not discovered automatically. Review their models, tools and instructions before copying the profiles you want into project `.pi/agents/` or global `~/.pi/agent/agents/` (or `$PI_CODING_AGENT_DIR/agents/`). The worker example delegates to scout and researcher, so install those too if you retain its delegation policy.
+Optional profiles live in [`examples/agents/`](examples/agents/). They are not discovered automatically. Review their models, tools and instructions before copying the profiles you want into project `.pi/agents/` or global `~/.pi/agent/agents/` (or `$PI_CODING_AGENT_DIR/agents/`). The worker example delegates to scout and researcher, so install those too if you retain its delegation policy. The claude example runs in Claude Code (see [Claude Code agents](#claude-code-agents)).
 
-From a checkout of this repository, to install all three into a project without overwriting existing profiles:
+From a checkout of this repository, to install them all into a project without overwriting existing profiles:
 
 ```sh
 mkdir -p /path/to/project/.pi/agents
@@ -116,8 +125,9 @@ cp -n examples/agents/*.md /path/to/project/.pi/agents/
 | **scout** | `openai/gpt-5.6-luna` | `read,grep,find,ls,codemode` | Fast read-only codebase recon |
 | **researcher** | `openai/gpt-5.6-luna` | Defaults − `edit`, `write` + `codemode` | Web research, synthesized into a sourced brief |
 | **worker** | parent's current model | Defaults + `codemode` + spawning | General implementer; may spawn `scout` and `researcher` |
+| **claude** | `opus` (Claude Code) | Claude Code's own | Self-driving investigation, experimentation and code exploration |
 
-All three use `auto-exit: true` and `system-prompt: append`.
+All four use `auto-exit: true` and `system-prompt: append`.
 
 ## Role folders
 

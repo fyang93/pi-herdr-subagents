@@ -21,6 +21,7 @@ import {
   ensurePiIntegration,
   piIntegrationPath,
   startAgent,
+  promptAgent,
   findSessionAgent,
   type AgentLaunch,
   waitForExit,
@@ -56,7 +57,7 @@ import {
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
-const launchDeps = { startAgent, findSessionAgent, watchSubagent };
+const launchDeps = { startAgent, promptAgent, findSessionAgent, watchSubagent };
 
 // Survive /reload: abort watchers from the previous module load.
 // /reload re-imports this file, giving fresh module-level state, but closures from
@@ -213,6 +214,8 @@ interface RunningSubagent {
   herdrName: string;
   startTime: number;
   sessionFile: string;
+  /** A Claude subagent's session id; its session file is then only the base of its markers. */
+  claudeSession?: string;
   abortController?: AbortController;
   /**
    * When true, a blocked agent does not wake the parent: the user drives the
@@ -227,6 +230,10 @@ interface RunningSubagent {
   questionCleanup?: Set<string>;
   noticeCleanup?: Set<string>;
 }
+
+/** The session herdr must report for a subagent's agent: its Claude session id, else its session file. */
+const ownSession = (running: Pick<RunningSubagent, "claudeSession" | "sessionFile">) =>
+  running.claudeSession ?? resolve(running.sessionFile);
 
 /** All currently running subagents, keyed by id. */
 const runningSubagents = new Map<string, RunningSubagent>();
@@ -334,6 +341,33 @@ function applyLoadoutToArgs(
   }
 }
 
+const shellQuote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`;
+
+/**
+ * Claude Code arguments for a Claude subagent's launch or resume: its session, model and
+ * identity, and the hooks that write its `.exit` marker (see claude-hook.ts).
+ */
+function claudeArgs(loadout: SubagentLoadout, sessionFile: string, opts: { autoExit: boolean; resume: boolean }): string[] {
+  const { session, model } = loadout.claude!;
+  const args = [opts.resume ? "--resume" : "--session-id", session, "--dangerously-skip-permissions"];
+  if (model) args.push("--model", model);
+  if (loadout.identity && loadout.systemPromptMode) {
+    // Passed as a file: herdr refuses agent arguments with line breaks.
+    const identityFile = `${sessionFile}.identity.md`;
+    writeFileSync(identityFile, loadout.identity, { encoding: "utf8", mode: 0o600 });
+    args.push(loadout.systemPromptMode === "replace" ? "--system-prompt-file" : "--append-system-prompt-file", identityFile);
+  }
+  const hook = (...hookArgs: string[]) => [{ hooks: [{
+    type: "command",
+    command: [process.execPath, join(SUBAGENTS_DIR, "claude-hook.ts"), ...hookArgs, sessionFile].map(shellQuote).join(" "),
+  }] }];
+  const hooks = opts.autoExit
+    ? { Stop: hook("stop", "auto") }
+    : { Stop: hook("stop", "keep"), SessionEnd: hook("end", "keep") };
+  args.push("--settings", JSON.stringify({ hooks }));
+  return args;
+}
+
 /**
  * Arguments that load herdr's pi integration into a child. It reports the child's state and
  * session, which supervision and restart recovery rely on — without it a restarted parent
@@ -402,6 +436,12 @@ async function steerLive(running: RunningSubagent, message: string, signal?: Abo
     while (!reported) await delay(100, undefined, { signal });
     return null;
   }
+  if (running.claudeSession) {
+    // Claude queues a prompt submitted during a turn.
+    try { await launchDeps.promptAgent(running.herdrName, message, signal); }
+    catch (error: any) { return fail(`Failed to deliver message to subagent "${running.name}": ${error?.message ?? String(error)}`); }
+    return steeredResult(running);
+  }
   let file: string;
   try { file = publishInboxMessage(running.sessionFile, message); }
   catch (error: any) { return fail(`Failed to deliver message to subagent "${running.name}": ${error?.message ?? String(error)}`); }
@@ -450,7 +490,7 @@ const PREPARE_GRACE = 30_000;
 
 /** Clear the previous run's markers and inbox. */
 function clearStaleMarkers(sessionFile: string): void {
-  for (const marker of [".exit", ".exiting", ".paused", ".ask", ".inbox"]) rmSync(sessionFile + marker, { recursive: true, force: true });
+  for (const marker of [".exit", ".exiting", ".paused", ".ask", ".inbox", ".answer"]) rmSync(sessionFile + marker, { recursive: true, force: true });
 }
 
 /** A session file's entries, parsed leniently as Pi does; none when it cannot be read. */
@@ -498,7 +538,11 @@ async function launchSubagent(
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
   const id = randomUUID().slice(0, 8);
-  const effectiveModel = params.model ?? resolveModelEnv(def.model, ctx.cwd) ?? (ctx.model && `${ctx.model.provider}/${ctx.model.id}`);
+  const claude = def.cli === "claude";
+  // Claude Code names models its own way (sonnet, claude-opus-4-1), and never inherits the parent's.
+  const effectiveModel = claude
+    ? (params.model ?? resolveModelEnv(def.model, ctx.cwd))?.replace(/^anthropic\//, "")
+    : params.model ?? resolveModelEnv(def.model, ctx.cwd) ?? (ctx.model && `${ctx.model.provider}/${ctx.model.id}`);
   const thinking = def.thinking ?? opts.thinking;
   const interactive = def.interactive ?? !def.autoExit;
   const cwd = params.cwd ? resolve(ctx.cwd, params.cwd) : def.cwd ? resolve(getAgentDir(), def.cwd) : ctx.cwd;
@@ -509,9 +553,11 @@ async function launchSubagent(
   if (!sessionFile) throw new Error("No session file");
   const sessionDir = getDefaultSessionDirFor(cwd, agentDir);
 
-  // Each launch has its own session path, including simultaneous launches.
+  // Each launch has its own session path, including simultaneous launches. A Claude
+  // subagent's is only the base of its sidecars, named after the Claude session.
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 23) + "Z";
-  const subagentSessionFile = join(sessionDir, `${timestamp}_${randomUUID()}.jsonl`);
+  const sessionUuid = randomUUID();
+  const subagentSessionFile = join(sessionDir, `${timestamp}_${sessionUuid}.${claude ? "claude" : "jsonl"}`);
   // Persist name → session before any await: it reserves the name against parallel spawns,
   // and lets subagent_message({ name }) resume this subagent after it finishes, even after
   // a pi restart. A failed write fails the launch rather than leave an unaddressable child.
@@ -521,7 +567,8 @@ async function launchSubagent(
   startingSessions.add(sessionKey);
   let surface: string, herdrName: string;
   try {
-    const sessionMode = def.sessionMode ?? "standalone";
+    // A Claude session cannot be seeded from the parent's pi conversation.
+    const sessionMode = claude ? "standalone" : def.sessionMode ?? "standalone";
     if (sessionMode !== "standalone") {
       seedSubagentSessionFile({
         mode: sessionMode,
@@ -549,30 +596,38 @@ async function launchSubagent(
       ? `${roleBlock}\n\n${params.task}`.trimStart()
       : `${roleBlock}\n\n${modeHint}\n\n${params.task}\n\n${summaryInstruction}`;
 
-    const args = ["--session", subagentSessionFile, "-e", join(SUBAGENTS_DIR, "subagent-done.ts")];
-    // Only the first launch picks them: the session keeps them, including a later switch.
-    if (effectiveModel) args.push("--model", effectiveModel);
-    if (thinking) args.push("--thinking", thinking);
     // Snapshot the loadout so resume preserves identity and tool restrictions.
     const loadout: SubagentLoadout = {
       agent: params.agent,
-      toolAllowlist: buildSubagentToolAllowlist(def.tools, { grantSpawning: !!def.subagentAgents?.length }),
+      // pi's tools, skills, thinking and delegation do not apply to Claude Code.
+      toolAllowlist: claude ? null : buildSubagentToolAllowlist(def.tools, { grantSpawning: !!def.subagentAgents?.length }),
       systemPromptMode: systemPromptMode ?? null,
       identity: identityInSystemPrompt ? identity : null,
-      spawnable: def.subagentAgents ?? null,
+      spawnable: claude ? null : def.subagentAgents ?? null,
       interactive,
       cwd,
       // Freeze the config dir so resume never follows a parent's later switch.
       agentDir,
+      ...(claude ? { claude: { session: sessionUuid, model: effectiveModel ?? null } } : {}),
     };
     writeSubagentLoadout(subagentSessionFile, loadout);
-    applyLoadoutToArgs(args, loadout, subagentSessionFile);
-    args.push(...await integrationArgs(agentDir));
-    const env = subagentEnv(loadout, { name: params.name, sessionFile: subagentSessionFile, autoExit: !!def.autoExit });
-    // The child's helper loads them all with the task: one run, none started on a skill alone.
-    if (def.skills) env.PI_SUBAGENT_SKILLS = def.skills;
+    let launch: AgentLaunch;
+    if (claude) {
+      launch = { name: params.name, kind: "claude", args: claudeArgs(loadout, subagentSessionFile, { autoExit: !!def.autoExit, resume: false }), env: {}, cwd };
+    } else {
+      const args = ["--session", subagentSessionFile, "-e", join(SUBAGENTS_DIR, "subagent-done.ts")];
+      // Only the first launch picks them: the session keeps them, including a later switch.
+      if (effectiveModel) args.push("--model", effectiveModel);
+      if (thinking) args.push("--thinking", thinking);
+      applyLoadoutToArgs(args, loadout, subagentSessionFile);
+      args.push(...await integrationArgs(agentDir));
+      const env = subagentEnv(loadout, { name: params.name, sessionFile: subagentSessionFile, autoExit: !!def.autoExit });
+      // The child's helper loads them all with the task: one run, none started on a skill alone.
+      if (def.skills) env.PI_SUBAGENT_SKILLS = def.skills;
+      launch = { name: params.name, kind: "pi", args, env, cwd };
+    }
     clearStaleMarkers(subagentSessionFile);
-    ({ surface, agent: herdrName } = await startTracked({ name: params.name, args, env, cwd }, fullTask, opts.signal));
+    ({ surface, agent: herdrName } = await startTracked(launch, fullTask, opts.signal));
   } finally {
     startingSessions.delete(sessionKey);
   }
@@ -586,6 +641,7 @@ async function launchSubagent(
     herdrName,
     startTime,
     sessionFile: subagentSessionFile,
+    ...(claude ? { claudeSession: sessionUuid } : {}),
     interactive,
   };
   runningSubagents.set(id, running);
@@ -616,7 +672,8 @@ function track<T>(work: Promise<T>): Promise<T> {
 }
 
 /**
- * Start an agent, then publish its task. A failed publication, shutdown or cancellation
+ * Start an agent, then hand it its task: through a pi child's inbox, or as a prompt to Claude.
+ * A failed hand-over, shutdown or cancellation
  * closes the pane rather than leave it untracked.
  */
 function startTracked(launch: AgentLaunch, message: string, cancel?: AbortSignal): Promise<{ surface: string; agent: string }> {
@@ -626,7 +683,8 @@ function startTracked(launch: AgentLaunch, message: string, cancel?: AbortSignal
     const started = await launchDeps.startAgent(launch, signal);
     try {
       signal.throwIfAborted();
-      publishInboxMessage(launch.env.PI_SUBAGENT_SESSION, message);
+      if (launch.kind === "claude") await launchDeps.promptAgent(started.agent, message, signal);
+      else publishInboxMessage(launch.env.PI_SUBAGENT_SESSION, message);
     } catch (error) {
       await closeOrReport(launch.name, started.surface);
       throw error;
@@ -765,6 +823,9 @@ async function watchSubagent(
     const result = await (deps.wait ?? waitForExit)(running.herdrName, AbortSignal.any([signal, getModuleAbortSignal()]), {
       interval: 1000,
       sessionFile,
+      session: ownSession(running),
+      // Claude stays open after its final answer: the marker is the end.
+      ...(running.claudeSession ? { exitGrace: 0 } : {}),
       onTick(status, pane) {
         if (pane) running.surface = pane;  // the pane may have moved
         try { deliverPendingQuestion(running); }
@@ -793,7 +854,7 @@ async function watchSubagent(
     const stats = existsSync(sessionFile) ? summarizeSessionStats(readSession(sessionFile)) : null;
     // A stale context (session replaced meanwhile) throws; the gauge then shows tokens only.
     try { if (stats?.provider && stats.model) stats.contextWindow = latestCtx?.modelRegistry.find(stats.provider, stats.model)?.contextWindow; } catch {}
-    const subagentSessionId = getSessionId(sessionFile);
+    const subagentSessionId = running.claudeSession ?? getSessionId(sessionFile);
 
     // A completion receipt does not grant ownership of a pane now hosting another session.
     if (!preservePane) await closeOrReport(running.name, running.surface, deps.close);
@@ -819,7 +880,7 @@ async function watchSubagent(
       // the pane where the agent is now, and never one now hosting another session.
       const found = await (deps.status ?? agentStatus)(running.herdrName);
       const live = found !== null && found !== "exited";
-      if (!live || !found.session || resolve(found.session) === resolve(sessionFile)) {
+      if (!live || !found.session || found.session === ownSession(running)) {
         await closeOrReport(running.name, live ? found.pane : running.surface, deps.close);
       }
     }
@@ -1102,25 +1163,28 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           const steered = runningSession && await steerLive(runningSession, message, deliverySignal);
           if (steered) return steered;
 
-          if (!existsSync(sessionPath)) {
+          // Restore the saved identity and tool restrictions; refuse rather than lose them.
+          const loadout = readSubagentLoadout(sessionPath);
+          // Claude keeps its own transcript.
+          if (!loadout?.claude && !existsSync(sessionPath)) {
             return fail(`Subagent "${name}" is registered but its session file is gone ` +
               `(${sessionPath}). It cannot be resumed. Spawn a fresh subagent instead.`);
           }
-          // Restore the saved identity and tool restrictions; refuse rather than lose them.
-          const loadout = readSubagentLoadout(sessionPath);
           if (!loadout) {
             return fail(`Cannot safely resume "${name}": no loadout snapshot found for this session ` +
               `(it predates loadout snapshots, or its .loadout.json sidecar was removed). ` +
               `Resuming would drop its system prompt and tool restrictions, so this is refused. ` +
               `Re-run the task as a fresh subagent instead.`);
           }
-          const resumedSessionId = getSessionId(sessionPath) ?? name;
+          const claudeSession = loadout.claude?.session;
+          const resumedSessionId = claudeSession ?? getSessionId(sessionPath) ?? name;
           startingSessions.add(sessionKey);
           // A resumed run is autonomous; a live child taken back keeps how it was launched.
           const watchRun = (surface: string, herdrName: string, interactive = false): RunningSubagent => {
             const running: RunningSubagent = {
               id: randomUUID().slice(0, 8), name, task: message, agent: loadout.agent ?? undefined,
               surface, herdrName, startTime: Date.now(), sessionFile: sessionPath, interactive,
+              ...(claudeSession ? { claudeSession } : {}),
             };
             runningSubagents.set(running.id, running);
             watchAndDeliver(running);
@@ -1129,23 +1193,25 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           let running: RunningSubagent;
           try {
             // Adopt a live child lost during a parent restart instead of opening its transcript twice.
-            const live = await launchDeps.findSessionAgent(sessionKey);
+            const live = await launchDeps.findSessionAgent(claudeSession ?? sessionKey);
             deliverySignal.throwIfAborted();
             const steeredLive = live && await steerLive(watchRun(live.pane, live.agent, loadout.interactive), message, deliverySignal);
             if (steeredLive) return steeredLive;
-            const args = ["--session", sessionPath, "-e", join(SUBAGENTS_DIR, "subagent-done.ts")];
-            applyLoadoutToArgs(args, loadout, sessionPath);
-            args.push(...await integrationArgs(loadout.agentDir ?? getAgentDir()));
+            const cwd = loadout.cwd ?? ctx.cwd;
+            let launch: AgentLaunch;
+            if (claudeSession) {
+              launch = { name, kind: "claude", args: claudeArgs(loadout, sessionPath, { autoExit: true, resume: true }), env: {}, cwd };
+            } else {
+              const args = ["--session", sessionPath, "-e", join(SUBAGENTS_DIR, "subagent-done.ts")];
+              applyLoadoutToArgs(args, loadout, sessionPath);
+              args.push(...await integrationArgs(loadout.agentDir ?? getAgentDir()));
+              launch = { name, kind: "pi", args, env: subagentEnv(loadout, { name, sessionFile: sessionPath, autoExit: true }), cwd };
+            }
             deliverySignal.throwIfAborted();
             // This run is autonomous: a parent that restarts and takes it back must see that.
             writeSubagentLoadout(sessionPath, { ...loadout, interactive: false });
             clearStaleMarkers(sessionPath);
-            const started = await startTracked({
-              name,
-              args,
-              env: subagentEnv(loadout, { name, sessionFile: sessionPath, autoExit: true }),
-              cwd: loadout.cwd ?? ctx.cwd,
-            }, message, deliverySignal);
+            const started = await startTracked(launch, message, deliverySignal);
             running = watchRun(started.surface, started.agent);
           } finally {
             startingSessions.delete(sessionKey);

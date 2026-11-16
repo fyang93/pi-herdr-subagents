@@ -673,10 +673,11 @@ describe("subagent discovery", () => {
     });
   });
 
-  it("example scout/researcher/worker all resolve as non-interactive (auto-exit)", async () => {
+  it("example scout/researcher/worker/claude all resolve as non-interactive (auto-exit)", async () => {
     await withIsolatedAgentEnv(({ projectAgentsDir }) => {
       cpSync(fileURLToPath(new URL("../examples/agents/", import.meta.url)), projectAgentsDir, { recursive: true });
-      for (const name of ["scout", "researcher", "worker"]) {
+      assert.equal(testApi.loadAgentDefaults("claude")?.cli, "claude");
+      for (const name of ["scout", "researcher", "worker", "claude"]) {
         const defs = testApi.loadAgentDefaults(name);
         assert.ok(defs, `expected installed example ${name} to be discoverable`);
         assert.equal(
@@ -1933,6 +1934,73 @@ describe("tool registration", () => {
       testApi.runningSubagents.clear(); testApi.startingSessions.clear();
       process.env = env;
     }
+  });
+
+  it("runs a cli: claude agent in Claude Code: prompts its task, steers it live and resumes its session", async () => {
+    const testApi = subagentsModule.__test__, deps = testApi.launchDeps, saved = { ...deps };
+    const env = { ...process.env };
+    try {
+      await withIsolatedAgentEnv(async ({ projectDir, projectAgentsDir }) => {
+        Object.assign(process.env, { HERDR_ENV: "1", HERDR_PANE_ID: "w1:p1" });
+        writeAgentFile(projectAgentsDir, "reviewer", "name: reviewer\ncli: claude\nmodel: anthropic/claude-sonnet-4-5\nauto-exit: true\nsystem-prompt: append\ntools: read\nskills: x", "You review code.");
+        const launches: any[] = [], prompts: string[][] = [];
+        deps.startAgent = async (launch: any) => { launches.push(launch); return { surface: "w1:p2", agent: "reviewer" }; };
+        deps.promptAgent = async (agent: string, text: string) => { prompts.push([agent, text]); };
+        deps.watchSubagent = async () => ({ summary: "", exitCode: 0, elapsed: 0 }); // the mock leaves it tracked as running
+        deps.findSessionAgent = async () => null;
+        const { api, registeredTools } = createMockExtensionApi();
+        subagentsModule.default(api as any);
+        const tool = (name: string) => registeredTools.find(item => item.name === name);
+        const ctx = { cwd: projectDir, model: { provider: "openai", id: "gpt" }, sessionManager: {
+          getSessionFile: () => join(projectDir, "parent.jsonl"), getSessionDir: () => projectDir,
+          getSessionId: () => "parent-id", getBranch: () => [],
+        } };
+        const spawned = await tool("subagent").execute("call", { agent: "reviewer", task: "review it" }, undefined, undefined, ctx);
+        const [launch] = launches;
+        const sessionFile: string = spawned.details.sessionFile;
+        const { claude } = readSubagentLoadout(sessionFile)!;
+        assert.equal(launch.kind, "claude");
+        assert.deepEqual(launch.env, {}, "nothing marks a nested pi as a subagent");
+        assert.deepEqual(launch.args.slice(0, 5), ["--session-id", claude!.session, "--dangerously-skip-permissions", "--model", "claude-sonnet-4-5"]);
+        assert.equal(launch.args[launch.args.indexOf("--append-system-prompt-file") + 1], `${sessionFile}.identity.md`);
+        assert.equal(readFileSync(`${sessionFile}.identity.md`, "utf8"), "You review code.");
+        const settings = JSON.parse(launch.args[launch.args.indexOf("--settings") + 1]);
+        assert.deepEqual(Object.keys(settings.hooks), ["Stop"]);
+        assert.match(settings.hooks.Stop[0].hooks[0].command, /claude-hook\.ts' 'stop' 'auto' '/);
+        assert.ok(!launch.args.includes("--tools") && !launch.args.includes("-e"), "pi's tools and extensions do not apply");
+        assert.equal(prompts.length, 1);
+        assert.match(prompts[0][1], /review it/);
+        assert.equal(existsSync(sessionFile), false, "Claude keeps the transcript");
+
+        const steered = await tool("subagent_message").execute("call", { name: "reviewer", message: "also tests" }, undefined, undefined, ctx);
+        assert.equal(steered.details.status, "steered");
+        assert.deepEqual(prompts[1], ["reviewer", "also tests"]);
+
+        testApi.runningSubagents.clear(); // it finished
+        const resumed = await tool("subagent_message").execute("call", { name: "reviewer", message: "one more" }, undefined, undefined, ctx);
+        assert.equal(resumed.details.sessionId, claude!.session);
+        assert.deepEqual(launches[1].args.slice(0, 2), ["--resume", claude!.session]);
+        assert.deepEqual(prompts[2], ["reviewer", "one more"]);
+      });
+    } finally {
+      Object.assign(deps, saved);
+      testApi.runningSubagents.clear(); testApi.startingSessions.clear();
+      process.env = env;
+    }
+  });
+
+  it("claude-hook.ts ends an autonomous run at Stop, an interactive one when Claude exits", () => {
+    const dir = createTestDir(), hook = fileURLToPath(new URL("../pi-extension/subagents/claude-hook.ts", import.meta.url));
+    const run = (event: string, mode: string, base: string, input = "") => execFileSync(process.execPath, [hook, event, mode, base], { input });
+    const stop = JSON.stringify({ last_assistant_message: "All done." });
+    run("stop", "auto", join(dir, "auto"), stop);
+    assert.deepEqual(JSON.parse(readFileSync(join(dir, "auto.exit"), "utf8")), { type: "done", summary: "All done." });
+    run("stop", "keep", join(dir, "kept"), stop);
+    assert.equal(existsSync(join(dir, "kept.exit")), false, "an interactive one stays open");
+    run("end", "keep", join(dir, "kept"));
+    assert.deepEqual(JSON.parse(readFileSync(join(dir, "kept.exit"), "utf8")), { type: "done", summary: "All done." });
+    run("end", "keep", join(dir, "never"));
+    assert.deepEqual(JSON.parse(readFileSync(join(dir, "never.exit"), "utf8")), { type: "done" });
   });
 
   it("cwd only sets the start directory; a .pi/agent there never replaces the parent's config dir", async () => {
