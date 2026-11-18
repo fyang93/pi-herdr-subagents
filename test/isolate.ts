@@ -5,8 +5,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 for (const key of Object.keys(process.env)) {
-  if (key.startsWith("PI_SUBAGENT_") || key.startsWith("HERDR_")) delete process.env[key];
+  if (key.startsWith("PI_SUBAGENT_") || key.startsWith("HERDR_") || key.startsWith("HC_")) delete process.env[key];
 }
+// Never let unit tests change the caller's real desktop layout.
+process.env.PI_SUBAGENT_APP_LAYOUT = "hidden";
 // A herdr with no agents and its pi integration installed, which answers every other call
 // with an empty result.
 const shim = mkdtempSync(join(tmpdir(), "herdr-shim-"));

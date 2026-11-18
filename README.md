@@ -1,6 +1,6 @@
 # pi-herdr-subagents
 
-Async subagents for [pi](https://github.com/badlogic/pi-mono), running as named agents in [herdr](https://herdr.dev). Spawn a sub-agent, keep working, and get its result delivered back automatically. Multiple sub-agents run concurrently in their own panes without stealing keyboard focus.
+Async subagents for [pi](https://github.com/badlogic/pi-mono), in [herdr](https://herdr.dev) or **herdr-app**. Spawn a sub-agent, keep working, and get its result delivered back automatically. In herdr-app each child gets its own background tab; legacy herdr keeps its split-pane strategy. Neither changes your keyboard focus.
 
 ## Install and requirements
 
@@ -8,7 +8,25 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono), running as named 
 pi install git:github.com/fyang93/pi-herdr-subagents
 ```
 
-Requires **pi 1.5.0+**, **Node.js 22.19+** and **herdr 0.9+**. Start pi inside a herdr pane (`herdr`, then `pi`). The extension installs herdr's Pi integration on first use; restart the parent if prompted. Children load it explicitly, even when settings exclude it, using their config directory's copy or the default `~/.pi/agent` copy. Launch fails if the integration is unavailable: restart recovery needs its session reports. To install it manually, run `herdr integration install pi`.
+Requires **pi 1.5.0+**, **Node.js 22.19+**, and either **herdr-app / herdr-core** or **legacy herdr 0.9+**. Start pi in a herdr-app terminal, or inside a legacy herdr pane (`herdr`, then `pi`). The backend is selected automatically.
+
+### Backends and platforms
+
+| Environment | Detection | Child presentation |
+| --- | --- | --- |
+| herdr-app / herdr-core | `HC_TERMINAL_ID` and `HC_TERMINAL_SOCKET` | One background tab per child in the parent's space |
+| Legacy herdr | `HERDR_ENV=1` and `HERDR_PANE_ID` | Split panes first, background tabs when space is insufficient |
+| Headless herdr-core | Same `HC_*` variables, no app space labels | Background terminals without changing a desktop window |
+
+The core backend uses local JSON-RPC, not shell commands: **Windows named pipes** and **macOS/Linux Unix sockets**. Arguments, Unicode paths and per-child environment variables are transmitted as JSON. `pi` (and `claude` for Claude profiles) must be executable in the core's environment. No symlinks or POSIX shell are required for the Pi backend. Core detection takes precedence if legacy variables were inherited.
+
+For herdr-app, the official `herdr.space` / `herdr.tab` terminal labels create separate tabs without selecting them or splitting existing panes. `herdr-app ls` locates the parent rather than using the user's focused space; the CLI also names adopted tabs. If the CLI/window is unavailable, inherited app labels still allow adoption when the window opens. No app is started or raised. `HERDR_APP_BIN_PATH` can point to the app executable when it is not on PATH. Set `PI_SUBAGENT_APP_LAYOUT=hidden` in the parent environment to keep workers as background terminals instead. Closing or moving a child tab does not change its immutable core terminal identity. Cleanup removes only the child's terminal; the app drops its now-empty pane/tab.
+
+Pi already reports native OSC status to core. A bundled extension updates each child's session label across `/new`, `/resume` and `/fork`, allowing recovery without the old herdr integration. The existing completion sidecars, inbox, questions and saved loadouts are shared by both backends. Core status uses the existing one-second polling fallback; no legacy pane-event subscription is sent to core.
+
+**Legacy herdr only:** the extension installs herdr's Pi integration on first use; restart the parent if prompted. Children load it explicitly, even when settings exclude it, using their config directory's copy or the default `~/.pi/agent` copy. Launch fails if the integration is unavailable: restart recovery needs its session reports. To install it manually, run `herdr integration install pi`.
+
+Windows end-to-end tests have been run with herdr-app 0.1.16, hc 0.1.21 and real Pi processes using a local simulated model. The backend test CI matrix targets Windows, macOS and Linux; macOS/Linux real-app behavior still needs validation on those machines.
 
 ## Tools
 
@@ -105,7 +123,7 @@ With `cli: claude`, the child runs `claude --dangerously-skip-permissions` in it
 
 Hooks passed with `--settings` hand Claude's final answer to the parent: with `auto-exit: true` at its first Stop, otherwise when the user leaves Claude. Escape leaves the turn unfinished and the pane open. `subagent_message` submits to a running child, which Claude queues during a turn, and resumes a finished one with `claude --resume`, keeping its session id. Usage stats are not reported.
 
-Claude Code asks once to trust a folder and once to accept bypass-permissions mode; a launch waiting at either fails with a hint to run `claude --dangerously-skip-permissions` there once. Install herdr's Claude integration (`herdr integration install claude`) so herdr reports the child's state and session.
+Claude Code asks once to trust a folder and once to accept bypass-permissions mode; a launch waiting at either fails with a hint to run `claude --dangerously-skip-permissions` there once. For legacy herdr, install its Claude integration (`herdr integration install claude`) so it reports the child's state and session. The core backend records the session identity at terminal creation and uses native status; no legacy integration command is run. Claude Code and its hook runtime/shell must still be available on the host; the new real-process smoke tests cover Pi, not Claude Code.
 
 ## Example agents
 
@@ -157,7 +175,7 @@ New sidecars (loadout, identity, registry, questions, inbox and markers) use `06
 
 ## How it works
 
-- **Panes:** each child gets an unfocused split (side by side when both halves fit, else stacked) next to the caller's subagents or its own pane, or a background tab when a half would be under 60 × 24 cells (`PI_SUBAGENT_MIN_COLUMNS`, `PI_SUBAGENT_MIN_ROWS`) or the tab is zoomed. Other panes are never rearranged.
+- **Presentation:** herdr-app gives each child its own background tab in the parent's space. Legacy herdr uses an unfocused split (side by side when both halves fit, else stacked) next to the caller's subagents or its own pane, or a background tab when a half would be under 60 × 24 cells (`PI_SUBAGENT_MIN_COLUMNS`, `PI_SUBAGENT_MIN_ROWS`) or the tab is zoomed. These minimum sizes apply only to legacy herdr. Other panes are never rearranged.
 - **Status:** a widget shows each child's elapsed time, profile, state and last tool; herdr's sidebar shows working, idle, blocked or done. Tracking follows pane moves.
 - **Attention:** an autonomous child blocked at a dialog or interrupted with Escape notifies the parent once and stays open; `subagent_message` continues it.
 - **Completion:** the result is the child's final answer on its active branch, with usage stats. A provider error or an answer cut off at the output limit is reported as a failure with any partial answer. The pane closes, then the result goes to the parent: it starts a run when the parent is idle; during a run, results, questions and notices that arrive meanwhile enter the next model call together, and the parent answers them before its run ends (your own queued messages are unaffected). A child that vanishes without reporting is marked interrupted and its pane is left open.
@@ -172,14 +190,17 @@ Child tools widgets toggle with `Ctrl+Alt+O`; completion messages expand with `C
 npm ci --ignore-scripts
 npm test              # type-check, then isolated stub herdr; no inherited subagent environment
 npm run test:runtime  # local Pi 1.5.0, localhost simulated model
-npm run test:e2e      # separate private herdr server; no working panes touched
+npm run test:e2e      # separate private legacy herdr server; POSIX fixture
+npm run test:backends # isolated core/app mocks; Windows/macOS/Linux, no live desktop touched
+npm run test:core-e2e # opt-in in core: real Pi, simulated model, owned background terminals
+npm run test:app-e2e  # opt-in in app: also verify separate tabs and unchanged focus
 ```
 
-Runtime TUI tests require util-linux `script`; RPC and TUI cases verify natural auto-exit. E2E uses scripted local responses to check session tracking, messaging and pane cleanup without real model credentials.
+The original suite has POSIX shell/permission assumptions; it is kept as a Linux CI job. Runtime TUI tests require util-linux `script`; RPC and TUI cases verify natural auto-exit. The new backend mocks use a private Windows named pipe or Unix socket, not the caller's real core. Core/app e2e scripts must be run explicitly inside the target environment: they create only owned test terminals/tabs, use a local simulated model (no paid API calls), and clean up without restarting the app/core. They cover parallel launches, inboxes, summaries, auto-exit, session resume, and the real `subagent` tool dispatching three children.
 
 ## Acknowledgements
 
-Based on [Amos Blomqvist's tmux fork](https://github.com/amosblomqvist/pi-interactive-subagents) of [HazAT/pi-interactive-subagents](https://github.com/HazAT/pi-interactive-subagents). The original introduced the subagent architecture; supervision was inspired by [RepoPrompt](https://repoprompt.com/). This fork uses herdr only.
+Based on [Amos Blomqvist's tmux fork](https://github.com/amosblomqvist/pi-interactive-subagents) of [HazAT/pi-interactive-subagents](https://github.com/HazAT/pi-interactive-subagents). The original introduced the subagent architecture; supervision was inspired by [RepoPrompt](https://repoprompt.com/). This fork supports legacy herdr and herdr-app / herdr-core.
 
 ## License
 

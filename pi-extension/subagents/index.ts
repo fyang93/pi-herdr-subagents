@@ -17,6 +17,7 @@ import {
 } from "./agents.ts";
 import {
   isHerdrAvailable,
+  isCoreAvailable,
   herdrSetupHint,
   ensurePiIntegration,
   piIntegrationPath,
@@ -393,6 +394,7 @@ function claudeArgs(loadout: SubagentLoadout, sessionFile: string, opts: { autoE
  * has one (Pi loads a path once), else the one herdr installed in the default config dir.
  */
 async function integrationArgs(agentDir: string): Promise<string[]> {
+  if (isCoreAvailable()) return ["-e", join(SUBAGENTS_DIR, "herdr-core-state.ts")];
   await integrationReady;
   if (!piIntegrationPath()) await ensurePiIntegration().catch(() => false);
   const integration = piIntegrationPath();
