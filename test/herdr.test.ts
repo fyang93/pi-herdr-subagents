@@ -1,5 +1,5 @@
 import "./isolate.ts";
-import { it, type TestContext } from "node:test";
+import { beforeEach, it, type TestContext } from "node:test";
 import { createServer, type Socket } from "node:net";
 import { once } from "node:events";
 import { setTimeout as delay } from "node:timers/promises";
@@ -17,10 +17,10 @@ writeFileSync(fake, `#!/usr/bin/env bash
 printf '%s\\0' "$@" >> ${JSON.stringify(log)}; printf '\\036' >> ${JSON.stringify(log)}
 case "$1 $2" in
   "pane current") echo '{"result":{"pane":{"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1"}}}' ;;
-  "pane list") cat ${JSON.stringify(join(dir, "panes"))} 2>/dev/null || echo '{"result":{"panes":[{"pane_id":"w1:p1","tab_id":"w1:t1"}]}}' ;;
-  "pane layout") file=${JSON.stringify(join(dir, "layout"))}; [ -e "$file-$4" ] && file="$file-$4"; cat "$file" ;;
-  "pane split") [ -e ${JSON.stringify(join(dir, "split_slow"))} ] && sleep 0.3; echo '{"result":{"pane":{"pane_id":"w1:p9"}}}' ;;
-  "tab create") echo '{"result":{"root_pane":{"pane_id":"w1:p8"},"tab":{}}}' ;;
+  "pane list"|"pane layout"|"pane split") echo '{"error":{"code":"unexpected_layout","message":"must create a dedicated tab"}}' >&2; exit 1 ;;
+  "tab create") [ -e ${JSON.stringify(join(dir, "tab_slow"))} ] && sleep 0.3
+    n=$(cat ${JSON.stringify(join(dir, "tab_count"))}); n=$((n + 1)); echo "$n" > ${JSON.stringify(join(dir, "tab_count"))}
+    printf '{"result":{"root_pane":{"pane_id":"w1:p%s"},"tab":{}}}\\n' "$n" ;;
   "agent list") [ -e ${JSON.stringify(join(dir, "list_fail"))} ] && { echo '{"error":{"code":"server_error","message":"down"}}' >&2; exit 1; }; cat ${JSON.stringify(join(dir, "list"))} 2>/dev/null || echo '{"result":{"agents":[{"name":"scout"}]}}' ;;
   "agent start") [ -e ${JSON.stringify(join(dir, "start_hang"))} ] && sleep 5; cat ${JSON.stringify(join(dir, "start"))}; [ -s ${JSON.stringify(join(dir, "start"))} ] && grep -q error ${JSON.stringify(join(dir, "start"))} && exit 1; true ;;
   "agent get") file=${JSON.stringify(join(dir, "agent"))}; [ -e "$file-$3" ] && file="$file-$3"; cat "$file"; grep -q error "$file" && exit 1; true ;;
@@ -38,96 +38,35 @@ Object.assign(process.env, { HERDR_ENV: "1", HERDR_PANE_ID: "w1:p1", HERDR_BIN_P
 delete process.env.HERDR_SOCKET_PATH;
 const herdr = await import("../pi-extension/subagents/herdr.ts");
 const calls = () => readFileSync(log, "utf8").split("\x1e").filter(Boolean).map((line) => line.split("\0").slice(0, -1));
-const layout = (panes: [string, number, number][], zoomed = false) => reply("layout", {
-  result: { layout: { zoomed, panes: panes.map(([pane_id, width, height]) => ({ pane_id, rect: { width, height } })) } },
-});
-// The pane split or tab created for the last start.
-const opening = () => calls().find(c => c.slice(0, 2).join(" ") === "pane split" || c.slice(0, 2).join(" ") === "tab create")!;
+// Only tab creation is allowed: any layout/split command below makes the fixture fail.
+const opening = () => calls().filter(c => c[0] === "tab" && c[1] === "create");
 const launch = { name: "Scout", kind: "pi" as const, args: ["--session", "/s s.jsonl"], env: { PI_SUBAGENT_NAME: "Scout" }, cwd: "/repo" };
+beforeEach(() => writeFileSync(join(dir, "tab_count"), "7"));
 
-it("starts a named agent in an unfocused split of the parent's own pane, else a background tab", async () => {
+it("starts a named agent in its own unfocused tab with cwd and environment preserved", async () => {
   writeFileSync(log, "");
   writeFileSync(join(dir, "start"), "");
-  layout([["w1:p1", 90, 50], ["w1:p2", 200, 50]]);  // a bigger pane beside the parent is never split
-  assert.deepEqual(await herdr.startAgent(launch), { surface: "w1:p9", agent: "scout-2" });
+  assert.deepEqual(await herdr.startAgent(launch), { surface: "w1:p8", agent: "scout-2" });
   const made = calls();
-  assert.deepEqual(made[0], ["pane", "current", "--current"]);  // the caller's pane as herdr sees it now
-  assert.deepEqual(opening(), ["pane", "split", "w1:p1", "--direction", "down", "--no-focus", "--cwd", "/repo", "--env", "PI_SUBAGENT_NAME=Scout"]);
-  assert.deepEqual(made.at(-1), ["agent", "start", "scout-2", "--kind", "pi", "--pane", "w1:p9", "--timeout", "60000", "--", "--session", "/s s.jsonl"]);
+  assert.deepEqual(made[0], ["pane", "current", "--current"]);
+  assert.deepEqual(opening(), [["tab", "create", "--workspace", "w1", "--no-focus", "--label", "Scout", "--cwd", "/repo", "--env", "PI_SUBAGENT_NAME=Scout"]]);
+  assert.deepEqual(made.at(-1), ["agent", "start", "scout-2", "--kind", "pi", "--pane", "w1:p8", "--timeout", "60000", "--", "--session", "/s s.jsonl"]);
   assert.equal(made.some(c => c[0] === "agent" && c[1] === "prompt"), false);
-
-  for (const [panes, zoomed] of [[[["w1:p1", 60, 20], ["w1:p2", 200, 50]], false], [[["w1:p1", 200, 50]], true]] as const) {
-    writeFileSync(log, "");
-    layout(panes as any, zoomed);  // the parent is too small, or the tab is zoomed
-    assert.equal((await herdr.startAgent(launch)).surface, "w1:p8");
-    assert.deepEqual(opening().slice(0, 7), ["tab", "create", "--workspace", "w1", "--no-focus", "--label", "Scout"]);
-  }
+  assert.equal(made.some(c => c[0] === "pane" && ["split", "layout", "list"].includes(c[1])), false);
 });
 
-it("splits the largest unfocused pane it opened before the parent's own pane", async () => {
+it("gives successive agents distinct tabs without inspecting or reusing existing panes", async () => {
+  writeFileSync(log, "");
   writeFileSync(join(dir, "start"), "");
-  layout([["w1:p1", 200, 50]]);
-  assert.equal((await herdr.startAgent(launch)).surface, "w1:p9");  // opened by this parent
-  const split = (panes: any[]) => {
-    reply("layout", { result: { layout: { zoomed: false, panes: panes.map(([pane_id, width, height, focused]) => ({ pane_id, focused, rect: { width, height } })) } } });
-    writeFileSync(log, "");
-    return herdr.startAgent(launch).then(() => opening());
-  };
-  assert.deepEqual((await split([["w1:p1", 100, 25], ["w1:p9", 100, 50], ["w1:p2", 200, 50]])).slice(0, 5), ["pane", "split", "w1:p9", "--direction", "down"]);
-  assert.deepEqual((await split([["w1:p1", 200, 50], ["w1:p9", 100, 50]])).slice(0, 3), ["pane", "split", "w1:p9"]);  // even when the parent's is bigger
-  assert.deepEqual((await split([["w1:p1", 100, 50], ["w1:p9", 100, 25]])).slice(0, 3), ["pane", "split", "w1:p1"]);  // agent panes too small
-  assert.deepEqual((await split([["w1:p1", 100, 25], ["w1:p9", 100, 50, true]])).slice(0, 3), ["pane", "split", "w1:p9"]);  // focused only within its tab
-  reply("panes", { result: { panes: [{ pane_id: "w1:p1", tab_id: "w1:t1" }, { pane_id: "w1:p9", tab_id: "w1:t1", focused: true }] } });
-  try {
-    assert.deepEqual((await split([["w1:p1", 100, 25], ["w1:p9", 100, 50]])).slice(0, 2), ["tab", "create"]);  // the user is in it
-  } finally {
-    rmSync(join(dir, "panes"));
-  }
-});
-
-it("fills background tabs of its own agents before opening another", async () => {
-  writeFileSync(join(dir, "start"), "");
-  layout([["w1:p1", 100, 25]]);
-  assert.equal((await herdr.startAgent(launch)).surface, "w1:p8");  // a background tab opened by this parent
-  const panes = (...extra: [string, string][]) => reply("panes", { result: { panes: [["w1:p1", "w1:t1"], ["w1:p8", "w1:t2"], ...extra].map(([pane_id, tab_id]) => ({ pane_id, tab_id })) } });
-  reply("layout-w1:p8", { result: { layout: { zoomed: false, panes: [{ pane_id: "w1:p8", focused: true, rect: { width: 200, height: 50 } }] } } });
-  try {
-    panes();
-    writeFileSync(log, "");
-    await herdr.startAgent(launch);
-    assert.deepEqual(opening().slice(0, 5), ["pane", "split", "w1:p8", "--direction", "right"]);  // its tab focus is not the user's
-    panes(["w1:p7", "w1:t2"]);  // the user opened a pane there
-    writeFileSync(log, "");
-    await herdr.startAgent(launch);
-    assert.deepEqual(opening().slice(0, 2), ["tab", "create"]);
-  } finally {
-    rmSync(join(dir, "panes"));
-    rmSync(join(dir, "layout-w1:p8"));
-  }
-});
-
-it("defaults to 60-column by 24-row panes, side by side first, otherwise opens a tab", async () => {
-  for (const [width, height, direction] of [
-    [147, 51, "right"],
-    [120, 80, "right"],
-    [120, 24, "right"],
-    [119, 48, "down"],
-    [60, 48, "down"],
-    [119, 47, null],
-    [120, 23, null],
-    [59, 48, null],
-  ] as const) {
-    writeFileSync(log, "");
-    writeFileSync(join(dir, "start"), "");
-    layout([["w1:p1", width, height]]);
-    const { surface } = await herdr.startAgent(launch);
-    assert.equal(surface, direction ? "w1:p9" : "w1:p8", `${width}×${height}`);
-    if (direction) assert.equal(opening()[4], direction);
-  }
+  const first = await herdr.startAgent(launch);
+  const second = await herdr.startAgent(launch);
+  assert.notEqual(first.surface, second.surface);
+  assert.equal(opening().length, 2);
+  assert.ok(opening().every(c => c.includes("--no-focus")));
+  assert.equal(calls().some(c => c[0] === "pane" && ["split", "layout", "list"].includes(c[1])), false);
 });
 
 it("abandons a start on abort and closes the pane it opened", async () => {
-  layout([["w1:p1", 200, 50]]);
   writeFileSync(join(dir, "start_hang"), "");
   writeFileSync(log, "");
   try {
@@ -136,31 +75,29 @@ it("abandons a start on abort and closes the pane it opened", async () => {
     while (!calls().some((c) => c[0] === "agent" && c[1] === "start")) await delay(10);
     controller.abort();
     await assert.rejects(started);
-    assert.deepEqual(calls().at(-1), ["pane", "close", "w1:p9"]);
+    assert.deepEqual(calls().at(-1), ["pane", "close", "w1:p8"]);
   } finally {
     rmSync(join(dir, "start_hang"));
   }
 });
 
-it("lets a pane creation finish on abort, then closes the pane", async () => {
-  layout([["w1:p1", 200, 50]]);
-  writeFileSync(join(dir, "split_slow"), "");
+it("lets tab creation finish on abort, then closes its root pane", async () => {
+  writeFileSync(join(dir, "tab_slow"), "");
   writeFileSync(log, "");
   try {
     const controller = new AbortController();
     const started = herdr.startAgent(launch, controller.signal);
-    while (!calls().some((c) => c[0] === "pane" && c[1] === "split")) await delay(10);
+    while (!calls().some((c) => c[0] === "tab" && c[1] === "create")) await delay(10);
     controller.abort(); // herdr may already have created the pane
     await assert.rejects(started);
-    assert.deepEqual(calls().at(-1), ["pane", "close", "w1:p9"]);
+    assert.deepEqual(calls().at(-1), ["pane", "close", "w1:p8"]);
     assert.equal(calls().some((c) => c[0] === "agent" && c[1] === "start"), false);
   } finally {
-    rmSync(join(dir, "split_slow"));
+    rmSync(join(dir, "tab_slow"));
   }
 });
 
-it("queues only pane creation: a slow start does not hold up the next launch", async () => {
-  layout([["w1:p1", 200, 50]]);
+it("queues only tab creation: a slow start does not hold up the next launch", async () => {
   writeFileSync(join(dir, "start_hang"), "");
   writeFileSync(log, "");
   const controller = new AbortController();
@@ -168,7 +105,7 @@ it("queues only pane creation: a slow start does not hold up the next launch", a
     const slow = herdr.startAgent(launch, controller.signal);
     while (!calls().some((c) => c[0] === "agent" && c[1] === "start")) await delay(10);
     const next = herdr.startAgent(launch, controller.signal);
-    while (calls().filter((c) => c[0] === "pane" && c[1] === "split").length < 2) await delay(10);
+    while (calls().filter((c) => c[0] === "tab" && c[1] === "create").length < 2) await delay(10);
     controller.abort();
     await Promise.allSettled([slow, next]);
   } finally {
@@ -177,12 +114,11 @@ it("queues only pane creation: a slow start does not hold up the next launch", a
 });
 
 it("retries closing a failed start's pane, and says when it stays open", async () => {
-  layout([["w1:p1", 200, 50]]);
   reply("start", { error: { code: "agent_start_failed", message: "no pi" } });
   writeFileSync(join(dir, "close_fail"), "");
   writeFileSync(log, "");
   try {
-    await assert.rejects(herdr.startAgent(launch), /herdr pane w1:p9 could not be closed/);
+    await assert.rejects(herdr.startAgent(launch), /herdr pane w1:p8 could not be closed/);
     assert.equal(calls().filter((c) => c[0] === "pane" && c[1] === "close").length, 3);
   } finally {
     rmSync(join(dir, "close_fail"));
@@ -213,18 +149,17 @@ it("finds the live agent running a pi session file or a Claude session id", asyn
 });
 
 it("closes the pane on every start failure, explaining one that never became ready", async () => {
-  layout([["w1:p1", 200, 50]]);
+  let pane = 8;
   for (const [code, expected] of [["agent_not_ready", /startup dialog in \/repo/], ["agent_start_failed", /agent_start_failed/]] as const) {
     reply("start", { error: { code, message: "no" } });
     writeFileSync(log, "");
     await assert.rejects(herdr.startAgent(launch), expected);
-    assert.deepEqual(calls().at(-1), ["pane", "close", "w1:p9"]);
+    assert.deepEqual(calls().at(-1), ["pane", "close", `w1:p${pane++}`]);
   }
   writeFileSync(join(dir, "start"), "");
 });
 
 it("picks another name once when a parallel start took it, and keeps the pane's output when pi fails to start", async () => {
-  layout([["w1:p1", 200, 50]]);
   reply("start", { error: { code: "agent_name_taken", message: "taken" } });
   writeFileSync(log, "");
   await assert.rejects(herdr.startAgent(launch), (error: any) => /agent_name_taken/.test(error.message) && /last line/.test(error.message));
@@ -235,7 +170,6 @@ it("picks another name once when a parallel start took it, and keeps the pane's 
 });
 
 it("starts pi only once the new pane's shell is at its prompt", async () => {
-  layout([["w1:p1", 200, 50]]);
   writeFileSync(join(dir, "start"), "");
   writeFileSync(join(dir, "shell_busy"), "3");  // still running its startup
   writeFileSync(log, "");
@@ -247,12 +181,11 @@ it("starts pi only once the new pane's shell is at its prompt", async () => {
 });
 
 it("closes the pane when listing agents fails after it was created", async () => {
-  layout([["w1:p1", 200, 50]]);
   writeFileSync(join(dir, "start"), "");
   writeFileSync(join(dir, "list_fail"), "");
   writeFileSync(log, "");
   await assert.rejects(herdr.startAgent(launch), /server_error/);
-  assert.deepEqual(calls().at(-1), ["pane", "close", "w1:p9"]);
+  assert.deepEqual(calls().at(-1), ["pane", "close", "w1:p8"]);
   rmSync(join(dir, "list_fail"));
 });
 

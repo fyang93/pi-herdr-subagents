@@ -118,7 +118,6 @@ try {
     HOME: join(base, "home"), XDG_CONFIG_HOME: join(base, "xdg"),
     HERDR_CONFIG_PATH: join(base, "herdr.toml"), HERDR_BIN_PATH: join(binDir, "herdr-private"),
     PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1", PI_TELEMETRY: "0", PI_SESSION_E2E: server,
-    PI_SUBAGENT_MIN_COLUMNS: "10000", PI_SUBAGENT_MIN_ROWS: "10000", // Stable background-tab topology.
     PATH: `${binDir}:${originalEnv.PATH ?? ""}`, TERM: "xterm-256color",
   });
   for (const key of Object.keys(process.env)) delete process.env[key];

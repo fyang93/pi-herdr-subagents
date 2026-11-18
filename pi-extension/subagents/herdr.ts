@@ -1,7 +1,6 @@
 /**
- * herdr operations. Each subagent is a named herdr agent in its own pane: an
- * unfocused split of the parent's pane or of a subagent pane it opened, in the parent's
- * tab or a background tab of its agents (a new background tab when those are too small),
+ * herdr operations. Each subagent is a named herdr agent in the root pane
+ * of its own background tab, in the parent's current workspace,
  * started with `herdr agent start` so it shows in herdr's agents sidebar, with
  * state reported by herdr's pi (or Claude) integration. Pane ids look like `w1:p2`.
  */
@@ -80,18 +79,6 @@ export async function ensurePiIntegration(): Promise<boolean> {
 
 // ── Starting agents ──
 
-function positiveInteger(value: string | undefined, fallback: number): number {
-  const number = Number(value);
-  return Number.isSafeInteger(number) && number > 0 ? number : fallback;
-}
-
-/** Split direction that leaves both halves usable, side by side first. */
-export function splitDirection(width: number, height: number, minColumns: number, minRows: number): "right" | "down" | null {
-  if (Math.floor(width / 2) >= minColumns && height >= minRows) return "right";
-  if (width >= minColumns && Math.floor(height / 2) >= minRows) return "down";
-  return null;
-}
-
 /** A herdr agent name ([a-z][a-z0-9_-]{0,31}) for a display name, unique among live agents. */
 export function agentName(display: string, taken: Set<string>): string {
   const slug = display.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^[^a-z]+/, "").replace(/-+$/, "").slice(0, 28) || "subagent";
@@ -109,48 +96,20 @@ export interface AgentLaunch {
   cwd: string;
 }
 
-// Serialize layout inspection + pane creation within this parent so parallel launches see fresh geometry.
+// Serialize tab creation only; agent startup and execution remain concurrent.
 let creationQueue: Promise<unknown> = Promise.resolve();
-// Panes this parent opened for its agents; they may be split again for later agents.
-const opened = new Set<string>();
 
-/** Open an unfocused pane for an agent: a split of the parent's pane or an agent's, or a background tab. */
-async function openPane(launch: AgentLaunch, signal?: AbortSignal): Promise<string> {
-  // Ask herdr for the caller's pane: HERDR_PANE_ID is only a launch-time alias after a move.
+/** Every subagent gets its own unfocused tab in the caller's current workspace. */
+async function openTab(launch: AgentLaunch, signal?: AbortSignal): Promise<string> {
+  // Resolve the live caller: HERDR_PANE_ID may be stale after a workspace move.
   const { pane: current } = await herdrAsync(["pane", "current", "--current"], { signal });
-  const parent = current.pane_id;
-  const minColumns = positiveInteger(process.env.PI_SUBAGENT_MIN_COLUMNS, 60);
-  const minRows = positiveInteger(process.env.PI_SUBAGENT_MIN_ROWS, 24);
-  // The pane list's `focused` is workspace-wide; a layout's is per tab.
-  const { panes } = await herdrAsync(["pane", "list", "--workspace", current.workspace_id], { signal });
-  const focused = panes.find((pane: any) => pane.focused)?.pane_id;
-  const tabs = new Map<string, string[]>();
-  for (const pane of panes) tabs.set(pane.tab_id, [...tabs.get(pane.tab_id) ?? [], pane.pane_id]);
-  // Fill the parent's tab, then background tabs holding only this parent's agents.
-  const layouts = [parent, ...[...tabs].filter(([tab, ids]) => tab !== current.tab_id && ids.every(id => opened.has(id))).map(([, ids]) => ids[0])];
-  // Split the largest unfocused agent pane, else the parent's own pane, never a pane of the user's;
-  // a background tab when all are too small or zoomed. Never unzoom or rearrange.
-  const area = (pane: any) => pane.rect.width * pane.rect.height;
-  let target = parent, direction: "right" | "down" | null = null;
-  for (const id of layouts) {
-    const { layout } = await herdrAsync(["pane", "layout", "--pane", id], { signal });
-    if (layout.zoomed) continue;
-    const own = layout.panes.filter((pane: any) => pane.pane_id === parent);
-    const agents = layout.panes.filter((pane: any) => opened.has(pane.pane_id) && pane.pane_id !== focused);
-    for (const pane of [...agents.sort((a: any, b: any) => area(b) - area(a)), ...own]) {
-      direction = splitDirection(pane.rect.width, pane.rect.height, minColumns, minRows);
-      if (direction) { target = pane.pane_id; break; }
-    }
-    if (direction) break;
-  }
   const env = Object.entries(launch.env).flatMap(([key, value]) => ["--env", `${key}=${value}`]);
-  // Neither abortable nor timed out: herdr may create the pane before it answers, and only
-  // the answer names it for cleanup.
-  const pane: string = direction
-    ? (await herdrAsync(["pane", "split", target, "--direction", direction, "--no-focus", "--cwd", launch.cwd, ...env], { timeout: 0 })).pane.pane_id
-    : (await herdrAsync(["tab", "create", "--workspace", current.workspace_id, "--no-focus", "--label", launch.name, "--cwd", launch.cwd, ...env], { timeout: 0 })).root_pane.pane_id;
-  opened.add(pane);
-  return pane;
+  // Let creation finish even on cancellation: the reply identifies what to clean up.
+  const { root_pane } = await herdrAsync([
+    "tab", "create", "--workspace", current.workspace_id, "--no-focus",
+    "--label", launch.name, "--cwd", launch.cwd, ...env,
+  ], { timeout: 0 });
+  return root_pane.pane_id;
 }
 
 /**
@@ -185,7 +144,7 @@ export async function startAgent(launch: AgentLaunch, signal?: AbortSignal): Pro
   // herdr refuses agent arguments it cannot encode for the pane's shell, such as line breaks.
   const unsafe = launch.args.find((arg) => /[\r\n]/.test(arg));
   if (unsafe !== undefined) throw new Error(`A ${launch.kind} argument for "${launch.name}" spans lines, which herdr cannot pass: ${JSON.stringify(unsafe.slice(0, 80))}`);
-  const opening = creationQueue.then(() => openPane(launch, signal));
+  const opening = creationQueue.then(() => openTab(launch, signal));
   creationQueue = opening.catch(() => {});
   const surface = await opening;
   await herdrAsync(["pane", "rename", surface, launch.name]).catch(() => {});

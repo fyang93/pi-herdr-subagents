@@ -1,6 +1,6 @@
 # pi-herdr-subagents
 
-Async subagents for [pi](https://github.com/badlogic/pi-mono), in [herdr](https://herdr.dev) or **herdr-app**. Spawn a sub-agent, keep working, and get its result delivered back automatically. In herdr-app each child gets its own background tab; legacy herdr keeps its split-pane strategy. Neither changes your keyboard focus.
+Async subagents for [pi](https://github.com/badlogic/pi-mono), in [herdr](https://herdr.dev) or **herdr-app**. Spawn a sub-agent, keep working, and get its result delivered back automatically. Each child gets its own background tab in both herdr-app and legacy herdr. Neither changes your keyboard focus.
 
 ## Install and requirements
 
@@ -15,7 +15,7 @@ Requires **pi 1.5.0+**, **Node.js 22.19+**, and either **herdr-app / herdr-core*
 | Environment | Detection | Child presentation |
 | --- | --- | --- |
 | herdr-app / herdr-core | `HC_TERMINAL_ID` and `HC_TERMINAL_SOCKET` | One background tab per child in the parent's space |
-| Legacy herdr | `HERDR_ENV=1` and `HERDR_PANE_ID` | Split panes first, background tabs when space is insufficient |
+| Legacy herdr | `HERDR_ENV=1` and `HERDR_PANE_ID` | One background tab per child in the parent's current workspace |
 | Headless herdr-core | Same `HC_*` variables, no app space labels | Background terminals without changing a desktop window |
 
 The core backend uses local JSON-RPC, not shell commands: **Windows named pipes** and **macOS/Linux Unix sockets**. Arguments, Unicode paths and per-child environment variables are transmitted as JSON. `pi` (and `claude` for Claude profiles) must be executable in the core's environment. No symlinks or POSIX shell are required for the Pi backend. Core detection takes precedence if legacy variables were inherited.
@@ -175,7 +175,7 @@ New sidecars (loadout, identity, registry, questions, inbox and markers) use `06
 
 ## How it works
 
-- **Presentation:** herdr-app gives each child its own background tab in the parent's space. Legacy herdr uses an unfocused split (side by side when both halves fit, else stacked) next to the caller's subagents or its own pane, or a background tab when a half would be under 60 × 24 cells (`PI_SUBAGENT_MIN_COLUMNS`, `PI_SUBAGENT_MIN_ROWS`) or the tab is zoomed. These minimum sizes apply only to legacy herdr. Other panes are never rearranged.
+- **Presentation:** each child gets its own background tab: in the parent's space for herdr-app, or its current workspace for legacy herdr. Existing panes are never split or rearranged, and focus stays put. The former `PI_SUBAGENT_MIN_COLUMNS` / `PI_SUBAGENT_MIN_ROWS` settings are no longer used.
 - **Status:** a widget shows each child's elapsed time, profile, state and last tool; herdr's sidebar shows working, idle, blocked or done. Tracking follows pane moves.
 - **Attention:** an autonomous child blocked at a dialog or interrupted with Escape notifies the parent once and stays open; `subagent_message` continues it.
 - **Completion:** the result is the child's final answer on its active branch, with usage stats. A provider error or an answer cut off at the output limit is reported as a failure with any partial answer. The pane closes, then the result goes to the parent: it starts a run when the parent is idle; during a run, results, questions and notices that arrive meanwhile enter the next model call together, and the parent answers them before its run ends (your own queued messages are unaffected). A child that vanishes without reporting is marked interrupted and its pane is left open.
