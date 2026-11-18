@@ -50,7 +50,7 @@ function formatClock(ms: number): string {
 /** Right-hand label: herdr's state, plus the tool a working pi subagent is in. */
 function widgetStatus(running: WidgetAgent, theme: Pick<Theme, "fg">): string {
   const status = running.status ?? "starting";
-  if (status === "blocked") return theme.fg("error", status);
+  if (status === "blocked" || status === "error") return theme.fg("error", status);
   if (status !== "working") return theme.fg("dim", status);
   const tool = currentTool(running.sessionFile);
   return theme.fg("warning", "working") + (tool ? ` · ${tool}` : "");
@@ -154,11 +154,16 @@ export const listRenderers: ToolRenderers = {
   renderResult(result, _opts, theme) {
     const details = result.details as any;
     const agents = details?.agents ?? [];
-    if (agents.length === 0) return new Text(theme.fg("dim", NO_AGENTS), 0, 0);
+    if (agents.length === 0) {
+      const text = result.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
+      return new Text(theme.fg("dim", text || NO_AGENTS), 0, 0);
+    }
+    const modelErrors = new Map<string, string>((details?.modelErrors ?? []).map((entry: { name: string; error: string }) => [entry.name, entry.error]));
     const lines = agents.map((a: any) => {
       const badge = a.source === "project" ? theme.fg("accent", " (project)") : "";
       const desc = a.description ? theme.fg("dim", ` — ${a.description}`) : "";
-      const model = a.model ? theme.fg("dim", ` [${a.model}]`) : "";
+      const error = modelErrors.get(a.name);
+      const model = error ? theme.fg("error", ` [error: ${error}]`) : a.model ? theme.fg("dim", ` [${a.model}]`) : "";
       return `  ${theme.fg("toolTitle", theme.bold(a.name))}${badge}${model}${desc}`;
     });
     return new Text(lines.join("\n"), 0, 0);

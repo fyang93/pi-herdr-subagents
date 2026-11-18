@@ -61,6 +61,18 @@ export function coreRequest(method: string, params: Record<string, unknown>, opt
 const SESSION = "pi.subagent.session";
 const MANAGED = "pi.subagent.managed";
 
+/** Only our terminal.run records start with literal pi/claude (core retains argv).
+ * A kept terminal can remain live while finish records a loss reason, then clears
+ * that reason when its replacement shell starts. Labels survive both phases.
+ * Missing argv / unrelated records are not evidence of process loss.
+ */
+function managedProgramLost(record: any): boolean {
+  if (record?.state !== "live" || record.labels?.[MANAGED] !== "1") return false;
+  if (typeof record.reason === "string" && record.reason.length > 0) return true;
+  const command = record.argv?.[0];
+  return typeof command === "string" && command !== "pi" && command !== "claude";
+}
+
 function sessionFor(launch: AgentLaunch): string | undefined {
   if (launch.kind === "pi") return launch.env.PI_SUBAGENT_SESSION;
   const index = launch.args.findIndex((arg) => arg === "--session-id" || arg === "--resume");
@@ -73,6 +85,18 @@ export async function startCoreAgent(launch: AgentLaunch, signal?: AbortSignal):
   await coreRequest("terminal.get", { terminal: process.env.HC_TERMINAL_ID }, { signal });
   const session = sessionFor(launch);
   if (!session) throw new Error("Cannot launch a herdr-core subagent without a session identity");
+  // argv[0] is also a template name in core, not an unconditionally literal executable.
+  // Do not let a user's template replace the CLI or turn its flags into a first prompt.
+  let templates: any;
+  try {
+    ({ templates } = await coreRequest("templates.list", {}, { signal }));
+  } catch (cause) {
+    throw new Error("Cannot safely verify herdr-core templates before launch; this core may not support templates.list. Update herdr-core and retry.", { cause });
+  }
+  if (!Array.isArray(templates)) throw new Error("herdr-core returned an invalid templates list; refusing to launch");
+  if (templates.some((template: any) => typeof template?.name === "string" && template.name.toLowerCase() === launch.kind)) {
+    throw new Error(`herdr-core template conflict: template "${launch.kind}" overrides the ${launch.kind} executable. Rename or remove that template before spawning a subagent.`);
+  }
   // No cancellable/timeout window during creation: losing the response could orphan a child.
   // No name constraint/race: retain display names as labels and supervise by terminal ID.
   const terminal = await coreRequest("terminal.run", {
@@ -89,7 +113,7 @@ export async function startCoreAgent(launch: AgentLaunch, signal?: AbortSignal):
   if (typeof terminal?.address !== "string") throw new Error("herdr-core returned no terminal address");
   try {
     signal?.throwIfAborted();
-    if (terminal.reason === "spawn_pending" || terminal.state === "finished") {
+    if (terminal.state === "finished") {
       throw new Error(`herdr-core could not start ${launch.kind}: ${terminal.reason ?? terminal.exit_code}`);
     }
     try {
@@ -101,17 +125,58 @@ export async function startCoreAgent(launch: AgentLaunch, signal?: AbortSignal):
     signal?.throwIfAborted();
     return { surface: terminal.address, agent: terminal.address };
   } catch (error) {
-    await closeCoreTerminal(terminal.address);
+    await closeCoreTerminal(terminal.address, launch.kind === "pi" ? resolve(session) : session);
     throw error;
   }
 }
 
-export async function closeCoreTerminal(terminal: string): Promise<void> {
+export async function closeCoreTerminal(terminal: string, session?: string): Promise<void> {
   try {
-    await coreRequest("terminal.kill", { terminal });
+    // A completion marker (or cancellation) is not ownership of a replacement
+    // shell or a /new session. Recheck at this single backend cleanup boundary.
+    // The get/kill pair is not atomic; core offers no conditional kill operation.
+    const record = await coreRequest("terminal.get", { terminal });
+    if (record.labels?.[MANAGED] !== "1" || (session && record.labels?.[SESSION] !== session)
+      || managedProgramLost(record) || (record.state !== "live" && record.state !== "finished")
+      || (record.state === "live" && !["pi", "claude"].includes(record.argv?.[0]))) {
+      console.warn(`Preserving herdr-core terminal ${terminal}: no longer the owned subagent program/session.`);
+      return;
+    }
+    if (record.state === "live") await coreRequest("terminal.kill", { terminal });
     await coreRequest("terminal.rm", { terminal });
   } catch (error) {
     if (!(error instanceof CoreError && error.code === "not_found")) throw error;
+  }
+}
+
+/** Diagnose a vanished child, removing only its confirmed finished, still-owned record.
+ * Never kill here: "exited" can also mean a missing record, and labels may have changed.
+ * All RPC failures become diagnostics, not a lost watcher result.
+ */
+export async function collectCoreInterruptedExit(terminal: string, session: string): Promise<string> {
+  const ownedFinished = (record: any) => session && record?.state === "finished"
+    && record.labels?.[MANAGED] === "1" && record.labels?.[SESSION] === session;
+  try {
+    const record = await coreRequest("terminal.get", { terminal });
+    if (!ownedFinished(record)) return "";
+    let diagnostics = `herdr-core terminal ${terminal} finished (exit_code=${record.exit_code ?? "unknown"}, reason=${record.reason ?? "unknown"}).`;
+    try {
+      const output = await readCoreScreen(terminal, 40);
+      if (output) diagnostics += `\nLast terminal output:\n${output}`;
+    } catch (error) {
+      diagnostics += `\nCould not read terminal output: ${error}`;
+    }
+    try {
+      // Reading output was asynchronous; ownership must still hold at removal time.
+      if (ownedFinished(await coreRequest("terminal.get", { terminal }))) {
+        await coreRequest("terminal.rm", { terminal });
+      }
+    } catch (error) {
+      diagnostics += `\nCould not remove finished terminal ${terminal}: ${error}`;
+    }
+    return diagnostics;
+  } catch (error) {
+    return `Could not inspect herdr-core terminal ${terminal}: ${error}`;
   }
 }
 
@@ -119,13 +184,9 @@ export async function coreAgentStatus(agent: string, signal?: AbortSignal): Prom
   try {
     const terminal = await coreRequest("terminal.get", { terminal: agent }, { signal });
     if (terminal.state === "finished") return "exited";
-    // A late app adoption may enable shell recovery after presentation timed out.
-    // Keep managed agents final on exit/crash, including without the app CLI.
-    if (terminal.keep && terminal.labels?.[MANAGED] === "1") {
-      await coreRequest("terminal.keep", { terminal: agent, keep: false }, { signal });
-    }
+    if (managedProgramLost(terminal)) return "exited";
     const state = terminal.status?.state;
-    const status: AgentStatus = state === "idle" || state === "working" || state === "blocked" || state === "done" ? state : state === "error" ? "blocked" : "unknown";
+    const status: AgentStatus = state === "idle" || state === "working" || state === "blocked" || state === "done" || state === "error" ? state : "unknown";
     return { status, pane: terminal.address, session: terminal.labels?.[SESSION] ?? null };
   } catch (error) {
     return error instanceof CoreError && error.code === "not_found" ? "exited" : null;
@@ -134,7 +195,7 @@ export async function coreAgentStatus(agent: string, signal?: AbortSignal): Prom
 
 export async function findCoreSessionAgent(session: string): Promise<{ agent: string; pane: string } | null> {
   const { terminals } = await coreRequest("terminal.list", { labels: { [MANAGED]: "1" } });
-  const terminal = terminals.find((t: any) => t.state === "live" && t.labels?.[SESSION] === session);
+  const terminal = terminals.find((t: any) => t.state === "live" && t.labels?.[SESSION] === session && !managedProgramLost(t));
   return terminal ? { agent: terminal.address, pane: terminal.address } : null;
 }
 

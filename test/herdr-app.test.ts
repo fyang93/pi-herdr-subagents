@@ -38,7 +38,7 @@ it("gives parallel children separate named background tabs, without focus/split 
   assert.ok(labels.every(c => c.params.labels["herdr.space"] === "parent-space"));
   assert.equal(f.commands.filter(c => c[0] === "do" && c[1] === "tab.rename").length, 3);
   assert.ok(f.commands.every(c => c[0] === "ls" || (c[0] === "do" && c[1] === "tab.rename")));
-  assert.equal(f.calls.filter(c => c.method === "terminal.keep" && c.params.keep === false).length, 3);
+  assert.equal(f.calls.filter(c => c.method === "terminal.keep").length, 0);
 });
 it("can opt out without querying the app or core", async () => {
   process.env.PI_SUBAGENT_APP_LAYOUT = "hidden";

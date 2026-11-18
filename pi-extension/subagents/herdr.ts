@@ -10,7 +10,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { createConnection, type Socket } from "node:net";
 import { isAbsolute, resolve } from "node:path";
 
-import { isCoreAvailable, startCoreAgent, coreAgentStatus, findCoreSessionAgent, closeCoreTerminal, readCoreScreen, promptCoreAgent } from "./herdr-core.ts";
+import { isCoreAvailable, startCoreAgent, coreAgentStatus, findCoreSessionAgent, closeCoreTerminal, readCoreScreen, promptCoreAgent, collectCoreInterruptedExit } from "./herdr-core.ts";
 export { isCoreAvailable } from "./herdr-core.ts";
 
 const execFileAsync = promisify(execFile);
@@ -134,7 +134,7 @@ async function waitForShell(surface: string, signal?: AbortSignal, timeout = 10_
 }
 
 /**
- * Open a pane and start the agent, waiting for it to be ready.
+ * Open a terminal and launch the agent. Only legacy herdr preflights readiness.
  * Every failure after the pane exists closes it, and so does `signal`: the caller
  * never learns the pane, so nothing else would.
  */
@@ -189,9 +189,14 @@ export async function promptAgent(agent: string, text: string, signal?: AbortSig
   await herdrAsync(["agent", "prompt", agent, text], { signal });
 }
 
-export async function closeSurface(surface: string): Promise<void> {
-  if (isCoreAvailable()) return closeCoreTerminal(surface);
+export async function closeSurface(surface: string, session?: string): Promise<void> {
+  if (isCoreAvailable()) return closeCoreTerminal(surface, session);
   await herdrAsync(["pane", "close", surface]);
+}
+
+/** Abnormal-exit diagnostics/cleanup are backend-specific. Legacy panes remain inspectable. */
+export async function collectInterruptedExit(agent: string, session: string): Promise<string> {
+  return isCoreAvailable() ? collectCoreInterruptedExit(agent, session) : "";
 }
 
 /** Close a pane, retrying briefly; one already gone counts as closed. Throws when it stays open. */
@@ -207,7 +212,7 @@ export async function closePane(surface: string, close: (surface: string) => voi
   }
 }
 
-export type AgentStatus = "idle" | "working" | "blocked" | "done" | "unknown";
+export type AgentStatus = "idle" | "working" | "blocked" | "done" | "error" | "unknown";
 
 /** The session herdr reports for an agent: a resolved transcript path (pi) or a session id (Claude). */
 function reportedSession(agent: any): string | null {

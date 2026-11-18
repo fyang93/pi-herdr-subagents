@@ -284,6 +284,31 @@ it("expands model environment variables and rejects missing values", t => {
   assert.equal(state.resolveModelEnv("${AUDIT_MODEL}", dir), "provider/model");
 });
 
+it("reports all missing model variables once, including empty values, without rejecting resolved variables", t => {
+  const names = ["AUDIT_PROVIDER", "AUDIT_EMPTY_MODEL", "AUDIT_DOTENV_MODEL", "AUDIT_BLANK_MODEL"];
+  const previous = names.map(name => process.env[name]);
+  const dir = fs.mkdtempSync(join(tmpdir(), "missing-model-env-"));
+  t.after(() => {
+    names.forEach((name, i) => {
+      if (previous[i] === undefined) delete process.env[name]; else process.env[name] = previous[i];
+    });
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  for (const name of names) delete process.env[name];
+  process.env.AUDIT_EMPTY_MODEL = "";
+  process.env.AUDIT_BLANK_MODEL = "   ";
+  fs.writeFileSync(join(dir, ".env"), "AUDIT_DOTENV_MODEL=resolved/model\n");
+  assert.throws(
+    () => state.resolveModelEnv("${AUDIT_PROVIDER}/${AUDIT_EMPTY_MODEL}/${AUDIT_PROVIDER}/${AUDIT_DOTENV_MODEL}/${AUDIT_BLANK_MODEL}", dir),
+    { message: "Subagent model references unset environment variables: AUDIT_PROVIDER, AUDIT_EMPTY_MODEL, AUDIT_BLANK_MODEL. Set them in the environment or the project's .env." },
+  );
+  assert.throws(() => state.resolveModelEnv("${AUDIT_PROVIDER}/${AUDIT_PROVIDER}", dir), {
+    message: "Subagent model references unset environment variable: AUDIT_PROVIDER. Set it in the environment or the project's .env.",
+  });
+  assert.equal(state.resolveModelEnv("${AUDIT_DOTENV_MODEL}", dir), "resolved/model");
+  assert.equal(state.resolveModelEnv(undefined, dir), undefined);
+});
+
 it("only accepts explicit, valid completion marker types", () => {
   for (const marker of [null, {}, [], "done", { type: "garbage" }, { type: ["done"] }]) {
     assert.equal(interpretExitSidecar(marker), undefined);

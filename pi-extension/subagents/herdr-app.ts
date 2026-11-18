@@ -60,9 +60,6 @@ export async function presentCoreTerminal(
     const current: AppSnapshot = await app(["ls"]);
     const adopted = current.spaces?.some(s => s.tabs.some(t => t.id === tab && t.terminals.some(p => p.terminal === terminal)));
     if (adopted) {
-      // App adoption enables keep by default. Autonomous children must not turn
-      // into replacement shells after a crash, leaving the parent waiting forever.
-      await core("terminal.keep", { terminal, keep: false });
       await app(["do", "tab.rename", JSON.stringify({ id: tab, name })]);
       return;
     }

@@ -894,6 +894,53 @@ describe("subagent discovery", () => {
     });
   });
 
+  it("lists every profile with its own missing model variables and renders those errors", async t => {
+    const names = ["LIST_AUDIT_PROVIDER", "LIST_AUDIT_MODEL", "LIST_AUDIT_OTHER"];
+    const previous = names.map(name => process.env[name]);
+    t.after(() => names.forEach((name, i) => restoreEnvVar(name, previous[i])));
+    for (const name of names) delete process.env[name];
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(projectAgentsDir, "broken-one", "name: broken-one\nmodel: ${LIST_AUDIT_PROVIDER}/${LIST_AUDIT_MODEL}/${LIST_AUDIT_PROVIDER}");
+      writeAgentFile(projectAgentsDir, "broken-two", "name: broken-two\nmodel: ${LIST_AUDIT_OTHER}");
+      writeAgentFile(projectAgentsDir, "healthy", "name: healthy\nmodel: provider/model");
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const tool = registeredTools.find((tool) => tool.name === "subagents_list");
+      assert.ok(tool);
+      const result = await tool.execute("call", {}, undefined, undefined, { cwd: process.cwd() });
+      assert.deepEqual(result.details.agents.map((agent: any) => agent.name).sort(), ["broken-one", "broken-two", "healthy"]);
+      assert.deepEqual(result.details.modelErrors, [
+        { name: "broken-one", error: "Subagent model references unset environment variables: LIST_AUDIT_PROVIDER, LIST_AUDIT_MODEL. Set them in the environment or the project's .env." },
+        { name: "broken-two", error: "Subagent model references unset environment variable: LIST_AUDIT_OTHER. Set it in the environment or the project's .env." },
+      ]);
+      const text = result.content[0].text;
+      assert.match(text, /broken-one.*LIST_AUDIT_PROVIDER, LIST_AUDIT_MODEL/);
+      assert.match(text, /broken-two.*LIST_AUDIT_OTHER/);
+      assert.match(text, /healthy.*\[provider\/model\]/);
+      assert.doesNotMatch(text, /No subagent definitions found/);
+      const theme = { fg: (_color: string, value: string) => value, bold: (value: string) => value };
+      const rendered = tool.renderResult(result, {}, theme).render(1000).join("\n");
+      assert.match(rendered, /broken-one.*error:.*LIST_AUDIT_PROVIDER, LIST_AUDIT_MODEL/);
+      assert.match(rendered, /broken-two.*error:.*LIST_AUDIT_OTHER/);
+      assert.match(rendered, /healthy.*\[provider\/model\]/);
+      assert.doesNotMatch(rendered, /No subagent definitions found/);
+    });
+  });
+
+  it("renders listing failures as their actual error, and reserves the empty message for empty lists", () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const tool = registeredTools.find((tool) => tool.name === "subagents_list");
+    assert.ok(tool);
+    const theme = { fg: (_color: string, value: string) => value };
+    const error = "Subagent model references unset environment variables: PROVIDER, MODEL";
+    const rendered = tool.renderResult({ content: [{ type: "text", text: error }] }, {}, theme).render(1000).join("\n");
+    assert.match(rendered, /unset environment variables: PROVIDER, MODEL/);
+    assert.doesNotMatch(rendered, /No subagent definitions found/);
+    const empty = tool.renderResult({ content: [], details: { agents: [] } }, {}, theme).render(1000).join("\n");
+    assert.match(empty, /No subagent definitions found/);
+  });
+
   it("hides disable-model-invocation agents from listings but keeps direct loading", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
       writeAgentFile(
@@ -2834,6 +2881,19 @@ describe("running-subagents widget", () => {
     });
   });
 
+  it("renders native error in failure color, not as blocked or unknown", () => {
+    const painted: [string, string][] = [];
+    const theme = { fg: (color: string, text: string) => { painted.push([color, text]); return text; } };
+    const lines = testApi.renderSubagentWidgetLines([
+      { name: "Failed", startTime: 0, status: "error", sessionFile: "missing.jsonl" },
+      { name: "Unreported", startTime: 0, status: "unknown", sessionFile: "missing.jsonl" },
+    ], 60, theme, 1000);
+    assert.ok(lines.some((line: string) => /Failed +error/.test(line)));
+    assert.ok(painted.some(([color, text]) => color === "error" && text === "error"));
+    assert.ok(painted.some(([color, text]) => color === "dim" && text === "unknown"));
+    assert.ok(!painted.some(([, text]) => text === "blocked"));
+  });
+
   it("reports no tool once the call has a result or the session is gone", () => {
     withTempDir((d) => {
       const sessionFile = join(d, "child.jsonl");
@@ -3044,6 +3104,23 @@ describe("watchSubagent", () => {
     assert.equal(result.exitCode, 0);
   });
 
+  it("does not manufacture blocked notifications for native error or unknown", async () => {
+    const { api } = createMockExtensionApi();
+    const sent: any[] = [];
+    api.sendMessage = (message: any) => { sent.push(message); };
+    (subagentsModule as any).default(api);
+    const failed = { ...running, id: "native-error-test" };
+    await testApi.watchSubagent(failed, new AbortController().signal, {
+      wait: async (_surface: string, _signal: AbortSignal, options: any) => {
+        for (const status of ["unknown", "error", "unknown", "error"]) options.onTick(status);
+        return { reason: "done", exitCode: 0 };
+      },
+      close: () => {},
+    });
+    assert.equal(failed.status, "error");
+    assert.equal(sent.filter((m) => m.customType === "subagent_status").length, 0);
+  });
+
   it("wakes the parent once when a non-interactive subagent becomes blocked", async () => {
     const { api } = createMockExtensionApi();
     const sent: any[] = [];
@@ -3058,7 +3135,8 @@ describe("watchSubagent", () => {
       close: () => {},
     });
     assert.equal(sent.filter((m) => m.customType === "subagent_status").length, 2);
-    assert.match(sent[0].content, /blocked .* pane w1:p9/);
+    assert.match(sent[0].content, /blocked .* terminal w1:p9/);
+    assert.doesNotMatch(sent[0].content, /herdr pane read/);
   });
 });
 

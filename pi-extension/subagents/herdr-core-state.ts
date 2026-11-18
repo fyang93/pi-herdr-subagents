@@ -1,4 +1,5 @@
-/** Loaded explicitly into Pi children. Keep the terminal's session identity current
+/** Session business metadata only, not a native status/ready integration.
+ * Loaded explicitly into Pi children. Keep the terminal's session identity current
  * across /new, /resume and /fork, so parent recovery cannot adopt a different session.
  * Pi itself already emits herdr-core's native OSC 7501 status reports.
  */

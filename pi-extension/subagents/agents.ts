@@ -86,14 +86,23 @@ function projectEnv(cwd: string): Record<string, string | undefined> {
   try { return parseEnv(readFileSync(join(cwd, ".env"), "utf8")); } catch { return {}; }
 }
 
-/** Expand `${NAME}` from the environment, else from the project's `.env`. */
+/** Expand `${NAME}` from the environment, else from the project's `.env`; report all missing names together. */
 export function resolveModelEnv(model: string | undefined, cwd = process.cwd()): string | undefined {
   let dotenv: Record<string, string | undefined> | undefined;
-  return model?.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_match, name: string) => {
+  const missing = new Set<string>();
+  const resolved = model?.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (match, name: string) => {
     const value = process.env[name] ?? (dotenv ??= projectEnv(cwd))[name];
-    if (value == null || !value.trim()) throw new Error(`Subagent model references unset environment variable: ${name}`);
+    if (value == null || !value.trim()) {
+      missing.add(name);
+      return match;
+    }
     return value.trim();
   });
+  if (missing.size) {
+    const plural = missing.size > 1;
+    throw new Error(`Subagent model references unset environment variable${plural ? "s" : ""}: ${[...missing].join(", ")}. Set ${plural ? "them" : "it"} in the environment or the project's .env.`);
+  }
+  return resolved;
 }
 
 function parseAgentDefinition(content: string, fallbackName: string): AgentDefinition | null {

@@ -27,7 +27,9 @@ import {
   type AgentLaunch,
   waitForExit,
   agentStatus,
+  collectInterruptedExit,
   closePane,
+  closeSurface,
 } from "./herdr.ts";
 import {
   formatContextUsage,
@@ -59,6 +61,9 @@ import {
 /** This file, and its directory `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const EXTENSION_FILE = fileURLToPath(import.meta.url);
 const SUBAGENTS_DIR = dirname(EXTENSION_FILE);
+// Decide before any process-global writes: a skipped worktree copy must not replace the
+// active copy's abort controller or child counter merely by being imported.
+const INERT_COPY = anotherCopyLoaded();
 const launchDeps = { startAgent, promptAgent, findSessionAgent, watchSubagent };
 
 // Survive /reload: abort watchers from the previous module load.
@@ -66,7 +71,7 @@ const launchDeps = { startAgent, promptAgent, findSessionAgent, watchSubagent };
 // the old module keep running. See https://github.com/HazAT/pi-interactive-subagents/issues/5
 const POLL_ABORT_KEY = Symbol.for("pi-subagents/poll-abort-controller");
 
-{
+if (!INERT_COPY) {
   const prevAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
   if (prevAbort) prevAbort.abort();
   (globalThis as any)[POLL_ABORT_KEY] = new AbortController();
@@ -253,7 +258,9 @@ const RUNNING_CHILDREN_COUNT_KEY = Symbol.for("pi-subagents/running-children-cou
 // A child counts until this session has taken in its result, not just until its pane closed:
 // the result can arrive as the session settles, and is processed only after that.
 const unconsumed = new Set<string>();
-(globalThis as any)[RUNNING_CHILDREN_COUNT_KEY] = () => new Set([...runningSubagents.keys(), ...unconsumed]).size;
+if (!INERT_COPY) {
+  (globalThis as any)[RUNNING_CHILDREN_COUNT_KEY] = () => new Set([...runningSubagents.keys(), ...unconsumed]).size;
+}
 
 /** Delivery ids of notices handed to Pi during the current run, for it to append when a turn ends. */
 const appended = new Set<string>();
@@ -675,8 +682,8 @@ let integrationReady: Promise<unknown> = Promise.resolve();
 const leftOpen: string[] = [];
 
 /** Close a subagent's pane; one that stays open is reported at shutdown, as it may still be working. */
-async function closeOrReport(name: string, surface: string, close?: (surface: string) => void | Promise<void>): Promise<void> {
-  try { await closePane(surface, close); } catch (error) {
+async function closeOrReport(name: string, surface: string, close?: (surface: string) => void | Promise<void>, session?: string): Promise<void> {
+  try { await closePane(surface, close ?? ((pane) => closeSurface(pane, session))); } catch (error) {
     console.warn(`Could not close subagent pane ${surface}: ${error}`);
     leftOpen.push(`${name} (herdr pane ${surface})`);
   }
@@ -706,7 +713,13 @@ function startTracked(launch: AgentLaunch, message: string, cancel?: AbortSignal
       if (launch.kind === "claude") await launchDeps.promptAgent(started.agent, message, signal);
       else publishInboxMessage(launch.env.PI_SUBAGENT_SESSION, message);
     } catch (error) {
-      await closeOrReport(launch.name, started.surface);
+      let session: string | undefined;
+      if (launch.kind === "pi") session = resolve(launch.env.PI_SUBAGENT_SESSION);
+      else {
+        const sessionArg = launch.args.findIndex(arg => arg === "--session-id" || arg === "--resume");
+        if (sessionArg >= 0) session = launch.args[sessionArg + 1];
+      }
+      await closeOrReport(launch.name, started.surface, undefined, session);
       throw error;
     }
     return started;
@@ -826,7 +839,7 @@ function reportBlocked(running: RunningSubagent, status: string | null): void {
   if (status !== "blocked" || running.interactive) return;
   notify({
     customType: "subagent_status",
-    content: `Sub-agent "${running.name}" is blocked at a confirmation or question dialog in herdr pane ${running.surface}. Tell the user, or read it with \`herdr pane read ${running.surface}\`.`,
+    content: `Sub-agent "${running.name}" is blocked at a confirmation or question dialog in terminal ${running.surface}. Tell the user, or inspect that terminal in herdr.`,
     display: true,
     details: { line: `${running.name}: blocked at a dialog in pane ${running.surface}` },
   });
@@ -863,8 +876,10 @@ async function watchSubagent(
 
     if (result.reason === "interrupted") {
       runningSubagents.delete(running.id);
-      // The pane may now be an ordinary shell (or reused). Do not close it.
-      return { sessionFile, elapsed, exitCode: 1, summary: `Subagent interrupted: ${result.errorMessage}` };
+      // Legacy panes stay open. Core may remove only a confirmed finished, owned record.
+      const diagnostics = preservePane ? "" : await collectInterruptedExit(running.herdrName, ownSession(running));
+      const errorMessage = `${result.errorMessage ?? "Agent exited without a completion marker."}${diagnostics ? `\n${diagnostics}` : ""}`;
+      return { sessionFile, elapsed, exitCode: 1, errorMessage, summary: `Subagent interrupted: ${errorMessage}` };
     }
 
     // The child reports its answer from its active branch, which the file's order does not show.
@@ -879,7 +894,7 @@ async function watchSubagent(
     const subagentSessionId = running.claudeSession ?? getSessionId(sessionFile);
 
     // A completion receipt does not grant ownership of a pane now hosting another session.
-    if (!preservePane) await closeOrReport(running.name, running.surface, deps.close);
+    if (!preservePane) await closeOrReport(running.name, running.surface, deps.close, ownSession(running));
     for (const marker of [".exit", ".exiting"]) {
       try { rmSync(sessionFile + marker, { force: true }); }
       catch (error) { console.warn(`Could not remove subagent marker ${sessionFile + marker}: ${error}`); }
@@ -903,7 +918,7 @@ async function watchSubagent(
       const found = await (deps.status ?? agentStatus)(running.herdrName);
       const live = found !== null && found !== "exited";
       if (!live || !found.session || found.session === ownSession(running)) {
-        await closeOrReport(running.name, live ? found.pane : running.surface, deps.close);
+        await closeOrReport(running.name, live ? found.pane : running.surface, deps.close, ownSession(running));
       }
     }
     runningSubagents.delete(running.id);
@@ -918,7 +933,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   // A spawning child loads its parent's copy with `-e`. Its folder may install another copy of
   // this package, say a git worktree with its own project settings, which Pi loads too: Pi
   // dedupes extensions by path only. That copy stays inert, so their tools do not conflict.
-  if (anotherCopyLoaded()) return;
+  if (INERT_COPY) return;
   latestPi = pi;
   pi.on("session_start", (event, ctx) => {
     latestCtx = ctx;
@@ -1114,17 +1129,25 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
         const list = discoverAgentDefinitions(ctx.cwd).filter((agent) => !agent.disableModelInvocation);
 
+        const modelErrors: Array<{ name: string; error: string }> = [];
         const lines = list.map((a) => {
           const badge = a.source === "project" ? " (project)" : "";
           const desc = a.description ? ` — ${a.description}` : "";
-          const resolvedModel = resolveModelEnv(a.model, ctx.cwd);
-          const model = resolvedModel ? ` [${resolvedModel}]` : "";
+          let model = "";
+          try {
+            const resolvedModel = resolveModelEnv(a.model, ctx.cwd);
+            model = resolvedModel ? ` [${resolvedModel}]` : "";
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            modelErrors.push({ name: a.name, error: message });
+            model = ` [error: ${message}]`;
+          }
           return `• ${a.name}${badge}${model}${desc}`;
         });
 
         return {
           content: [{ type: "text", text: lines.length ? lines.join("\n") : NO_AGENTS }],
-          details: { agents: list },
+          details: { agents: list, ...(modelErrors.length ? { modelErrors } : {}) },
         };
       },
       ...listRenderers,

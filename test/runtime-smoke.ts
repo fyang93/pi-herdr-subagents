@@ -254,6 +254,105 @@ test("a spawning child whose folder installs its own copy of this package loads 
   assert.deepEqual(resumeArgs, launchArgs);
 });
 
+test("an active module reload still aborts and replaces the previous controller", async () => {
+  const controllerKey = Symbol.for("pi-subagents/poll-abort-controller");
+  const countKey = Symbol.for("pi-subagents/running-children-count");
+  const globals = globalThis as any;
+  const previousController = globals[controllerKey];
+  const previousCount = globals[countKey];
+  try {
+    // Leave the suite's cached module lifecycle untouched.
+    delete globals[controllerKey];
+    // Re-evaluate the active entry point as /reload does, without a factory or real children.
+    const entry = "../pi-extension/subagents/index.ts";
+    await import(`${entry}?reload-control=first`);
+    const controller = globals[controllerKey];
+    const count = globals[countKey];
+    assert.ok(controller instanceof AbortController);
+    assert.equal(controller.signal.aborted, false);
+    assert.equal(typeof count, "function");
+    await import(`${entry}?reload-control=second`);
+    assert.equal(controller.signal.aborted, true, "a real reload must still retire the old lifecycle");
+    assert.notEqual(globals[controllerKey], controller);
+    assert.equal(globals[controllerKey].signal.aborted, false);
+    assert.notEqual(globals[countKey], count);
+  } finally {
+    globals[controllerKey]?.abort();
+    globals[controllerKey] = previousController;
+    globals[countKey] = previousCount;
+  }
+});
+
+test("an inert worktree copy preserves the active controller and keeps a worker open for its child result", async () => {
+  const parent = join(root, "worktree-parent");
+  mkdirSync(parent);
+  cpSync(resolve("pi-extension"), join(parent, "pi-extension"), { recursive: true });
+  cpSync(resolve("package.json"), join(parent, "package.json"));
+  const extension = join(parent, "pi-extension/subagents/index.ts");
+  // Capture at module evaluation, BEFORE Pi imports the installed copy and calls factories.
+  // Capturing in the factory would accept a controller the inert import already replaced.
+  // Watchers start only at session_start; do not assume one exists during startup imports.
+  // Only external child execution is stubbed; tracking and result delivery are real.
+  const source = readFileSync(extension, "utf8").replace("export default function subagentsExtension", "function subagentsExtension");
+  writeFileSync(extension, source + `
+    const key=Symbol.for("pi-subagents/poll-abort-controller");
+    const countKey=Symbol.for("pi-subagents/running-children-count");
+    const controller=(globalThis as any)[key];
+    const count=(globalThis as any)[countKey];
+    export default (pi:any)=>{
+      subagentsExtension(pi);
+      let release!:()=>void;
+      const completed=new Promise<void>(resolve=>{release=resolve;});
+      __test__.launchDeps.watchSubagent=async(child:any,callerSignal:AbortSignal)=>{
+        // Match the real watcher's caller + module lifecycle cancellation.
+        const signal=AbortSignal.any([callerSignal,(globalThis as any)[key].signal]);
+        const aborted=await new Promise<boolean>(resolve=>{
+          const onAbort=()=>{signal.removeEventListener("abort",onAbort);resolve(true);};
+          if(signal.aborted)return onAbort();
+          signal.addEventListener("abort",onAbort,{once:true});
+          void completed.then(()=>{signal.removeEventListener("abort",onAbort);resolve(signal.aborted);});
+        });
+        __test__.runningSubagents.delete(child.id);
+        return {summary:aborted?"WATCH_ABORTED":"WORKTREE_CHILD_RESULT",exitCode:aborted?1:0,elapsed:1};
+      };
+      pi.registerCommand("release-child",{description:"Release the simulated child",handler:async()=>{setTimeout(release,20);}});
+      pi.on("session_start",(_event:any,ctx:any)=>{
+        const child={id:"nested",name:"nested",task:"t",surface:"fake:p1",herdrName:"nested",
+          startTime:Date.now(),sessionFile:join(ctx.cwd,"nested.jsonl"),interactive:false};
+        __test__.runningSubagents.set(child.id,child);
+        __test__.watchAndDeliver(child);
+        writeFileSync(join(ctx.cwd,"globals.json"),JSON.stringify({
+          sameController:(globalThis as any)[key]===controller,
+          previousAborted:controller.signal.aborted,
+          sameCount:(globalThis as any)[countKey]===count,
+          children:(globalThis as any)[countKey](),
+        }));
+      });
+    };`);
+  const h = start({
+    extensions: [extension],
+    toolArgs: ["--approve"],
+    env: { PI_SUBAGENT_EXTENSION: extension, PI_SUBAGENT_ALLOWED: "scout" },
+    configure: installedCopy,
+  });
+  await h.command("get_state");
+  assert.deepEqual(JSON.parse(readFileSync(join(h.dir, "globals.json"), "utf8")), {
+    sameController: true, previousAborted: false, sameCount: true, children: 1,
+  });
+  replies = [{ text: "WAITING_FOR_CHILD" }, { text: "CHILD_RESULT_RECEIVED" }];
+  prompt(h);
+  await waitFor(() => h.records.some(r => r.type === "agent_settled"), h.diagnostic);
+  await h.command("get_state");
+  assert.equal(h.closed, false, "the worker stays alive while its child is pending");
+  assert.equal(h.sidecar(".exit"), null);
+  const released = await h.command("prompt", { message: "/release-child" });
+  assert.equal(released.success, true, JSON.stringify(released));
+  await h.exited(2);
+  assert.equal(requests.length, 2, h.diagnostic());
+  assert.match(JSON.stringify(requests[1].messages), /WORKTREE_CHILD_RESULT/);
+  assert.match(h.sidecar(".exit")?.summary ?? "", /CHILD_RESULT_RECEIVED$/);
+});
+
 test("a spawning child in the parent's own folder loads the one installed copy", async () => {
   const testApi = (await import("../pi-extension/subagents/index.ts")).__test__;
   const own = resolve("pi-extension/subagents/index.ts");

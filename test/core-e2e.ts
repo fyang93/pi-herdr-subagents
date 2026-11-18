@@ -7,7 +7,8 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { startAgent, waitForExit, closePane, findSessionAgent, agentStatus } from "../pi-extension/subagents/herdr.ts";
-import { isCoreAvailable } from "../pi-extension/subagents/herdr-core.ts";
+import { coreRequest, isCoreAvailable } from "../pi-extension/subagents/herdr-core.ts";
+import { __test__ as watcher } from "../pi-extension/subagents/index.ts";
 import { appCall, parentAppSpace, type AppSnapshot } from "../pi-extension/subagents/herdr-app.ts";
 import { publishInboxMessage } from "../pi-extension/subagents/session.ts";
 
@@ -94,6 +95,30 @@ try {
   assert.equal(results.length, 3, "The orchestrator received all three real tool-dispatched results");
   assert.ok(results.every(entry => JSON.stringify(entry).includes("CORE_E2E_OK")));
   console.log("PASS: real subagent tool -> 3 real Pi children -> result delivery -> orchestrator auto-exit");
+  const failedSession = session("crashed");
+  const failed = await coreRequest("terminal.run", {
+    argv: [process.execPath, "-e", "console.error('CORE_CRASH_DIAGNOSTIC'); process.exit(23)"],
+    cwd: root, keep: false, wait: false, no_notify: true,
+    parent: process.env.HC_TERMINAL_ID,
+    labels: { "pi.subagent.managed": "1", "pi.subagent.session": resolve(failedSession) },
+  });
+  owned.add(failed.address);
+  // This synthetic crash uses node, not the managed pi/claude launch contract.
+  // Observe its actual finished record before testing abnormal-exit diagnostics;
+  // do not mistake the live node fixture's argv for a recovered shell.
+  for (const deadline = Date.now() + 10_000; ; ) {
+    const record = await coreRequest("terminal.get", { terminal: failed.address });
+    if (record.state === "finished") break;
+    assert.ok(Date.now() < deadline, "Synthetic crash did not actually finish");
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  const interrupted = await watcher.watchSubagent({ id: failed.address, name: "crashed", herdrName: failed.address, surface: failed.address, sessionFile: failedSession, startTime: Date.now() } as any, AbortSignal.timeout(60_000));
+  assert.equal(interrupted.exitCode, 1);
+  assert.match(interrupted.summary, /exit_code=23/);
+  assert.match(interrupted.summary, /CORE_CRASH_DIAGNOSTIC/);
+  await assert.rejects(coreRequest("terminal.get", { terminal: failed.address }), (error: any) => error.code === "not_found");
+  owned.delete(failed.address);
+  console.log("PASS: real abnormal exit captures exit code/output and removes only the finished record");
 } finally {
   const cleanup = await Promise.allSettled([...owned].map(id => closePane(id)));
   if (cleanup.some(r => r.status === "rejected")) console.error("Cleanup failed; inspect owned terminals:", [...owned]);
