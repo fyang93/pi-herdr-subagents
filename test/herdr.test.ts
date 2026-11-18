@@ -481,7 +481,7 @@ it("finds where herdr installed the pi integration, so children elsewhere can lo
   assert.equal(await herdr.ensurePiIntegration(), false);
   assert.equal(herdr.piIntegrationPath(), installed);
   rmSync(installed);
-  assert.equal(herdr.piIntegrationPath(), null, "not once it is gone");
+  assert.equal(herdr.piIntegrationPath(), null);
 });
 
 it("installs the pi integration only when it is not current", async () => {

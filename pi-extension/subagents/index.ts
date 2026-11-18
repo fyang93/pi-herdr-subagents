@@ -17,7 +17,6 @@ import {
 } from "./agents.ts";
 import {
   isHerdrAvailable,
-  isCoreAvailable,
   herdrSetupHint,
   ensurePiIntegration,
   piIntegrationPath,
@@ -27,7 +26,6 @@ import {
   type AgentLaunch,
   waitForExit,
   agentStatus,
-  collectInterruptedExit,
   closePane,
   closeSurface,
 } from "./herdr.ts";
@@ -393,15 +391,8 @@ function claudeArgs(loadout: SubagentLoadout, sessionFile: string, opts: { autoE
   return args;
 }
 
-/**
- * Arguments that load herdr's pi integration into a child. It reports the child's state and
- * session, which supervision and restart recovery rely on — without it a restarted parent
- * could start a second pi on a live session — so a launch without it fails. It is always
- * loaded explicitly, which settings cannot exclude: the child config dir's own copy when it
- * has one (Pi loads a path once), else the one herdr installed in the default config dir.
- */
+/** Load herdr's Pi integration explicitly so session ownership can be recovered. */
 async function integrationArgs(agentDir: string): Promise<string[]> {
-  if (isCoreAvailable()) return ["-e", join(SUBAGENTS_DIR, "herdr-core-state.ts")];
   await integrationReady;
   if (!piIntegrationPath()) await ensurePiIntegration().catch(() => false);
   const integration = piIntegrationPath();
@@ -675,7 +666,7 @@ async function launchSubagent(
   return running;
 }
 
-/** Settles once herdr's pi integration is checked or installed; launches wait for it. */
+/** Settles once herdr's Pi integration has been checked or installed. */
 let integrationReady: Promise<unknown> = Promise.resolve();
 
 /** Subagents whose pane could not be closed, so they may still be working unsupervised. */
@@ -876,9 +867,8 @@ async function watchSubagent(
 
     if (result.reason === "interrupted") {
       runningSubagents.delete(running.id);
-      // Legacy panes stay open. Core may remove only a confirmed finished, owned record.
-      const diagnostics = preservePane ? "" : await collectInterruptedExit(running.herdrName, ownSession(running));
-      const errorMessage = `${result.errorMessage ?? "Agent exited without a completion marker."}${diagnostics ? `\n${diagnostics}` : ""}`;
+      // herdr TUI panes stay open after an unexpected exit.
+      const errorMessage = result.errorMessage ?? "Agent exited without a completion marker.";
       return { sessionFile, elapsed, exitCode: 1, errorMessage, summary: `Subagent interrupted: ${errorMessage}` };
     }
 
@@ -937,12 +927,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   latestPi = pi;
   pi.on("session_start", (event, ctx) => {
     latestCtx = ctx;
-    // Subagents are new pi processes, so they load herdr's state integration once installed.
     if (isHerdrAvailable()) {
       integrationReady = ensurePiIntegration().then(
         (installed) => installed && ctx.ui.notify("Installed herdr's pi integration; restart this pi session so its session identity is reported.", "info"),
         () => ctx.ui.notify("Could not check/install herdr's pi integration; run `herdr integration install pi` and restart pi sessions.", "warning"),
-      ).catch(() => {}); // the session was replaced or reloaded meanwhile: its ctx is stale
+      ).catch(() => {});
     }
     // pi runs multiple sessions in one process. A prior session's shutdown
     // aborts the shared module poll-abort controller; install a fresh one so

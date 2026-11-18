@@ -16,10 +16,7 @@
     "typecheck": "tsc -p .",
     "test": "tsc -p . && node --test test/test.ts test/*.test.ts",
     "test:runtime": "node test/runtime-smoke.ts",
-    "test:e2e": "node test/session-e2e.ts",
-    "test:backends": "tsc -p . && node --test --test-timeout=15000 test/herdr-core.test.ts test/herdr-app.test.ts",
-    "test:core-e2e": "node test/core-e2e.ts",
-    "test:app-e2e": "node test/core-e2e.ts --app"
+    "test:e2e": "node test/session-e2e.ts"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "^1.5.0",

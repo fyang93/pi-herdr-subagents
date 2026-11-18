@@ -1891,7 +1891,6 @@ describe("tool registration", () => {
         assert.equal(fork.launch.env.PI_SUBAGENT_AUTO_EXIT, "1");
         assert.equal(fork.launch.args[fork.launch.args.indexOf("--tools") + 1], "read,ask_question");
         assert.equal(fork.launch.args[fork.launch.args.indexOf("--model") + 1], "test/model");
-        // herdr's integration is always loaded explicitly, so settings cannot exclude it.
         assert.ok(fork.launch.args.some((arg: string, i: number) => fork.launch.args[i - 1] === "-e" && arg.endsWith("herdr-agent-state.ts")));
         assert.equal(fork.launch.args[fork.launch.args.indexOf("--thinking") + 1], "high");
         assert.match(readFileSync(fork.running.sessionFile, "utf8"), /Here is my plan/);

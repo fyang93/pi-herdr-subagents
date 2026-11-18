@@ -6,12 +6,9 @@
  */
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { existsSync, readFileSync } from "node:fs";
 import { createConnection, type Socket } from "node:net";
+import { existsSync, readFileSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
-
-import { isCoreAvailable, startCoreAgent, coreAgentStatus, findCoreSessionAgent, closeCoreTerminal, readCoreScreen, promptCoreAgent, collectCoreInterruptedExit } from "./herdr-core.ts";
-export { isCoreAvailable } from "./herdr-core.ts";
 
 const execFileAsync = promisify(execFile);
 // Bound CLI stalls, not agent execution time. Never retry mutating actions.
@@ -19,11 +16,11 @@ const cliOptions = { encoding: "utf8" as const, timeout: 10_000, killSignal: "SI
 const bin = () => process.env.HERDR_BIN_PATH || "herdr";
 
 export function isHerdrAvailable(): boolean {
-  return isCoreAvailable() || (process.env.HERDR_ENV === "1" && !!process.env.HERDR_PANE_ID);
+  return process.env.HERDR_ENV === "1" && !!process.env.HERDR_PANE_ID;
 }
 
 export function herdrSetupHint(): string {
-  return "Start pi inside herdr-app / a herdr-core terminal (`hc run pi`), or a legacy herdr pane (`herdr`, then `pi`).";
+  return "Start pi inside a herdr pane (`herdr`, then `pi`).";
 }
 
 /** herdr prints `{result}` (plain text for `pane read`) or `{error: {code, message}}` with exit 1. */
@@ -53,19 +50,13 @@ async function herdrAsync(args: string[], options: { signal?: AbortSignal; timeo
 
 let integrationPath: string | null = null;
 
-/**
- * Where herdr installed its pi integration, as found by `ensurePiIntegration`, or null.
- * herdr installs it in the default config directory, so a child using another one must
- * load it explicitly to report its state and session.
- */
+/** Path to herdr's installed Pi integration, when still present. */
 export function piIntegrationPath(): string | null {
   return integrationPath && existsSync(integrationPath) ? integrationPath : null;
 }
 
 /** Install or update herdr's pi integration so subagents report exact agent state; true if it installed. */
 export async function ensurePiIntegration(): Promise<boolean> {
-  // Pi reports OSC status natively to herdr-core; session identity is stored at terminal creation.
-  if (isCoreAvailable()) return false;
   const status = async () => {
     const { stdout } = await execFileAsync(bin(), ["integration", "status"], cliOptions);
     integrationPath = /^pi: \S+.*\(((?:\/|[A-Za-z]:[\\/]|\\\\).*)\)$/m.exec(stdout)?.[1] ?? null;
@@ -134,12 +125,11 @@ async function waitForShell(surface: string, signal?: AbortSignal, timeout = 10_
 }
 
 /**
- * Open a terminal and launch the agent. Only legacy herdr preflights readiness.
+ * Open a terminal and launch the agent, preflighting shell readiness.
  * Every failure after the pane exists closes it, and so does `signal`: the caller
  * never learns the pane, so nothing else would.
  */
 export async function startAgent(launch: AgentLaunch, signal?: AbortSignal): Promise<{ surface: string; agent: string }> {
-  if (isCoreAvailable()) return startCoreAgent(launch, signal);
   if (!isHerdrAvailable()) throw new Error(`herdr is not available. ${herdrSetupHint()}`);
   // herdr refuses agent arguments it cannot encode for the pane's shell, such as line breaks.
   const unsafe = launch.args.find((arg) => /[\r\n]/.test(arg));
@@ -179,24 +169,16 @@ export async function startAgent(launch: AgentLaunch, signal?: AbortSignal): Pro
 
 /** Recent output with soft wraps joined. */
 export async function readScreen(surface: string, lines = 50): Promise<string> {
-  if (isCoreAvailable()) return readCoreScreen(surface, lines);
   return (await herdrAsync(["pane", "read", surface, "--source", "recent-unwrapped", "--lines", String(Math.max(1, lines))], { raw: true })).trimEnd();
 }
 
 /** Submit a prompt to a Claude agent, which queues it while a turn runs. */
 export async function promptAgent(agent: string, text: string, signal?: AbortSignal): Promise<void> {
-  if (isCoreAvailable()) return promptCoreAgent(agent, text, signal);
   await herdrAsync(["agent", "prompt", agent, text], { signal });
 }
 
 export async function closeSurface(surface: string, session?: string): Promise<void> {
-  if (isCoreAvailable()) return closeCoreTerminal(surface, session);
   await herdrAsync(["pane", "close", surface]);
-}
-
-/** Abnormal-exit diagnostics/cleanup are backend-specific. Legacy panes remain inspectable. */
-export async function collectInterruptedExit(agent: string, session: string): Promise<string> {
-  return isCoreAvailable() ? collectCoreInterruptedExit(agent, session) : "";
 }
 
 /** Close a pane, retrying briefly; one already gone counts as closed. Throws when it stays open. */
@@ -227,7 +209,6 @@ function reportedSession(agent: any): string | null {
  * lists it; null when herdr could not answer.
  */
 export async function agentStatus(agent: string, signal?: AbortSignal): Promise<{ status: AgentStatus; pane: string; session: string | null } | "exited" | null> {
-  if (isCoreAvailable()) return coreAgentStatus(agent, signal);
   try {
     const result = (await herdrAsync(["agent", "get", agent], { signal })).agent;
     return { status: result.agent_status ?? "unknown", pane: result.pane_id, session: reportedSession(result) };
@@ -238,7 +219,6 @@ export async function agentStatus(agent: string, signal?: AbortSignal): Promise<
 
 /** The live agent running a session (a pi session file or a Claude session id), by herdr's session report; null when none is. */
 export async function findSessionAgent(session: string): Promise<{ agent: string; pane: string } | null> {
-  if (isCoreAvailable()) return findCoreSessionAgent(session);
   const key = isAbsolute(session) ? resolve(session) : session;
   const agents: any[] = (await herdrAsync(["agent", "list"]))?.agents ?? [];
   const live = agents.find((a) => a.name && reportedSession(a) === key);
@@ -251,8 +231,6 @@ export async function findSessionAgent(session: string): Promise<{ agent: string
  * changed; `notify(false)` means events are unavailable, so the caller polls.
  */
 function watchPaneEvents(pane: string, notify: (live: boolean) => void): () => void {
-  // Core uses a different event protocol; use the existing bounded polling fallback.
-  if (isCoreAvailable()) return () => {};
   let socket: Socket | undefined;
   let retry: ReturnType<typeof setTimeout> | undefined;
   let stopped = false;
