@@ -894,6 +894,25 @@ describe("subagent discovery", () => {
     });
   });
 
+  it("renders the resolved model in both the tool result and Pi UI", async t => {
+    const previous = process.env.LIST_RESOLVED_MODEL;
+    t.after(() => restoreEnvVar("LIST_RESOLVED_MODEL", previous));
+    process.env.LIST_RESOLVED_MODEL = "provider/resolved";
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(projectAgentsDir, "resolved", "name: resolved\nmodel: ${LIST_RESOLVED_MODEL}");
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const tool = registeredTools.find((tool) => tool.name === "subagents_list");
+      const result = await tool.execute("call", {}, undefined, undefined, { cwd: process.cwd() });
+      assert.equal(result.details.agents.find((agent: any) => agent.name === "resolved").model, "provider/resolved");
+      assert.match(result.content[0].text, /resolved.*\[provider\/resolved\]/);
+      const theme = { fg: (_color: string, value: string) => value, bold: (value: string) => value };
+      const rendered = tool.renderResult(result, {}, theme).render(1000).join("\n");
+      assert.match(rendered, /resolved.*\[provider\/resolved\]/);
+      assert.doesNotMatch(rendered, /\$\{LIST_RESOLVED_MODEL\}/);
+    });
+  });
+
   it("lists every profile with its own missing model variables and renders those errors", async t => {
     const names = ["LIST_AUDIT_PROVIDER", "LIST_AUDIT_MODEL", "LIST_AUDIT_OTHER"];
     const previous = names.map(name => process.env[name]);

@@ -1119,24 +1119,26 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const list = discoverAgentDefinitions(ctx.cwd).filter((agent) => !agent.disableModelInvocation);
 
         const modelErrors: Array<{ name: string; error: string }> = [];
-        const lines = list.map((a) => {
+        const agents = list.map((agent) => {
+          try {
+            return { ...agent, model: resolveModelEnv(agent.model, ctx.cwd) };
+          } catch (error) {
+            modelErrors.push({ name: agent.name, error: error instanceof Error ? error.message : String(error) });
+            return agent;
+          }
+        });
+        const errors = new Map(modelErrors.map(({ name, error }) => [name, error]));
+        const lines = agents.map((a) => {
           const badge = a.source === "project" ? " (project)" : "";
           const desc = a.description ? ` — ${a.description}` : "";
-          let model = "";
-          try {
-            const resolvedModel = resolveModelEnv(a.model, ctx.cwd);
-            model = resolvedModel ? ` [${resolvedModel}]` : "";
-          } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            modelErrors.push({ name: a.name, error: message });
-            model = ` [error: ${message}]`;
-          }
+          const error = errors.get(a.name);
+          const model = error ? ` [error: ${error}]` : a.model ? ` [${a.model}]` : "";
           return `• ${a.name}${badge}${model}${desc}`;
         });
 
         return {
           content: [{ type: "text", text: lines.length ? lines.join("\n") : NO_AGENTS }],
-          details: { agents: list, ...(modelErrors.length ? { modelErrors } : {}) },
+          details: { agents, ...(modelErrors.length ? { modelErrors } : {}) },
         };
       },
       ...listRenderers,
